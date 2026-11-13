@@ -476,27 +476,10 @@ fn watch_for_perf() {
 }
 
 // Run: `WAYLAND_DISPLAY=wayland-2 cargo run -q -p ui-gallery --example gallery`
-/// Let an outside debugger attach to this process; `yama.ptrace_scope=1` otherwise refuses.
-#[cfg(unix)]
-fn allow_ptrace() {
-    unsafe extern "C" {
-        fn prctl(option: i32, ...) -> i32;
-    }
-    const PR_SET_PTRACER: i32 = 0x5961_6d61;
-    const PR_SET_PTRACER_ANY: usize = usize::MAX;
-    unsafe {
-        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
-    }
-}
-
-/// Nothing to allow: the debugger attaches without the process's consent.
-#[cfg(not(unix))]
-fn allow_ptrace() {}
-
 #[cfg_attr(feature = "profile", hotpath::main)]
 fn main() {
     if std::env::var_os("EXITDBG").is_some() {
-        allow_ptrace();
+        ui_host::allow_debugger();
     }
     let want_sizes = std::env::var_os("GALLERY_ALLOC_SIZES").is_some();
     let want_allocs = want_sizes

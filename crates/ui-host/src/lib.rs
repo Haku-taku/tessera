@@ -9,10 +9,10 @@
 //! frame rate, a dma-buf count — rather than by not existing.
 
 #[cfg(unix)]
-pub use ui_platform_wayland::{PortalThemeWatcher as ThemeWatch, Session};
+pub use ui_platform_wayland::{PortalThemeWatcher as ThemeWatch, Session, allow_debugger};
 
 #[cfg(windows)]
-pub use ui_platform_win32::{Session, Win32ThemeWatcher as ThemeWatch};
+pub use ui_platform_win32::{Session, Win32ThemeWatcher as ThemeWatch, allow_debugger};
 
 // The options and the turn belong to the portable contract, not to a backend: restating them
 // on the platform side would give one app two structs that drift apart.

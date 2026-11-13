@@ -44,3 +44,9 @@ impl core::fmt::Display for WindowError {
 }
 
 impl std::error::Error for WindowError {}
+
+/// Let an outside debugger attach to this process.
+///
+/// Windows has no ptrace scope to widen: a debugger attaches on its own, so this is the
+/// Windows answer to the same call, and it does nothing.
+pub fn allow_debugger() {}

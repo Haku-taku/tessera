@@ -66,7 +66,7 @@ impl Demo {
     /// Open the window and run until it closes. Never returns: the process ends here.
     pub fn run<A: App + 'static>(self, app: A) -> ! {
         if std::env::var_os("EXITDBG").is_some() {
-            allow_ptrace();
+            ui_host::allow_debugger();
         }
         let mut lp = AppLoop::with_stack(app, self.stack);
         for (family, bytes) in &self.fonts {
@@ -292,20 +292,3 @@ fn dump(lp: &AppLoop<impl App>) {
         );
     }
 }
-
-/// Let an outside debugger attach; `yama.ptrace_scope=1` otherwise refuses.
-#[cfg(unix)]
-fn allow_ptrace() {
-    unsafe extern "C" {
-        fn prctl(option: i32, ...) -> i32;
-    }
-    const PR_SET_PTRACER: i32 = 0x5961_6d61;
-    const PR_SET_PTRACER_ANY: usize = usize::MAX;
-    unsafe {
-        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
-    }
-}
-
-/// Windows has no `ptrace` scope to widen; a debugger attaches on its own.
-#[cfg(not(unix))]
-fn allow_ptrace() {}
