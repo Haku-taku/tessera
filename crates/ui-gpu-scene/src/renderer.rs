@@ -2925,7 +2925,8 @@ fn upload_image(
     entry: &ImageEntry,
     destination: ui_core::colour::Destination,
 ) -> Result<(), GpuError> {
-    let needed = (entry.width as usize) * (entry.height as usize) * 4;
+    let texel_bytes = entry.colour.storage.bytes_per_texel();
+    let needed = (entry.width as usize) * (entry.height as usize) * texel_bytes;
     let Some(data) = entry.pixels() else {
         return Err(GpuError::from(format!(
             "image {} is a canvas; its target supplies the texture, not an upload",
@@ -2959,32 +2960,42 @@ fn upload_image(
         // Tables only pay off on a whole texture, and only after the conversion is known
         // to be needed.
         let placement = placement.tabulated();
-        data[..needed]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .flat_map(|texel| {
-                let [r, g, b, alpha] = placement.texel(texel);
-                let mut out = Vec::with_capacity(4);
-                match encode {
-                    Encode::Srgb => {
-                        let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-                        out.extend_from_slice(&[
-                            byte(r * alpha),
-                            byte(g * alpha),
-                            byte(b * alpha),
-                            byte(alpha),
-                        ]);
-                    }
-                    Encode::Linear => {
-                        for value in [r * alpha, g * alpha, b * alpha, alpha] {
-                            out.extend_from_slice(&half_bits(value).to_le_bytes());
-                        }
+        let convert = |texel: &[u8]| {
+            let [r, g, b, alpha] = placement.texel(texel);
+            let mut out = Vec::with_capacity(4);
+            match encode {
+                Encode::Srgb => {
+                    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    out.extend_from_slice(&[
+                        byte(r * alpha),
+                        byte(g * alpha),
+                        byte(b * alpha),
+                        byte(alpha),
+                    ]);
+                }
+                Encode::Linear => {
+                    for value in [r * alpha, g * alpha, b * alpha, alpha] {
+                        out.extend_from_slice(&half_bits(value).to_le_bytes());
                     }
                 }
-                out
-            })
-            .collect()
+            }
+            out
+        };
+        // The packing decides the chunk size, and a storage has one of two.
+        match texel_bytes {
+            8 => data[..needed]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .flat_map(|texel| convert(texel))
+                .collect(),
+            _ => data[..needed]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|texel| convert(texel))
+                .collect(),
+        }
     };
     let format = match encode {
         Encode::Srgb => TextureFormat::Rgba8,

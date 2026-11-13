@@ -1185,8 +1185,9 @@ fn sample_texture(
     x: f32,
     y: f32,
 ) -> Color {
-    const ZERO: [u8; 4] = [0, 0, 0, 0];
+    const ZERO: [u8; 8] = [0; 8];
     let (w, h) = (entry.width as i32, entry.height as i32);
+    let texel_bytes = entry.colour.storage.bytes_per_texel();
     // A canvas has no CPU pixels: the engine swaps its entries for the target's bytes before
     // this pass, so an entry that is still a canvas is outside that contract and draws
     // nothing rather than sampling a stale buffer.
@@ -1197,8 +1198,10 @@ fn sample_texture(
     let x = x.clamp(0.0, (w - 1) as f32);
     let y = y.clamp(0.0, (h - 1) as f32);
     let texel = |tx: i32, ty: i32| -> [f32; 4] {
-        let at = ((ty as usize * entry.width as usize) + tx as usize) * 4;
-        let bytes = data.get(at..at + 4).unwrap_or(&ZERO);
+        let at = ((ty as usize * entry.width as usize) + tx as usize) * texel_bytes;
+        let bytes = data
+            .get(at..at + texel_bytes)
+            .unwrap_or(&ZERO[..texel_bytes]);
         let [r, g, b, a] = placement.texel(bytes);
         [r * a, g * a, b * a, a]
     };

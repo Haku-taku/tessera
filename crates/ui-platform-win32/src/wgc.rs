@@ -2,8 +2,8 @@
 //!
 //! A capture session holds nothing exclusively and hands over a frame while the desktop is
 //! still, which is what one screenshot needs. The pool is free-threaded because the caller has
-//! no dispatcher queue, and an advanced-colour display is captured in half floats and reduced
-//! here to sRGB codes, exactly as a duplication's float surface is.
+//! no dispatcher queue, and an advanced-colour display is captured in scRGB half floats, which
+//! travel unconverted, exactly as a duplication's float surface does.
 
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ use windows::Graphics::Capture::{
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D,
@@ -26,13 +27,12 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
-use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::core::Interface as _;
 
 use crate::capture::{
-    ScreenFrame, device_on, find_output, monitor_scale, read_float_rows, read_rows, staging_for,
+    ScreenFrame, device_on, find_output, monitor_scale, read_half_rows, read_rows, staging_for,
 };
 use crate::outputs::{HdrOutput, hdr_output};
 
@@ -87,7 +87,8 @@ impl GraphicsCapture {
                 .map_err(|error| format!("the capture interop: {error}"))?;
         let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor) }
             .map_err(|error| format!("a capture item for {name}: {error}"))?;
-        let size = item.Size()
+        let size = item
+            .Size()
             .map_err(|error| format!("the capture item's size on {name}: {error}"))?;
         let format = match hdr {
             Some(_) => DirectXPixelFormat::R16G16B16A16Float,
@@ -163,8 +164,9 @@ impl GraphicsCapture {
     }
 
     fn copy(&mut self, frame: &Direct3D11CaptureFrame) -> Result<ScreenFrame, String> {
-        let surface =
-            frame.Surface().map_err(|error| format!("frame surface: {error}"))?;
+        let surface = frame
+            .Surface()
+            .map_err(|error| format!("frame surface: {error}"))?;
         let access: IDirect3DDxgiInterfaceAccess = surface
             .cast()
             .map_err(|error| format!("the frame's DXGI interface: {error}"))?;
@@ -194,18 +196,20 @@ impl GraphicsCapture {
                 .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
         }
         .map_err(|error| format!("map the captured frame: {error}"))?;
-        let pixels = if float {
-            let reference_nits = self.hdr.map_or(80.0, |hdr| hdr.reference_nits);
-            read_float_rows(&mapped, &description, reference_nits)
+        let (pixels, colour) = if float {
+            (
+                read_half_rows(&mapped, &description),
+                ContentColour::scrgb(self.hdr.map_or(0.0, |hdr| hdr.peak_nits)),
+            )
         } else {
-            read_rows(&mapped, &description)
+            (read_rows(&mapped, &description), ContentColour::SDR)
         };
         unsafe { self.context.Unmap(&staging, 0) };
         Ok(ScreenFrame {
             width: description.Width,
             height: description.Height,
             pixels,
-            colour: ContentColour::SDR,
+            colour,
             output: self.output.clone(),
             scale: self.scale,
         })

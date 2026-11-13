@@ -319,17 +319,33 @@ pub enum PixelStorage {
     Sdr8,
     /// One little-endian 32-bit word: red in bits 0–9, green 10–19, blue 20–29, alpha 30–31.
     Packed10,
+    /// Four little-endian binary16 channels, straight alpha. scRGB: linear light whose 1.0
+    /// is [`SCRGB_WHITE_NITS`], which is the surface a desktop compositing in floats hands
+    /// over, and the only packing that can carry light above SDR white.
+    Float16,
 }
 
 impl PixelStorage {
+    /// Bytes one texel occupies.
+    pub fn bytes_per_texel(self) -> usize {
+        match self {
+            Self::Sdr8 | Self::Packed10 => 4,
+            Self::Float16 => 8,
+        }
+    }
+
+    /// Whether a texel is integer codes, which a whole-buffer transfer table can index.
+    pub fn is_integer(self) -> bool {
+        !matches!(self, Self::Float16)
+    }
+
     /// The integer codes one texel holds, and its alpha as an 8-bit fraction.
     ///
     /// Codes rather than fractions, because a whole-frame conversion tabulates the transfer
-    /// function over exactly these values.
-    #[inline]
-    pub fn codes(self, bytes: &[u8]) -> ([u16; 3], u8) {
+    /// function over exactly these values. A float packing has no codes.
+    fn codes(self, bytes: &[u8]) -> Option<([u16; 3], u8)> {
         let byte = |index: usize| bytes.get(index).copied().unwrap_or(0) as u16;
-        match self {
+        Some(match self {
             Self::Sdr8 => ([byte(0), byte(1), byte(2)], byte(3) as u8),
             Self::Packed10 => {
                 // Every word in a frame is four bytes; a short slice is a caller bug the
@@ -344,29 +360,63 @@ impl PixelStorage {
                 let alpha = (((word >> 30) & 0x3) * 85) as u8;
                 ([code(0), code(10), code(20)], alpha)
             }
-        }
+            Self::Float16 => return None,
+        })
     }
 
-    /// The largest code this packing can hold.
-    pub fn levels(self) -> u16 {
+    /// The largest code an integer packing can hold.
+    fn levels(self) -> u16 {
         match self {
             Self::Sdr8 => 255,
             Self::Packed10 => 1023,
+            Self::Float16 => 1,
         }
     }
 
-    /// The straight-alpha codes one texel holds, each in `[0, 1]`.
+    /// One texel in the units its transfer function decodes, and its alpha in `[0, 1]`.
+    ///
+    /// An integer packing answers codes scaled into `[0, 1]`; a float packing answers the
+    /// values themselves, which may exceed 1, because that is what carrying light above the
+    /// reference white means.
+    #[inline]
     pub fn unpack(self, bytes: &[u8]) -> ([f32; 3], f32) {
-        let (codes, alpha) = self.codes(bytes);
-        let levels = f32::from(self.levels());
+        if let Some((codes, alpha)) = self.codes(bytes) {
+            let levels = f32::from(self.levels());
+            return (
+                [
+                    f32::from(codes[0]) / levels,
+                    f32::from(codes[1]) / levels,
+                    f32::from(codes[2]) / levels,
+                ],
+                f32::from(alpha) / 255.0,
+            );
+        }
+        let channel = |at: usize| {
+            let low = bytes.get(at).copied().unwrap_or(0);
+            let high = bytes.get(at + 1).copied().unwrap_or(0);
+            half_to_f32(u16::from_le_bytes([low, high]))
+        };
         (
-            [
-                f32::from(codes[0]) / levels,
-                f32::from(codes[1]) / levels,
-                f32::from(codes[2]) / levels,
-            ],
-            f32::from(alpha) / 255.0,
+            [channel(0), channel(2), channel(4)],
+            channel(6).clamp(0.0, 1.0),
         )
+    }
+}
+
+/// The luminance scRGB's 1.0 stands for: the format's own unit, not the display's white.
+pub const SCRGB_WHITE_NITS: f32 = 80.0;
+
+/// A binary16 value as a float.
+pub fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = (bits & 0x3ff) as f32;
+    match exponent {
+        // Subnormals scale from 2^-14 with no implicit leading bit.
+        0 => sign * mantissa * (1.0 / 16_777_216.0),
+        0x1f if mantissa == 0.0 => sign * f32::INFINITY,
+        0x1f => f32::NAN,
+        _ => sign * (1.0 + mantissa / 1024.0) * f32::exp2(exponent as f32 - 15.0),
     }
 }
 
@@ -392,6 +442,20 @@ impl ContentColour {
         max_nits: 0.0,
     };
 
+    /// A desktop's float surface: scRGB light up to `peak_nits`, nothing converted.
+    ///
+    /// This is what a compositor hands over when it composites in floats — the Windows
+    /// duplication and capture-session surfaces — and it is absolute light in a fixed unit,
+    /// so it survives being pinned and drawn on either kind of surface.
+    pub fn scrgb(peak_nits: f32) -> Self {
+        Self {
+            storage: PixelStorage::Float16,
+            primaries: Chromaticities::SRGB,
+            transfer: TransferFunction::Linear,
+            max_nits: peak_nits,
+        }
+    }
+
     /// The transform that draws this picture on `destination`, derived once per texture.
     pub fn placement(self, destination: Destination) -> Placement {
         let encoded = matches!(destination.domain, Domain::Encoded);
@@ -409,8 +473,13 @@ impl ContentColour {
         // either way, which is why content carries no white of its own. HLG is scene
         // referred and needs an OOTF this engine has no peak for; nothing produces it yet,
         // so it is placed as relative light.
-        let absolute = matches!(self.transfer, TransferFunction::Pq);
-        let gain = if absolute {
+        // scRGB is absolute light in a fixed unit, so it needs the same treatment as PQ: its
+        // 1.0 is 80 nits whatever the destination's white is.
+        let scrgb = self.storage == PixelStorage::Float16;
+        let absolute = scrgb || matches!(self.transfer, TransferFunction::Pq);
+        let gain = if scrgb {
+            SCRGB_WHITE_NITS / reference_nits.max(1.0)
+        } else if absolute {
             10_000.0 / reference_nits.max(1.0)
         } else {
             1.0
@@ -580,12 +649,15 @@ impl Placement {
     /// and a tone curve is a luminance ratio rather than a per-channel map, so neither is
     /// tabulated.
     pub fn tabulated(mut self) -> Self {
-        let mut decode = Box::new([0.0f32; MAX_CODES]);
-        let levels = self.storage.levels();
-        for (code, slot) in decode.iter_mut().enumerate() {
-            *slot = self.transfer.decode(code as f32 / f32::from(levels));
+        // A float packing has no code space to index; its texels decode directly.
+        if self.storage.is_integer() {
+            let mut decode = Box::new([0.0f32; MAX_CODES]);
+            let levels = self.storage.levels();
+            for (code, slot) in decode.iter_mut().enumerate() {
+                *slot = self.transfer.decode(code as f32 / f32::from(levels));
+            }
+            self.decode = Some(decode);
         }
-        self.decode = Some(decode);
         if self.encoded {
             let mut encode = Box::new([0.0f32; ENCODE_STEPS]);
             for (step, slot) in encode.iter_mut().enumerate() {
@@ -602,16 +674,20 @@ impl Placement {
     /// would otherwise keep this a call per texel.
     #[inline]
     pub fn texel(&self, bytes: &[u8]) -> [f32; 4] {
-        let (codes, alpha) = self.storage.codes(bytes);
+        let Some((codes, alpha)) = self.storage.codes(bytes) else {
+            let (values, alpha) = self.storage.unpack(bytes);
+            if self.identity {
+                return [values[0], values[1], values[2], alpha];
+            }
+            // A float texel *is* the content's linear light; a transfer decode would clamp it
+            // at the reference white and throw away every highlight the packing exists for.
+            return self.place(values, alpha);
+        };
         let alpha = f32::from(alpha) / 255.0;
+        let levels = f32::from(self.storage.levels());
+        let code = |code: u16| f32::from(code) / levels;
         if self.identity {
-            let levels = f32::from(self.storage.levels());
-            return [
-                f32::from(codes[0]) / levels,
-                f32::from(codes[1]) / levels,
-                f32::from(codes[2]) / levels,
-                alpha,
-            ];
+            return [code(codes[0]), code(codes[1]), code(codes[2]), alpha];
         }
         let linear = match &self.decode {
             Some(table) => [
@@ -619,12 +695,17 @@ impl Placement {
                 table[codes[1] as usize],
                 table[codes[2] as usize],
             ],
-            None => {
-                let levels = f32::from(self.storage.levels());
-                let code = |code: u16| self.transfer.decode(f32::from(code) / levels);
-                [code(codes[0]), code(codes[1]), code(codes[2])]
-            }
+            None => [
+                self.transfer.decode(code(codes[0])),
+                self.transfer.decode(code(codes[1])),
+                self.transfer.decode(code(codes[2])),
+            ],
         };
+        self.place(linear, alpha)
+    }
+
+    /// Linear light into the destination's domain: primaries, gain, curve, encoding.
+    fn place(&self, linear: [f32; 3], alpha: f32) -> [f32; 4] {
         let m = &self.matrix;
         let mut rgb = [
             (m[0][0] * linear[0] + m[0][1] * linear[1] + m[0][2] * linear[2]) * self.gain,
@@ -892,6 +973,67 @@ mod tests {
             compressed[0] < 1.95,
             "the tone curve did not run: {}",
             compressed[0]
+        );
+    }
+
+    /// One grey scRGB texel as binary16, with opaque alpha. Every value the test uses is exact
+    /// in binary16, so the bits are arithmetic; the renderer owns the general encoder.
+    fn scrgb(value: f32) -> [u8; 8] {
+        let exponent = value.log2().floor() as i32;
+        let mantissa = ((value / f32::exp2(exponent as f32) - 1.0) * 1024.0).round() as u16;
+        let bits = (((exponent + 15) as u16) << 10) | mantissa;
+        let mut bytes = [0u8; 8];
+        for (slot, half) in bytes
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip([bits; 3].into_iter().chain([0x3c00]))
+        {
+            slot.copy_from_slice(&half.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// A float capture keeps the light above SDR white: the packing exists so a highlight can
+    /// be pinned and exported as light, not as the 255 a clipping ingest would leave.
+    #[test]
+    fn a_float_picture_keeps_its_light_above_the_reference_white() {
+        let content = ContentColour::scrgb(1000.0);
+        let hdr = Destination {
+            domain: Domain::Linear {
+                reference_nits: 203.0,
+                min_nits: 0.0,
+                peak_nits: 1000.0,
+            },
+            tone: ToneMapping::Bt2390,
+        };
+        // scRGB's 2.5 is 200 nits, just under the destination's white; 8.0 is 640 nits.
+        let white = content.placement(hdr).texel(&scrgb(2.5));
+        assert!(
+            (white[0] - 200.0 / 203.0).abs() < 1e-3,
+            "SDR white landed at {white:?}"
+        );
+        let highlight = content.placement(hdr).texel(&scrgb(8.0));
+        assert!(
+            (highlight[0] - 640.0 / 203.0).abs() < 1e-2,
+            "light above white was reduced on the way in: {highlight:?}"
+        );
+        // A file is SDR, so the same texel lands on the peak while white stays white.
+        let file = content.placement(Destination {
+            domain: Domain::Encoded,
+            tone: ToneMapping::Clip,
+        });
+        let clipped = file.texel(&scrgb(8.0));
+        assert!(
+            clipped[..3]
+                .iter()
+                .all(|channel| (channel - 1.0).abs() < 1e-3),
+            "a highlight in a file is the peak: {clipped:?}"
+        );
+        let encoded_white = file.texel(&scrgb(2.5));
+        assert!(
+            encoded_white[0] > 0.98,
+            "the SDR white dimmed in the file: {encoded_white:?}"
         );
     }
 
