@@ -8,6 +8,7 @@ use ui_core::clipboard::ClipboardContent;
 use ui_core::geom::{Point, Rect};
 use ui_core::{CursorShape, Event};
 use ui_platform::driver::FrameHost;
+use ui_platform::present::ImeState;
 use ui_platform::window::{KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, GlobalFree, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
@@ -44,7 +45,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     QS_ALLINPUT, RegisterClassExW, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOZORDER, SetCursor, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
     WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
     WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_NOACTIVATE,
@@ -81,6 +83,12 @@ struct WindowState {
     /// A layer's keyboard request; `None` for a window the manager places, which has no
     /// shape and no activation rule of its own.
     keyboard: Option<KeyboardMode>,
+    /// The input-method state the last frame published, so one change applies once.
+    ime: Option<ImeState>,
+    /// Whether the input context is open, which is the last state that reached it.
+    ime_open: bool,
+    /// The buffer is secret: the input method's own candidate list is hidden too.
+    ime_hidden: bool,
     /// The areas the last frame's tree consumes, surface-local logical units; `None` until a
     /// frame publishes one, which leaves the whole surface consuming input.
     input: Option<Vec<Rect>>,
@@ -357,6 +365,31 @@ impl Win32Window {
             return;
         }
         state.input = Some(areas.to_vec());
+    }
+
+    /// Apply this frame's input-method state: open or close the context, and keep the IME's
+    /// composition and candidate windows at the caret.
+    ///
+    /// A context change sends messages back to this thread's window procedure, so nothing is
+    /// borrowed while the IME calls run.
+    pub fn set_ime(&mut self, state: ImeState) {
+        let (open, dpi) = {
+            let mut window = self.state.borrow_mut();
+            if window.ime.as_ref() == Some(&state) {
+                return;
+            }
+            window.ime = Some(state.clone());
+            window.ime_hidden = state.hidden;
+            (window.ime_open, window.dpi)
+        };
+        if crate::ime::set_open(self.hwnd, state.enabled, open) {
+            self.state.borrow_mut().ime_open = state.enabled;
+        }
+        if state.enabled
+            && let Some(caret) = state.cursor
+        {
+            crate::ime::place(self.hwnd, dpi, caret);
+        }
     }
 
     /// Move the pointer by a logical offset; false when the platform refused.
@@ -772,6 +805,34 @@ unsafe fn handle(
                     .events
                     .push(Event::Text(character.to_string()));
             }
+            Some(LRESULT(0))
+        }
+        WM_IME_SETCONTEXT => {
+            let hidden = state.borrow().ime_hidden;
+            let flags = crate::ime::ui_flags(lparam, hidden);
+            Some(unsafe { DefWindowProcW(hwnd, message, wparam, flags) })
+        }
+        WM_IME_STARTCOMPOSITION => {
+            // The engine draws the composition from the preedit it is given, so the IME's
+            // own composition window stays hidden and this needs no default handling. The
+            // place is refreshed here because the caret is the last frame's, and the window
+            // may have moved since.
+            let (caret, dpi) = {
+                let window = state.borrow();
+                (window.ime.as_ref().and_then(|ime| ime.cursor), window.dpi)
+            };
+            if let Some(caret) = caret {
+                crate::ime::place(hwnd, dpi, caret);
+            }
+            Some(LRESULT(0))
+        }
+        WM_IME_COMPOSITION => {
+            let events = crate::ime::composition(hwnd, lparam.0 as u32);
+            state.borrow_mut().events.extend(events);
+            Some(LRESULT(0))
+        }
+        WM_IME_ENDCOMPOSITION => {
+            state.borrow_mut().events.push(Event::Preedit(None));
             Some(LRESULT(0))
         }
         WM_SETCURSOR => {

@@ -367,4 +367,8 @@ impl SceneTarget for Target<'_> {
     fn set_input_region(&mut self, areas: &[ui_core::geom::Rect]) {
         self.win.set_input_region(areas);
     }
+
+    fn set_ime(&mut self, state: ui_platform::present::ImeState) {
+        self.win.set_ime(state);
+    }
 }
