@@ -145,14 +145,10 @@ impl Backend for Win32Backend {
     }
 
     fn outputs(&mut self) -> Vec<OutputInfo> {
-        let mut found: Vec<OutputInfo> = Vec::new();
-        let data = LPARAM((&mut found as *mut Vec<OutputInfo>) as isize);
-        // SAFETY: the callback writes through `data` while this call is on the stack, and
-        // every monitor it visits outlives the enumeration.
-        unsafe {
-            let _ = EnumDisplayMonitors(None, None, Some(collect_output), data);
-        }
-        found
+        outputs_with_monitors()
+            .into_iter()
+            .map(|(_, information)| information)
+            .collect()
     }
 
     fn system_languages(&self) -> Vec<String> {
@@ -272,6 +268,29 @@ impl SurfaceHandle for HostedSurface {
     }
 }
 
+/// Every monitor Windows reports, with the output description the host lists it as.
+///
+/// The order is the enumerator's, which is the order `Backend::outputs` answers in; a monitor
+/// whose description cannot be read is left out of both, so a name still finds its monitor.
+pub(crate) fn outputs_with_monitors() -> Vec<(HMONITOR, OutputInfo)> {
+    let mut found: Vec<(HMONITOR, OutputInfo)> = Vec::new();
+    let data = LPARAM((&mut found as *mut Vec<(HMONITOR, OutputInfo)>) as isize);
+    // SAFETY: the callback writes through `data` while this call is on the stack, and every
+    // monitor it visits outlives the enumeration.
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(collect_output), data);
+    }
+    found
+}
+
+/// The monitor an output name refers to.
+pub(crate) fn monitor_named(name: &str) -> Option<HMONITOR> {
+    outputs_with_monitors()
+        .into_iter()
+        .find(|(_, information)| information.name == name)
+        .map(|(monitor, _)| monitor)
+}
+
 /// Gather one monitor into the host's output list.
 unsafe extern "system" fn collect_output(
     monitor: HMONITOR,
@@ -279,11 +298,11 @@ unsafe extern "system" fn collect_output(
     _: *mut RECT,
     data: LPARAM,
 ) -> BOOL {
-    // SAFETY: the enumerator passes back the pointer it was given, which `outputs` keeps on
+    // SAFETY: the enumerator passes back the pointer it was given, which the caller keeps on
     // the stack for the whole call.
-    let found = unsafe { &mut *(data.0 as *mut Vec<OutputInfo>) };
+    let found = unsafe { &mut *(data.0 as *mut Vec<(HMONITOR, OutputInfo)>) };
     if let Some(info) = output_of(monitor) {
-        found.push(info);
+        found.push((monitor, info));
     }
     BOOL(1)
 }

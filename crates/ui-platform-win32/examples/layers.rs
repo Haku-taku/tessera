@@ -1,4 +1,4 @@
-//! What a layer surface becomes on Win32: a popup on the primary monitor, placed by the
+//! What a layer surface becomes on Win32: a popup on its output's monitor, placed by the
 //! spec's rectangle, held at the spec's level, and shaped to its input region.
 //!
 //! Run: `cargo run -p ui-platform-win32 --example layers`
@@ -55,7 +55,7 @@ fn windows_main() -> Result<(), String> {
     use ui_platform_win32::Win32Window;
     use windows::Win32::Foundation::{LPARAM, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+        GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint,
     };
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use windows::Win32::UI::Shell::{ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP};
@@ -117,6 +117,7 @@ fn windows_main() -> Result<(), String> {
         "crabsnap-win32-layers",
         "probe.toolbar",
         LayerSpec {
+            output: None,
             level: Layer::Overlay,
             anchor: Anchor {
                 top: true,
@@ -160,6 +161,49 @@ fn windows_main() -> Result<(), String> {
         "a borderless popup's client area is its whole rect",
         toolbar.logical_size() == (320, 180),
     );
+
+    // A layer that names its output belongs on that monitor, and a name no monitor answers to
+    // falls back to the primary one: an unplugged display must not leave a surface nowhere.
+    let mut described = MONITORINFOEXW::default();
+    described.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if !unsafe {
+        GetMonitorInfoW(monitor, std::ptr::from_mut(&mut described).cast::<MONITORINFO>())
+    }
+    .as_bool()
+    {
+        return Err(String::from("GetMonitorInfoW: no name for the primary monitor"));
+    }
+    let end = described
+        .szDevice
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(described.szDevice.len());
+    let name = String::from_utf16_lossy(&described.szDevice[..end]);
+    for (pattern, output) in [
+        (
+            "a layer naming an output covers that output's monitor",
+            name.clone(),
+        ),
+        (
+            "a name no monitor has falls back to the primary one",
+            String::from(r"\\.\DISPLAY999"),
+        ),
+    ] {
+        let placed = Win32Window::new(SurfaceSpec::layer(
+            "crabsnap-win32-layers",
+            "probe.output",
+            LayerSpec {
+                output: Some(output),
+                auto_hide: AutoHide::Cover,
+                ..LayerSpec::default()
+            },
+        ))
+        .map_err(|error| error.to_string())?;
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(placed.hwnd(), &mut rect) }
+            .map_err(|error| format!("GetWindowRect: {error}"))?;
+        ok &= expect(pattern, rect == monitor_rect);
+    }
 
     // A surface whose picture is the screen asks for the whole monitor: two rows short would
     // squeeze that picture, and a pointer would name a pixel it is not over.
@@ -315,6 +359,7 @@ fn windows_main() -> Result<(), String> {
         "crabsnap-win32-layers",
         "probe.follow",
         LayerSpec {
+            output: None,
             level: Layer::Overlay,
             anchor: Anchor {
                 top: true,

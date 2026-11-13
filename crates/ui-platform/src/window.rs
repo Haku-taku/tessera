@@ -74,6 +74,13 @@ pub enum SurfaceRole {
 /// closest placement that platform has.
 #[derive(Clone, Debug)]
 pub struct LayerSpec {
+    /// Which output it is placed on, by the name [`Backend::outputs`](crate::host::Backend::outputs)
+    /// reports; `None` lets the platform choose.
+    ///
+    /// A per-output surface — an overlay over this monitor, a canvas for its pins — must name
+    /// its output, or it lands wherever the platform puts a new surface. A backend that does not
+    /// act on the name ignores it, and the surface opens where it otherwise would.
+    pub output: Option<String>,
     /// The stack it is drawn in; later layers cover earlier ones.
     pub level: Layer,
     /// The edges it is pinned to; pinned to all four it takes the whole output.
@@ -107,6 +114,7 @@ pub enum AutoHide {
 impl Default for LayerSpec {
     fn default() -> Self {
         Self {
+            output: None,
             level: Layer::Overlay,
             anchor: Anchor::ALL,
             size: None,

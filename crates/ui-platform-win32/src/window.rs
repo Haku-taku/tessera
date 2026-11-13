@@ -546,20 +546,24 @@ fn opening_window(size: (u32, u32)) -> Result<Opening, WindowError> {
     })
 }
 
-/// A layer as the closest thing Win32 has: a borderless popup on the primary monitor.
+/// A layer as the closest thing Win32 has: a borderless popup on one monitor.
 ///
-/// The portable spec names no output, so the primary monitor is where a layer lands, as the
-/// first bound output is on Wayland. The popup is placed by arithmetic on the monitor's
-/// rectangle; nothing in the shell anchors it afterwards.
+/// A spec that names an output lands on that monitor; one that names none, or names an output
+/// that is gone, lands on the primary one, which is what the shell would pick anyway. The popup
+/// is placed by arithmetic on the monitor's rectangle; nothing in the shell anchors it after.
 fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
-    let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    let monitor = layer
+        .output
+        .as_deref()
+        .and_then(crate::backend::monitor_named)
+        .unwrap_or_else(primary_monitor);
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..MONITORINFO::default()
     };
     if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
         return Err(WindowError::Win32(String::from(
-            "GetMonitorInfoW: no primary monitor",
+            "GetMonitorInfoW: the monitor's rectangle was refused",
         )));
     }
     let (mut dpi_x, mut dpi_y) = (0, 0);
@@ -635,6 +639,11 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
         keyboard: Some(layer.keyboard),
         composited: true,
     })
+}
+
+/// The monitor the shell treats as primary.
+fn primary_monitor() -> HMONITOR {
+    unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) }
 }
 
 /// The monitor edge an auto-hidden taskbar hides against, when it hides on `monitor`.
