@@ -430,6 +430,14 @@ impl Host {
         &self.outputs
     }
 
+    /// The user's preferred UI languages, most preferred first, as BCP-47 tags.
+    ///
+    /// Read from the backend rather than the environment: a platform that keeps the list in
+    /// its own settings has no locale variables to read.
+    pub fn languages(&self) -> Vec<String> {
+        self.backend.system_languages()
+    }
+
     /// Called once per turn: the application's own periodic work (an idle timeout, a pin a
     /// surface handed over). The context is the same one a message handler gets, because the
     /// work may open a surface.
