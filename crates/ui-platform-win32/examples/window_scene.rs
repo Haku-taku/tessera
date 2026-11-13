@@ -23,12 +23,16 @@ fn windows_main() -> Result<(), String> {
     use std::io::Write;
     use std::time::{Duration, Instant};
 
+    use ui_core::colour::{
+        Chromaticities, TransferFunction, WhiteAdaptation, encode_for_pq_output,
+        gamut_matrix_adapted,
+    };
     use ui_core::geom::{Color, Corners};
     use ui_core::{Id, NodeData, NodeKind, SizeClass};
     use ui_platform::view::{App, AppLoop};
     use ui_platform::window::SurfaceSpec;
     use ui_platform::{Container, Element};
-    use ui_platform_win32::{Win32Presenter, Win32Window};
+    use ui_platform_win32::{HdrOutput, Win32Presenter, Win32Window};
 
     const BACKDROP: Color = Color::from_rgba8(20, 22, 28, 255);
     const RED: Color = Color::from_rgba8(255, 0, 0, 255);
@@ -132,20 +136,51 @@ fn windows_main() -> Result<(), String> {
         ]
     }
 
-    fn near(got: [u8; 4], want: Color, tolerance: u8) -> bool {
-        let expected = [
-            (want.r * 255.0).round() as u8,
-            (want.g * 255.0).round() as u8,
-            (want.b * 255.0).round() as u8,
-            (want.a * 255.0).round() as u8,
+    /// The codes the presented buffer holds for `want`.
+    ///
+    /// An HDR buffer holds PQ codes of linear light in BT.2020, so the expected value is the
+    /// colour through the same matrix and transfer the output shader uses.
+    fn expected(want: Color, hdr: Option<HdrOutput>) -> [u8; 4] {
+        let Some(output) = hdr else {
+            return [
+                (want.r * 255.0).round() as u8,
+                (want.g * 255.0).round() as u8,
+                (want.b * 255.0).round() as u8,
+                (want.a * 255.0).round() as u8,
+            ];
+        };
+        let linear = [
+            TransferFunction::Srgb.decode(want.r),
+            TransferFunction::Srgb.decode(want.g),
+            TransferFunction::Srgb.decode(want.b),
         ];
+        let gamut = gamut_matrix_adapted(
+            Chromaticities::SRGB,
+            Chromaticities::BT2020,
+            WhiteAdaptation::Bradford,
+        );
+        let mut codes = [0u8; 3];
+        for (channel, row) in codes.iter_mut().zip(gamut) {
+            let mapped: f32 = row.iter().zip(linear).map(|(m, l)| m * l).sum();
+            let code = encode_for_pq_output(mapped, output.reference_nits, output.min_nits);
+            *channel = (code * 255.0).round() as u8;
+        }
+        [codes[0], codes[1], codes[2], (want.a * 255.0).round() as u8]
+    }
+
+    fn near(got: [u8; 4], want: Color, hdr: Option<HdrOutput>, tolerance: u8) -> bool {
         got.iter()
-            .zip(expected)
+            .zip(expected(want, hdr))
             .all(|(got, want)| got.abs_diff(want) <= tolerance)
     }
 
     /// Assert the presented buffer at the scene's own points, in logical coordinates.
-    fn verify(pixels: &[u8], size: (u32, u32), scale: f32) -> Result<(), String> {
+    fn verify(
+        pixels: &[u8],
+        size: (u32, u32),
+        scale: f32,
+        hdr: Option<HdrOutput>,
+    ) -> Result<(), String> {
         let (width, height) = size;
         let at = |x: f32, y: f32| {
             (
@@ -164,7 +199,7 @@ fn windows_main() -> Result<(), String> {
         for (name, x, y, want) in probes {
             let (px, py) = at(x, y);
             let got = pixel(pixels, width, px, py);
-            let ok = near(got, want, 12);
+            let ok = near(got, want, hdr, 12);
             println!(
                 "{name:40} {} (at {px},{py}: {got:?})",
                 if ok { "OK" } else { "FAIL" }
@@ -198,6 +233,13 @@ fn windows_main() -> Result<(), String> {
     );
     let mut window = Win32Window::new(spec).map_err(|error| error.to_string())?;
     let mut presenter = Win32Presenter::new(&window).map_err(|error| error.to_string())?;
+    match presenter.hdr() {
+        Some(output) => println!(
+            "the output is HDR: SDR white {} nits, peak {} nits",
+            output.reference_nits, output.peak_nits
+        ),
+        None => println!("the output is SDR: 8-bit sRGB"),
+    }
     let mut app = AppLoop::with_stack(Demo, &[]);
     let seconds = std::env::var("WINDOW_SECONDS")
         .ok()
@@ -256,7 +298,7 @@ fn windows_main() -> Result<(), String> {
         };
         let extent = if stage == 0 { "opening" } else { "resized" };
         if check {
-            verify(&pixels, size, scale)?;
+            verify(&pixels, size, scale, presenter.hdr())?;
             println!("PASS: the swap chain holds the scene at the {extent} size");
         }
         if let Some(path) = &dump

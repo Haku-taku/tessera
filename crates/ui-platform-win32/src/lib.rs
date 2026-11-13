@@ -4,9 +4,10 @@
 //! without user32 and dxgi, and there is nothing for a non-Windows build to fall back to, so
 //! the workspace builds an empty library there.
 //!
-//! What it does not do yet: HDR, and a clipboard read that carries more than text. Keys, the
-//! pointer, the wheel, text and the input method's composition reach the engine as its own
-//! events.
+//! The swap chain follows its output into HDR when Windows is composing there, and stays
+//! 8-bit sRGB otherwise. What it does not do yet: a clipboard read that carries more than
+//! text. Keys, the pointer, the wheel, text and the input method's composition reach the
+//! engine as its own events.
 
 #![cfg(windows)]
 
@@ -23,7 +24,7 @@ mod window;
 
 pub use backend::Win32Backend;
 pub use hotkeys::WINDOW_CLASS as HOTKEY_WINDOW_CLASS;
-pub use presenter::Win32Presenter;
+pub use presenter::{HdrOutput, Win32Presenter};
 pub use session::Session;
 pub use theme::Win32ThemeWatcher;
 pub use ui_platform::session::{HostSession, SessionOptions, Tick};
