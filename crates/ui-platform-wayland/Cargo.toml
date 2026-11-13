@@ -14,6 +14,12 @@ ui-paint-gpu = { workspace = true, optional = true }
 ui-platform = { workspace = true }
 ui-text = { workspace = true }
 ui-text-fontique = { workspace = true }
+# Frame-phase timing for the `profile` feature; absent from normal builds.
+hotpath = { version = "0.30", optional = true, default-features = false }
+
+# Wayland, D-Bus and the unix syscalls behind them exist only on unix; the crate is an empty
+# library elsewhere, and these are the declarations that would otherwise still be built.
+[target.'cfg(unix)'.dependencies]
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 # wlr-layer-shell: the only portable way to ask for an overlay surface that the
@@ -28,10 +34,8 @@ rustix = { version = "1", features = ["event", "net", "pipe"] }
 # the GlobalShortcuts transport. This crate is Linux's platform layer, so D-Bus is part of it;
 # which hotkey transport runs is still decided at runtime.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
-# Frame-phase timing for the `profile` feature; absent from normal builds.
-hotpath = { version = "0.30", optional = true, default-features = false }
 
-[dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 # Virtual keyboard, so `type_text` can drive a real input method without a physical one.
 wayland-protocols-misc = { version = "0.3", features = ["client"] }

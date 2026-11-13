@@ -16,6 +16,33 @@ hotpath = { version = "0.30", optional = true, default-features = false }
 [features]
 # Times each render phase; the gallery's own `profile` feature turns it on.
 profile = ["dep:hotpath", "hotpath/hotpath", "ui-gpu-scene/profile"]
+# The probes below render into a real EGL context, which exists only on unix. They are opt-in
+# so that a build of every target on another platform skips them instead of failing.
+egl-probes = []
+
+[[example]]
+name = "gpu_scene"
+required-features = ["egl-probes"]
+
+[[example]]
+name = "gpu_cached_scene"
+required-features = ["egl-probes"]
+
+[[example]]
+name = "gpu_effect_band_scene"
+required-features = ["egl-probes"]
+
+[[example]]
+name = "gpu_hdr_scene"
+required-features = ["egl-probes"]
+
+[[example]]
+name = "gpu_image_scene"
+required-features = ["egl-probes"]
+
+[[example]]
+name = "gpu_shadow_scene"
+required-features = ["egl-probes"]
 
 [dev-dependencies]
 ui-gpu-egl = { path = "../ui-gpu-egl" }

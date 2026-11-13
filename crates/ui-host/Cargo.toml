@@ -1,0 +1,20 @@
+[package]
+name = "ui-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The window backend an app runs on, chosen by the target and named once."
+
+[dependencies]
+# A window shows text the app did not bundle, so the OS face stack is on everywhere.
+ui-platform = { workspace = true, features = ["system-fonts"] }
+
+# One backend per target, never both: a backend that names another OS's APIs does not compile
+# there, and an empty library is still a library to link. This is where an app's choice
+# between them is made, so that its own manifests and source make none.
+[target.'cfg(unix)'.dependencies]
+ui-platform-wayland = { path = "../ui-platform-wayland", features = ["gpu"] }
+
+[target.'cfg(windows)'.dependencies]
+ui-platform-win32 = { path = "../ui-platform-win32" }

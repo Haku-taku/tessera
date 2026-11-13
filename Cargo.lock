@@ -1894,11 +1894,10 @@ dependencies = [
  "ui-design",
  "ui-gpu-scene",
  "ui-highlight",
+ "ui-host",
  "ui-i18n",
  "ui-paint",
  "ui-platform",
- "ui-platform-wayland",
- "ui-platform-win32",
  "ui-richtext",
  "ui-style",
  "ui-widgets",
@@ -1942,6 +1941,15 @@ dependencies = [
  "tree-sitter-highlight",
  "tree-sitter-json",
  "tree-sitter-rust",
+]
+
+[[package]]
+name = "ui-host"
+version = "0.1.0"
+dependencies = [
+ "ui-platform",
+ "ui-platform-wayland",
+ "ui-platform-win32",
 ]
 
 [[package]]

@@ -883,17 +883,13 @@ pub(crate) fn appearance_of(dark: bool) -> ui_design::Appearance {
     }
 }
 
-// The host seam: the one place the gallery names its platform.
+// The host seam: what the gallery asks of its host beyond the session itself.
 //
-// A target's binaries can only name the backends that compile there, so the surface type is
-// an alias per target while everything else the gallery asks of its host is a capability
-// question answered here — a platform that cannot do something says so, and the report
+// The window backend is named in `ui-host`, so nothing here mentions one. What remains is a
+// capability question per target — a host that cannot do something says so, and the report
 // leaves the number out instead of printing a zero.
 
-#[cfg(unix)]
-pub(crate) use ui_platform_wayland::{Session, SessionOptions};
-#[cfg(windows)]
-pub(crate) use ui_platform_win32::{Session, SessionOptions};
+pub(crate) use ui_host::{Session, SessionOptions};
 
 pub(crate) use host::*;
 
@@ -903,11 +899,11 @@ mod host {
     use crate::app::Gallery;
 
     /// XDG portal, so the desktop's colour scheme reaches the app.
-    pub(crate) type ThemeWatch = ui_platform_wayland::PortalThemeWatcher;
+    pub(crate) type ThemeWatch = ui_host::ThemeWatch;
 
     /// Frames drawn wholly and partly, for the exit line.
     pub(crate) fn partial_frames() -> (u64, u64) {
-        ui_platform_wayland::partial_frames()
+        ui_gpu_scene::partial_frames()
     }
 
     pub(crate) fn set_supersample(session: &mut Session<Gallery>, factor: u32) {
@@ -966,7 +962,7 @@ mod host {
     use crate::app::Gallery;
 
     /// The registry value Windows keeps the app colour scheme in.
-    pub(crate) type ThemeWatch = ui_platform_win32::Win32ThemeWatcher;
+    pub(crate) type ThemeWatch = ui_host::ThemeWatch;
 
     pub(crate) fn partial_frames() -> (u64, u64) {
         ui_gpu_scene::partial_frames()

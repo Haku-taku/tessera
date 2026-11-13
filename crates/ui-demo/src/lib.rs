@@ -3,7 +3,8 @@
 //!
 //! Knobs: `DEMO_CPU=1`, `DEMO_SECONDS=n`, `DEMO_CLOSE_AFTER=n`, `DEMO_WALLPAPER=path`,
 //! `DEMO_HEARTBEAT=1`.
-//! `DEMO_HEARTBEAT=1`.
+
+#![cfg(unix)]
 
 use std::time::Instant;
 

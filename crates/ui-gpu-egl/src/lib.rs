@@ -3,6 +3,8 @@
 //! Nothing here knows about layout, text or draw lists; the renderer depends on this,
 //! never the other way round.
 
+#![cfg(unix)]
+
 pub mod context;
 pub mod ffi;
 pub mod node;

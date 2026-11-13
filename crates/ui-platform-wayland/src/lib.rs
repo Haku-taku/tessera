@@ -1,5 +1,7 @@
 //! Wayland XDG window target: `wl_shm` reference path plus an optional dma-buf path.
 
+#![cfg(unix)]
+
 pub mod backend;
 pub(crate) mod clipboard;
 pub mod clipboard_host;

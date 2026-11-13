@@ -7,6 +7,11 @@ license.workspace = true
 
 [dependencies]
 ui-gpu-scene = { workspace = true }
+
+# EGL, GBM and DRM syncobj exist only on unix, so the crate is an empty library everywhere
+# else rather than a compile error. The bindings live behind the same cfg for that reason:
+# an empty crate still builds whatever it declares.
+[target.'cfg(unix)'.dependencies]
 khronos-egl = { version = "6.0", features = ["dynamic"] }
 glow = "0.18"
 libc = "0.2"

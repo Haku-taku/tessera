@@ -49,6 +49,10 @@ const PLATFORM_BOUND: &[(&str, &str)] = &[
         "D3D11 device: COM, DXGI and d3dcompiler are Win32 APIs, and the crate is empty off Windows",
     ),
     (
+        "ui-host",
+        "Host facade: re-exports this target's window backend, so it depends on a platform crate by design",
+    ),
+    (
         "ui-platform-win32",
         "Win32 window + DXGI swap chain: user32 and dxgi are Windows APIs, and the crate is empty off Windows",
     ),
