@@ -282,16 +282,7 @@ impl Win32Window {
 
     /// Take every message waiting for this thread; true when there was one.
     pub fn pump(&mut self) -> bool {
-        let mut message = MSG::default();
-        let mut any = false;
-        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
-            unsafe {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-            any = true;
-        }
-        any
+        pump_messages()
     }
 
     /// Events since the last call, in arrival order.
@@ -756,6 +747,24 @@ fn register_class(class: &[u16], instance: HINSTANCE) -> Result<(), WindowError>
         }
     }
     Ok(())
+}
+
+/// Dispatch every message already on this thread's queue; true when there was one.
+///
+/// The process's loop calls this after its wait as well as per surface, so a message that
+/// belongs to no window of this process — a hotkey press — is still delivered when no
+/// surface is open.
+pub(crate) fn pump_messages() -> bool {
+    let mut message = MSG::default();
+    let mut any = false;
+    while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        any = true;
+    }
+    any
 }
 
 /// How long a wait may last with no deadline given.

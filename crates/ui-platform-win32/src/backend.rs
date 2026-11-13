@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use ui_core::draw::ImageEntry;
 use ui_platform::clipboard::{ClipboardCommand, ClipboardCopy};
 use ui_platform::host::{Backend, OpenOptions, SurfaceHandle, SurfaceStep};
+use ui_platform::hotkeys::GlobalHotkeys;
+use ui_platform::ipc::Channel;
 use ui_platform::jobs::Waker;
 use ui_platform::output::OutputInfo;
 use ui_platform::session::{HostSession, SessionOptions};
@@ -28,8 +30,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
+use crate::hotkeys::Win32Hotkeys;
 use crate::session::Session;
-use crate::window::{bounded_millis, set_system_clipboard, wait_for_composition};
+use crate::window::{bounded_millis, pump_messages, set_system_clipboard, wait_for_composition};
 
 /// Surfaces and services on one thread's message queue.
 pub struct Win32Backend {
@@ -37,6 +40,8 @@ pub struct Win32Backend {
     drew: Rc<Cell<bool>>,
     /// Set by a worker to interrupt [`Backend::wait`]; absent when the event could not open.
     wake: Option<Arc<WakeEvent>>,
+    /// The system-wide hotkeys, opened on the first request; absent when that failed.
+    hotkeys: Option<Win32Hotkeys>,
 }
 
 /// The loop's wake channel from the other side: an event any worker can set.
@@ -70,6 +75,7 @@ impl Win32Backend {
         Self {
             drew: Rc::new(Cell::new(false)),
             wake,
+            hotkeys: None,
         }
     }
 }
@@ -140,9 +146,24 @@ impl Backend for Win32Backend {
             .map(|wake| Arc::clone(wake) as Arc<dyn Waker>)
     }
 
+    fn listen(&mut self, name: &str) -> Result<Box<dyn Channel>, String> {
+        let waker = self.waker();
+        Ok(Box::new(crate::ipc::open(name, waker)?))
+    }
+
+    fn hotkeys(&mut self) -> Option<&mut (dyn GlobalHotkeys + 'static)> {
+        if self.hotkeys.is_none() {
+            // A sink that cannot be created is a platform with no hotkeys, which is what the
+            // `Option` answer means; the app reports the chord as unsupported.
+            self.hotkeys = Win32Hotkeys::open().ok();
+        }
+        self.hotkeys
+            .as_mut()
+            .map(|hotkeys| hotkeys as &mut (dyn GlobalHotkeys + 'static))
+    }
+
     fn wait(&mut self, timeout: Option<Duration>) -> Result<(), String> {
-        // The queue's own messages and the wake event are what end the sleep. A surface's
-        // messages are dispatched by its next step, so nothing here reads them.
+        // The queue's own messages and the wake event are what end the sleep.
         let handles = [self.wake.as_ref().map_or(HANDLE::default(), |wake| wake.0)];
         let given = if self.wake.is_some() {
             &handles[..]
@@ -154,6 +175,9 @@ impl Backend for Win32Backend {
         unsafe {
             MsgWaitForMultipleObjectsEx(Some(given), millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
+        // Dispatched here as well as per surface: a hotkey arrives at a window of this
+        // process that no surface owns, and a loop with no surfaces would never deliver it.
+        pump_messages();
         Ok(())
     }
 

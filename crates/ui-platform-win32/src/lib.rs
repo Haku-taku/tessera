@@ -11,13 +11,16 @@
 #![cfg(windows)]
 
 mod backend;
+mod hotkeys;
 mod input;
+mod ipc;
 mod presenter;
 mod session;
 mod theme;
 mod window;
 
 pub use backend::Win32Backend;
+pub use hotkeys::WINDOW_CLASS as HOTKEY_WINDOW_CLASS;
 pub use presenter::Win32Presenter;
 pub use session::Session;
 pub use theme::Win32ThemeWatcher;
