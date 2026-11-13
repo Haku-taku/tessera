@@ -1,8 +1,9 @@
-//! Screen capture through DXGI Desktop Duplication.
+//! Screen capture through DXGI Desktop Duplication, and the readback both capture paths share.
 //!
 //! The duplication hands over the desktop's own texture, on the adapter that drives the
 //! output — a device on any other adapter duplicates a black frame on a hybrid laptop. One
-//! output at a time: the caller names it or takes the primary.
+//! output at a time: the caller names it or takes the primary. A capture session (`wgc`)
+//! photographs the same output through the compositor instead.
 
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D,
 };
@@ -175,14 +176,7 @@ impl ScreenCapture {
                 ));
             }
         };
-        let staging = match &self.staging {
-            Some(staging) if self.matches(staging, &description) => staging.clone(),
-            _ => {
-                let staging = self.create_staging(&description)?;
-                self.staging = Some(staging.clone());
-                staging
-            }
-        };
+        let staging = staging_for(&self.context, &mut self.staging, &description)?;
         unsafe { self.context.CopyResource(&staging, &texture) };
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
@@ -191,98 +185,108 @@ impl ScreenCapture {
         }
         .map_err(|error| format!("map the desktop frame: {error}"))?;
         let tight = if float {
-            self.read_float_rows(&mapped, &description)
+            read_float_rows(&mapped, &description, self.reference_nits)
         } else {
-            self.read_rows(&mapped, &description)
+            read_rows(&mapped, &description)
         };
         unsafe { self.context.Unmap(&staging, 0) };
         Ok((description.Width, description.Height, tight))
     }
+}
 
-    /// Whether the cached copy already has the desktop's size and packing.
-    fn matches(&self, staging: &ID3D11Texture2D, wanted: &D3D11_TEXTURE2D_DESC) -> bool {
+/// A CPU-readable copy of `wanted`, reused from `cached` when it already matches.
+///
+/// Two capture paths read the compositor's texture through this, so the copy is described
+/// once: staging usage, one mip, and a single sample, which is what a desktop surface is.
+pub(crate) fn staging_for(
+    context: &ID3D11DeviceContext,
+    cached: &mut Option<ID3D11Texture2D>,
+    wanted: &D3D11_TEXTURE2D_DESC,
+) -> Result<ID3D11Texture2D, String> {
+    if let Some(staging) = cached {
         let mut current = D3D11_TEXTURE2D_DESC::default();
         unsafe { staging.GetDesc(&mut current) };
-        current.Width == wanted.Width
+        if current.Width == wanted.Width
             && current.Height == wanted.Height
             && current.Format == wanted.Format
-    }
-
-    fn create_staging(&self, wanted: &D3D11_TEXTURE2D_DESC) -> Result<ID3D11Texture2D, String> {
-        let description = D3D11_TEXTURE2D_DESC {
-            Width: wanted.Width,
-            Height: wanted.Height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: wanted.Format,
-            SampleDesc: wanted.SampleDesc,
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-        };
-        let mut staging: Option<ID3D11Texture2D> = None;
-        // The context, not the device: both belong to the device the duplication was made on.
-        let device = unsafe { self.context.GetDevice() }
-            .map_err(|error| format!("the duplication's device: {error}"))?;
-        unsafe { device.CreateTexture2D(&description, None, Some(&mut staging)) }
-            .map_err(|error| format!("staging texture: {error}"))?;
-        staging.ok_or_else(|| String::from("CreateTexture2D returned no texture"))
-    }
-
-    /// The float desktop as sRGB codes the content had.
-    ///
-    /// Its linear light is referenced to 80 nits and SDR white to the display's own, so
-    /// dividing by that scale returns the codes a window drew. Light past SDR white clips.
-    fn read_float_rows(
-        &self,
-        mapped: &D3D11_MAPPED_SUBRESOURCE,
-        size: &D3D11_TEXTURE2D_DESC,
-    ) -> Vec<u8> {
-        let width = size.Width as usize;
-        let rows = size.Height as usize;
-        let to_white = 80.0 / self.reference_nits;
-        let mut pixels = Vec::with_capacity(width * rows * 4);
-        let pitch = mapped.RowPitch as usize;
-        for row in 0..rows {
-            let source = unsafe { (mapped.pData as *const u8).add(row * pitch) };
-            // SAFETY: as in `read_rows`, the row holds the texture's texels for its width.
-            let row_bytes = unsafe { std::slice::from_raw_parts(source, width * 8) };
-            for texel in row_bytes.as_chunks::<8>().0 {
-                for channel in 0..3 {
-                    let at = channel * 2;
-                    let bits = u16::from_le_bytes([texel[at], texel[at + 1]]);
-                    let linear = (from_half(bits) * to_white).clamp(0.0, 1.0);
-                    let code = TransferFunction::Srgb.encode(linear) * 255.0;
-                    pixels.push(code.round() as u8);
-                }
-                pixels.push(255);
-            }
+        {
+            return Ok(staging.clone());
         }
-        pixels
     }
+    let description = D3D11_TEXTURE2D_DESC {
+        Width: wanted.Width,
+        Height: wanted.Height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: wanted.Format,
+        SampleDesc: wanted.SampleDesc,
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut created: Option<ID3D11Texture2D> = None;
+    let device = unsafe { context.GetDevice() }
+        .map_err(|error| format!("the capture's device: {error}"))?;
+    unsafe { device.CreateTexture2D(&description, None, Some(&mut created)) }
+        .map_err(|error| format!("staging texture: {error}"))?;
+    let created = created.ok_or_else(|| String::from("CreateTexture2D returned no texture"))?;
+    *cached = Some(created.clone());
+    Ok(created)
+}
 
-    /// The mapped rows as straight RGBA, each row copied out of its own pitch.
-    fn read_rows(&self, mapped: &D3D11_MAPPED_SUBRESOURCE, size: &D3D11_TEXTURE2D_DESC) -> Vec<u8> {
-        let width = size.Width as usize;
-        let rows = size.Height as usize;
-        let mut pixels = Vec::with_capacity(width * rows * 4);
-        let pitch = mapped.RowPitch as usize;
-        for row in 0..rows {
-            let source = unsafe { (mapped.pData as *const u8).add(row * pitch) };
-            // SAFETY: D3D11 guarantees a mapped texture is readable for `RowPitch` bytes per
-            // row, and the row holds four bytes per texel of the width it was created for.
-            let row_pixels = unsafe { std::slice::from_raw_parts(source, width * 4) };
-            for texel in row_pixels.as_chunks::<4>().0 {
-                pixels.extend_from_slice(&[texel[2], texel[1], texel[0], texel[3]]);
+/// The float desktop as sRGB codes the content had.
+///
+/// Its linear light is referenced to 80 nits and SDR white to the display's own, so dividing
+/// by that scale returns the codes a window drew. Light past SDR white clips.
+pub(crate) fn read_float_rows(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    size: &D3D11_TEXTURE2D_DESC,
+    reference_nits: f32,
+) -> Vec<u8> {
+    let width = size.Width as usize;
+    let rows = size.Height as usize;
+    let to_white = 80.0 / reference_nits;
+    let mut pixels = Vec::with_capacity(width * rows * 4);
+    let pitch = mapped.RowPitch as usize;
+    for row in 0..rows {
+        let source = unsafe { (mapped.pData as *const u8).add(row * pitch) };
+        // SAFETY: as in `read_rows`, the row holds the texture's texels for its width.
+        let row_bytes = unsafe { std::slice::from_raw_parts(source, width * 8) };
+        for texel in row_bytes.as_chunks::<8>().0 {
+            for channel in 0..3 {
+                let at = channel * 2;
+                let bits = u16::from_le_bytes([texel[at], texel[at + 1]]);
+                let linear = (from_half(bits) * to_white).clamp(0.0, 1.0);
+                let code = TransferFunction::Srgb.encode(linear) * 255.0;
+                pixels.push(code.round() as u8);
             }
+            pixels.push(255);
         }
-        pixels
     }
+    pixels
+}
+
+/// The mapped rows as straight RGBA, each row copied out of its own pitch.
+pub(crate) fn read_rows(mapped: &D3D11_MAPPED_SUBRESOURCE, size: &D3D11_TEXTURE2D_DESC) -> Vec<u8> {
+    let width = size.Width as usize;
+    let rows = size.Height as usize;
+    let mut pixels = Vec::with_capacity(width * rows * 4);
+    let pitch = mapped.RowPitch as usize;
+    for row in 0..rows {
+        let source = unsafe { (mapped.pData as *const u8).add(row * pitch) };
+        // SAFETY: D3D11 guarantees a mapped texture is readable for `RowPitch` bytes per
+        // row, and the row holds four bytes per texel of the width it was created for.
+        let row_pixels = unsafe { std::slice::from_raw_parts(source, width * 4) };
+        for texel in row_pixels.as_chunks::<4>().0 {
+            pixels.extend_from_slice(&[texel[2], texel[1], texel[0], texel[3]]);
+        }
+    }
+    pixels
 }
 
 /// The adapter and output a grab reads, with the output's GDI device name.
-fn find_output(
+pub(crate) fn find_output(
     factory: &IDXGIFactory1,
     wanted: Option<&str>,
 ) -> Result<(IDXGIAdapter, IDXGIOutput, String), String> {
@@ -360,7 +364,9 @@ fn from_half(bits: u16) -> f32 {
 }
 
 /// A D3D11 device on `adapter`, which duplication requires.
-fn device_on(adapter: &IDXGIAdapter) -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
+pub(crate) fn device_on(
+    adapter: &IDXGIAdapter,
+) -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
     let levels = [
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1,
@@ -373,7 +379,8 @@ fn device_on(adapter: &IDXGIAdapter) -> Result<(ID3D11Device, ID3D11DeviceContex
             adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
-            D3D11_CREATE_DEVICE_FLAG(0),
+            // BGRA support is what a compositor surface arrives through, in either path.
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             Some(&levels),
             D3D11_SDK_VERSION,
             Some(&mut device),
@@ -389,7 +396,7 @@ fn device_on(adapter: &IDXGIAdapter) -> Result<(ID3D11Device, ID3D11DeviceContex
 }
 
 /// Device pixels per logical point for `monitor`, 1.0 when Windows will not say.
-fn monitor_scale(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> f32 {
+pub(crate) fn monitor_scale(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> f32 {
     let (mut x, mut y) = (96u32, 96u32);
     let asked = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) };
     if asked.is_err() || x == 0 {

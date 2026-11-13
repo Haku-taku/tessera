@@ -5,8 +5,9 @@
 //! the workspace builds an empty library there.
 //!
 //! The swap chain follows its output into HDR when Windows is composing there, and stays
-//! 8-bit sRGB otherwise. A screen capture duplicates one output and returns it as the sRGB
-//! codes a window drew, even where Windows composes the desktop in linear light. What it
+//! 8-bit sRGB otherwise. A screen capture duplicates one output or runs a capture session over
+//! it, and returns the sRGB codes a window drew, even where Windows composes the desktop in
+//! linear light. What it
 //! does not do yet: a clipboard read that carries more than text. Keys, the pointer, the
 //! wheel, text and the input method's composition reach the engine as its own events.
 
@@ -23,6 +24,7 @@ mod outputs;
 mod presenter;
 mod session;
 mod theme;
+mod wgc;
 mod window;
 
 pub use backend::Win32Backend;
@@ -33,6 +35,7 @@ pub use presenter::Win32Presenter;
 pub use session::Session;
 pub use theme::Win32ThemeWatcher;
 pub use ui_platform::session::{HostSession, SessionOptions, Tick};
+pub use wgc::GraphicsCapture;
 pub use window::Win32Window;
 
 /// Why the window or its presentation path could not open.
