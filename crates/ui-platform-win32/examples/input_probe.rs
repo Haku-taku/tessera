@@ -27,8 +27,8 @@ fn windows_main() -> Result<(), String> {
     use ui_platform_win32::Win32Window;
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        PostMessageW, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-        WM_MOUSEWHEEL,
+        PostMessageW, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL,
+        WM_MOUSEMOVE, WM_MOUSEWHEEL,
     };
 
     let mut window = Win32Window::new(SurfaceSpec::window(
@@ -50,6 +50,7 @@ fn windows_main() -> Result<(), String> {
     post(WM_LBUTTONDOWN, 0, at(40, 30))?;
     post(WM_LBUTTONUP, 0, at(40, 30))?;
     post(WM_MOUSEWHEEL, 120usize << 16, at(40, 30))?;
+    post(WM_MOUSEHWHEEL, 120usize << 16, at(40, 30))?;
     post(WM_CHAR, 'x' as usize, LPARAM(0))?;
     post(WM_KEYDOWN, 0x1B, LPARAM(0))?;
     // The real cursor is not over the window, so Windows follows the synthetic move with a
@@ -90,6 +91,12 @@ fn windows_main() -> Result<(), String> {
         events
             .iter()
             .any(|event| matches!(event, Event::Scroll { delta, .. } if *delta == Point::new(0.0, -48.0))),
+    );
+    ok &= expect(
+        "a wheel tilted right scrolls sideways by one step",
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Scroll { delta, .. } if *delta == Point::new(48.0, 0.0))),
     );
     ok &= expect(
         "a character arrives as text",

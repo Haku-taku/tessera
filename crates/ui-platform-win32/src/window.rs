@@ -47,7 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
     WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP,
@@ -907,10 +907,10 @@ unsafe fn handle(
             let _ = unsafe { ReleaseCapture() };
             Some(LRESULT(0))
         }
-        WM_MOUSEWHEEL => {
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             let notches = ((wparam.0 as u32) >> 16) as u16 as i16 as f32 / 120.0;
-            // Unlike the button messages this one names a screen position, and a window that
-            // let the pointer through never saw a move to fall back on.
+            // Unlike the button messages these name a screen position, and a window that let
+            // the pointer through never saw a move to fall back on.
             let mut point = packed_point(lparam);
             let pos = if unsafe { ScreenToClient(hwnd, &mut point) }.as_bool() {
                 logical_point(state, point)
@@ -920,11 +920,18 @@ unsafe fn handle(
                     None => return Some(LRESULT(0)),
                 }
             };
-            // A positive delta is a notch away from the user, which scrolls content up.
+            let delta = if message == WM_MOUSEHWHEEL {
+                // Positive is a wheel tilted right, which reveals content to the right; the
+                // engine and Wayland both call that a positive step.
+                Point::new(notches * input::WHEEL_NOTCH, 0.0)
+            } else {
+                // Positive is a notch away from the user, which scrolls content up.
+                Point::new(0.0, -notches * input::WHEEL_NOTCH)
+            };
             state
                 .borrow_mut()
                 .events
-                .push(Event::wheel(pos, -notches * input::WHEEL_NOTCH));
+                .push(Event::Scroll { pos, delta });
             Some(LRESULT(0))
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
