@@ -2,7 +2,8 @@
 
 use ui_core::Damage;
 use ui_core::colour::{
-    Chromaticities, Destination, Domain, ToneMapping, WhiteAdaptation, gamut_matrix_adapted,
+    Chromaticities, Destination, Domain, LinearEncoding, ToneMapping, WhiteAdaptation,
+    gamut_matrix_adapted,
 };
 use ui_core::draw::DrawList;
 use ui_gpu_d3d11::D3d11Device;
@@ -16,8 +17,8 @@ use windows::Win32::Graphics::DirectComposition::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_ALPHA_MODE_UNSPECIFIED,
-    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH,
@@ -47,8 +48,9 @@ pub struct Win32Presenter {
     renderer: GpuRenderer,
     chain: IDXGISwapChain1,
     format: DXGI_FORMAT,
-    /// Set when the chain carries PQ in BT.2020 rather than an 8-bit SDR surface.
-    hdr: Option<HdrOutput>,
+    /// The output the chain declares HDR for, with how that light is encoded; `None` on an
+    /// 8-bit SDR surface.
+    hdr: Option<(HdrOutput, LinearEncoding)>,
     /// Held for the life of the surface: composed frames stop showing when it drops.
     _composition: Option<Composition>,
     /// The back buffer as a target; released before the chain resizes.
@@ -87,8 +89,8 @@ impl Win32Presenter {
             window.composited(),
         )?;
         // Before the frame target exists: its format follows the destination.
-        if let Some(output) = opened.hdr {
-            aim_at_hdr(&mut renderer, output);
+        if let Some((output, encoding)) = opened.hdr {
+            aim_at_hdr(&mut renderer, output, encoding);
         }
         let mut this = Self {
             device,
@@ -139,7 +141,12 @@ impl Win32Presenter {
 
     /// The HDR the swap chain declares; `None` when it presents an SDR surface.
     pub fn hdr(&self) -> Option<HdrOutput> {
-        self.hdr
+        self.hdr.map(|(output, _)| output)
+    }
+
+    /// How the chain encodes linear light, which decides what its buffer holds.
+    pub fn hdr_encoding(&self) -> Option<LinearEncoding> {
+        self.hdr.map(|(_, encoding)| encoding)
     }
 
     /// The scene renderer, for knobs only the scene knows about such as supersampling.
@@ -321,7 +328,7 @@ impl RenderTarget for Frame {
 struct Chain {
     chain: IDXGISwapChain1,
     format: DXGI_FORMAT,
-    hdr: Option<HdrOutput>,
+    hdr: Option<(HdrOutput, LinearEncoding)>,
     composition: Option<Composition>,
 }
 
@@ -338,7 +345,8 @@ struct Composition {
 /// The chain the window presents through, plus the HDR it declares.
 ///
 /// Only one chain exists at a time: the format is decided from the output before a chain is
-/// made, and a chain the driver will not declare PQ is dropped before the SDR one replaces it.
+/// made, and a chain the driver will declare neither PQ nor scRGB is dropped before the SDR
+/// one replaces it.
 fn open_chain(
     device: &ID3D11Device,
     hwnd: HWND,
@@ -351,11 +359,11 @@ fn open_chain(
     if let Some(output) = crate::outputs::hdr_output(&factory, monitor) {
         let format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         let (chain, composition) = create_chain(&factory, device, hwnd, size, format, composited)?;
-        if declare_hdr(&chain) {
+        if let Some(encoding) = declare_hdr(&chain) {
             return Ok(Chain {
                 chain,
                 format,
-                hdr: Some(output),
+                hdr: Some((output, encoding)),
                 composition,
             });
         }
@@ -371,35 +379,57 @@ fn open_chain(
     })
 }
 
-/// Declare the chain PQ in BT.2020; false when the output will not present that.
-fn declare_hdr(chain: &IDXGISwapChain1) -> bool {
-    let Ok(chain) = chain.cast::<IDXGISwapChain3>() else {
-        return false;
-    };
+/// Declare the chain in the first HDR space it will present, or `None` when it takes none.
+///
+/// PQ is what a colour-managed compositor asks for, and a float chain on an advanced-colour
+/// display often refuses it while accepting scRGB — which is what the desktop itself
+/// composites in, and what Chromium declares for HDR.
+fn declare_hdr(chain: &IDXGISwapChain1) -> Option<LinearEncoding> {
+    let chain = chain.cast::<IDXGISwapChain3>().ok()?;
     // `DXGI_COLOR_SPACE_SUPPORT_FLAG_PRESENT`, the flag the bindings do not name.
     const SUPPORTED_FOR_PRESENT: u32 = 0x1;
-    let space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-    let supported = unsafe { chain.CheckColorSpaceSupport(space) }
-        .is_ok_and(|flags| flags & SUPPORTED_FOR_PRESENT != 0);
-    supported && unsafe { chain.SetColorSpace1(space) }.is_ok()
+    for (space, encoding) in [
+        (
+            DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+            LinearEncoding::Pq,
+        ),
+        (DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, LinearEncoding::ScRgb),
+    ] {
+        let presentable = unsafe { chain.CheckColorSpaceSupport(space) }
+            .is_ok_and(|flags| flags & SUPPORTED_FOR_PRESENT != 0);
+        if presentable && unsafe { chain.SetColorSpace1(space) }.is_ok() {
+            return Some(encoding);
+        }
+    }
+    None
 }
 
-/// Point the renderer at the display: linear light tone mapped into the panel's own range,
-/// and BT.2020 because that is the gamut a PQ surface carries.
-fn aim_at_hdr(renderer: &mut GpuRenderer, output: HdrOutput) {
+/// Point the renderer at the display: light tone mapped into the panel's own range, in the
+/// gamut and encoding the chain declared.
+fn aim_at_hdr(renderer: &mut GpuRenderer, output: HdrOutput, encoding: LinearEncoding) {
     renderer.set_destination(Destination {
         domain: Domain::Linear {
             reference_nits: output.reference_nits,
             min_nits: output.min_nits,
             peak_nits: output.peak_nits,
+            encoding,
         },
         tone: ToneMapping::Bt2390,
     });
-    renderer.set_gamut(gamut_matrix_adapted(
-        Chromaticities::SRGB,
-        Chromaticities::BT2020,
-        WhiteAdaptation::Bradford,
-    ));
+    renderer.set_gamut(match encoding {
+        // A PQ surface carries BT.2020.
+        LinearEncoding::Pq => gamut_matrix_adapted(
+            Chromaticities::SRGB,
+            Chromaticities::BT2020,
+            WhiteAdaptation::Bradford,
+        ),
+        // scRGB's primaries are the working space's own, so nothing is converted.
+        LinearEncoding::ScRgb => gamut_matrix_adapted(
+            Chromaticities::SRGB,
+            Chromaticities::SRGB,
+            WhiteAdaptation::Bradford,
+        ),
+    });
 }
 
 /// A flip-model chain at `format`, composed when the surface's alpha is meant to be seen.

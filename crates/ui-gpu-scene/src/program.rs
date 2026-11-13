@@ -12,6 +12,7 @@ pub enum ProgramKey {
     Box,
     OutputSrgb,
     OutputLinear,
+    OutputScRgb,
     Resolve,
     Capture,
     Rects,
@@ -104,7 +105,7 @@ impl ProgramKey {
                     "u_color",
                 ],
             },
-            Self::OutputSrgb | Self::OutputLinear => ProgramSpec {
+            Self::OutputSrgb | Self::OutputLinear | Self::OutputScRgb => ProgramSpec {
                 stride: layout::RECT_STRIDE,
                 attributes: LAYER,
                 required: &["u_viewport", "u_src", "u_scale", "u_offset", "u_gamut"],

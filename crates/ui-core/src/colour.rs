@@ -546,7 +546,18 @@ pub enum Domain {
         /// Black level, in nits; the output pass places it in PQ.
         min_nits: f32,
         peak_nits: f32,
+        encoding: LinearEncoding,
     },
+}
+
+/// How a linear destination's bytes are encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinearEncoding {
+    /// PQ codes over BT.2020, which is what a Wayland colour manager asks for.
+    Pq,
+    /// scRGB: linear light whose 1.0 is [`SCRGB_WHITE_NITS`] over BT.709, which is what a
+    /// DXGI float swap chain carries on an advanced-colour display.
+    ScRgb,
 }
 
 /// What brings content above the destination's peak into its range.
@@ -950,6 +961,7 @@ mod tests {
                 reference_nits: 203.0,
                 min_nits: 0.0,
                 peak_nits: 417.0,
+                encoding: LinearEncoding::Pq,
             },
             tone: ToneMapping::Bt2390,
         };
@@ -1004,6 +1016,7 @@ mod tests {
                 reference_nits: 203.0,
                 min_nits: 0.0,
                 peak_nits: 1000.0,
+                encoding: LinearEncoding::Pq,
             },
             tone: ToneMapping::Bt2390,
         };
@@ -1056,6 +1069,7 @@ mod tests {
                 reference_nits: 203.0,
                 min_nits: 0.0,
                 peak_nits: 417.0,
+                encoding: LinearEncoding::Pq,
             },
             tone: ToneMapping::Bt2390,
         };

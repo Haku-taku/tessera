@@ -1,9 +1,10 @@
 //! Check what the presented buffer holds when Windows is showing HDR.
 //!
 //! The screen cannot judge this — a panel tone-maps and the desktop compositor may rescale —
-//! so the check reads the back buffer back and compares it with `encode_for_pq_output`, the
-//! same authority the Wayland probe uses. On an SDR output the check runs the other way:
-//! the buffer must still hold the sRGB codes, with no trace of the PQ transform.
+//! so the check reads the back buffer back and compares it with the transform the chain
+//! declared: `encode_for_pq_output` for a PQ surface, and linear light in 80-nit units for
+//! scRGB, the same authority the Wayland probe uses. On an SDR output the check runs the
+//! other way: the buffer must still hold the sRGB codes, with no trace of an HDR transform.
 //!
 //! Run: `cargo run -p ui-platform-win32 --example hdr --release`
 
@@ -24,7 +25,9 @@ fn main() {
 fn windows_main() -> Result<(), String> {
     use ui_core::Damage;
     use ui_core::NodeId;
-    use ui_core::colour::{TransferFunction, encode_for_pq_output};
+    use ui_core::colour::{
+        LinearEncoding, SCRGB_WHITE_NITS, TransferFunction, encode_for_pq_output,
+    };
     use ui_core::draw::{DrawList, RectPrim};
     use ui_core::geom::{Color, Corners, Rect};
     use ui_platform::present::SceneTarget;
@@ -58,13 +61,14 @@ fn windows_main() -> Result<(), String> {
     let mut window = Win32Window::new(spec).map_err(|error| error.to_string())?;
     let mut presenter = Win32Presenter::new(&window).map_err(|error| error.to_string())?;
     let hdr = presenter.hdr();
+    let encoding = presenter.hdr_encoding();
     let text = TextPass::isolated();
-    match hdr {
-        Some(output) => println!(
-            "HDR output: SDR white {} nits, black {} nits, peak {} nits",
+    match (hdr, encoding) {
+        (Some(output), Some(encoding)) => println!(
+            "HDR output ({encoding:?}): SDR white {} nits, black {} nits, peak {} nits",
             output.reference_nits, output.min_nits, output.peak_nits
         ),
-        None => println!("SDR output: the swap chain is 8-bit sRGB"),
+        _ => println!("SDR output: the swap chain is 8-bit sRGB"),
     }
 
     let (width, height) = presenter.size();
@@ -83,9 +87,15 @@ fn windows_main() -> Result<(), String> {
         let index = ((height / 2) * width + width / 2) as usize * 4;
         let actual = pixels[index] as f32 / 255.0;
         let linear = TransferFunction::Srgb.decode(code as f32 / 255.0);
-        let expected = match hdr {
-            Some(output) => encode_for_pq_output(linear, output.reference_nits, output.min_nits),
-            None => code as f32 / 255.0,
+        let expected = match (hdr, encoding) {
+            (Some(output), Some(LinearEncoding::Pq)) => {
+                encode_for_pq_output(linear, output.reference_nits, output.min_nits)
+            }
+            // scRGB's unit is 80 nits, and the readback stops at the surface's own 1.0.
+            (Some(output), Some(LinearEncoding::ScRgb)) => {
+                (linear * output.reference_nits / SCRGB_WHITE_NITS).min(1.0)
+            }
+            _ => code as f32 / 255.0,
         };
         // One 8-bit step plus the shader's own rounding.
         let delta = (actual - expected).abs();
@@ -101,17 +111,30 @@ fn windows_main() -> Result<(), String> {
     }
 
     // A transform that did nothing would pass every "same as the input" check above, so pin
-    // the opposite: on an HDR surface white must land well away from the top of the range.
-    let white = match hdr {
-        Some(output) => encode_for_pq_output(1.0, output.reference_nits, output.min_nits),
-        None => 1.0,
+    // the opposite: on a PQ surface white lands well away from the top of the range, and on
+    // scRGB a mid grey lands where linear light puts it rather than where the sRGB code does.
+    let mid = 128.0 / 255.0;
+    let (moved, observed) = match (hdr, encoding) {
+        (Some(output), Some(LinearEncoding::Pq)) => {
+            let white = encode_for_pq_output(1.0, output.reference_nits, output.min_nits);
+            (white < 0.75, format!("white at {white:.4}"))
+        }
+        (Some(output), Some(LinearEncoding::ScRgb)) => {
+            let value = (TransferFunction::Srgb.decode(mid) * output.reference_nits
+                / SCRGB_WHITE_NITS)
+                .min(1.0);
+            (
+                (value - mid).abs() > 3.0 / 255.0,
+                format!("mid grey at {value:.4}"),
+            )
+        }
+        _ => (true, String::from("no transform to reach the buffer")),
     };
-    let moved = hdr.is_none() || white < 0.75;
     if !moved {
         failures += 1;
     }
     println!(
-        "[6] white is not the top of the range: {white:.4} {}",
+        "[6] the transform reached the buffer: {observed} {}",
         if moved { "ok" } else { "FAIL" }
     );
 
@@ -120,8 +143,9 @@ fn windows_main() -> Result<(), String> {
     }
     println!(
         "PASS: {}",
-        match hdr {
-            Some(_) => "the buffer holds PQ codes the output describes",
+        match encoding {
+            Some(LinearEncoding::Pq) => "the buffer holds PQ codes the output describes",
+            Some(LinearEncoding::ScRgb) => "the buffer holds scRGB light the output describes",
             None => "the buffer holds sRGB codes, as an SDR output expects",
         }
     );

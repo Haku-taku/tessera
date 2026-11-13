@@ -76,6 +76,7 @@ fn main() {
             reference_nits: REFERENCE_NITS,
             min_nits: MIN_NITS,
             peak_nits: PEAK_NITS,
+            encoding: ui_core::colour::LinearEncoding::Pq,
         },
         tone: ui_core::colour::ToneMapping::Bt2390,
     });

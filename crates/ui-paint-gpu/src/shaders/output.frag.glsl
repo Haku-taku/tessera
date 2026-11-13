@@ -36,10 +36,16 @@ void main() {
 #else
     vec3 lin = vec3(srgb_decode(straight.r), srgb_decode(straight.g), srgb_decode(straight.b));
 #endif
-    // sRGB -> BT.2020 in linear light; the surface is declared as BT.2020.
+    // The surface's own gamut: BT.2020 on a PQ surface, the identity on scRGB.
     lin = u_gamut * lin;
+#ifdef SCRGB_OUTPUT
+    // scRGB is linear light whose 1.0 is 80 nits, so the scale has already carried the
+    // scene's white into the surface's unit and nothing is left to encode.
+    vec3 code = max(u_scale * lin + u_offset, vec3(0.0));
+#else
     vec3 code = vec3(pq_encode(clamp(u_scale * lin.r + u_offset, 0.0, 1.0)),
                      pq_encode(clamp(u_scale * lin.g + u_offset, 0.0, 1.0)),
                      pq_encode(clamp(u_scale * lin.b + u_offset, 0.0, 1.0)));
+#endif
     frag = vec4(code * c.a, c.a);
 }

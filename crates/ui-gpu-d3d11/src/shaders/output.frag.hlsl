@@ -1,4 +1,4 @@
-// Output transform: sRGB-encoded premultiplied in, PQ-encoded premultiplied out.
+// Output transform: sRGB-encoded premultiplied in, PQ or scRGB premultiplied out.
 
 float srgb_decode(float c) {
     return c <= 0.040449237 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
@@ -28,10 +28,16 @@ float4 main(PsIn input) : SV_Target {
 #else
     float3 lin = float3(srgb_decode(straight.r), srgb_decode(straight.g), srgb_decode(straight.b));
 #endif
-    // sRGB -> BT.2020 in linear light; the surface is declared as BT.2020.
+    // The surface's own gamut: BT.2020 on a PQ surface, the identity on scRGB.
     lin = mul(u_gamut, lin);
+#ifdef SCRGB_OUTPUT
+    // scRGB is linear light whose 1.0 is 80 nits, so the scale has already carried the
+    // scene's white into the surface's unit and nothing is left to encode.
+    float3 code = max(u_scale * lin + u_offset, 0.0);
+#else
     float3 code = float3(pq_encode(clamp(u_scale * lin.r + u_offset, 0.0, 1.0)),
                          pq_encode(clamp(u_scale * lin.g + u_offset, 0.0, 1.0)),
                          pq_encode(clamp(u_scale * lin.b + u_offset, 0.0, 1.0)));
+#endif
     return float4(code * c.a, c.a);
 }

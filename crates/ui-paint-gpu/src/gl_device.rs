@@ -250,6 +250,13 @@ fn sources(key: ProgramKey) -> (String, String) {
             layer(),
             format!("#define LINEAR_DOMAIN\n{}", shader::OUTPUT_FRAGMENT),
         ),
+        ProgramKey::OutputScRgb => (
+            layer(),
+            format!(
+                "#define LINEAR_DOMAIN\n#define SCRGB_OUTPUT\n{}",
+                shader::OUTPUT_FRAGMENT
+            ),
+        ),
         ProgramKey::Resolve => (layer(), shader::RESOLVE_FRAGMENT.to_string()),
         ProgramKey::Capture => (layer(), shader::CAPTURE_FRAGMENT.to_string()),
         ProgramKey::Rects => (shader::RECT_VERTEX.to_string(), shader::rect_fragment()),

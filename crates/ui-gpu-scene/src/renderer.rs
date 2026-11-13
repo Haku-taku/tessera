@@ -284,6 +284,8 @@ pub struct GpuRenderer {
     /// variants of the same source, picked by the working domain.
     output_srgb: Program,
     output_linear: Program,
+    /// The same pass ending in scRGB instead of PQ.
+    output_scrgb: Program,
     /// Box average from the supersampled frame down to the presented buffer.
     resolve: Program,
     resolve_scratch: Option<Target>,
@@ -292,8 +294,10 @@ pub struct GpuRenderer {
     capture_targets: Vec<CaptureTarget>,
     /// Rendering resolution multiplier: every internal target is `ss²` times the surface.
     supersample: u32,
-    /// (scale, offset) for the PQ output transform; `None` keeps the buffer as sRGB.
+    /// (scale, offset) for the output transform; `None` keeps the buffer as sRGB.
     hdr: Option<[f32; 2]>,
+    /// Which encoding the transform writes when it runs.
+    linear_encoding: ui_core::colour::LinearEncoding,
     /// What this renderer draws onto: the domain, its white and peak, and the tone curve.
     /// Content is converted for it, so a change here invalidates every image texture.
     destination: ui_core::colour::Destination,
@@ -378,6 +382,7 @@ impl GpuRenderer {
         let glass_kit_linear = new_program(device, ProgramKey::GlassKitLinear)?;
         let output_srgb = new_program(device, ProgramKey::OutputSrgb)?;
         let output_linear = new_program(device, ProgramKey::OutputLinear)?;
+        let output_scrgb = new_program(device, ProgramKey::OutputScRgb)?;
         let resolve = new_program(device, ProgramKey::Resolve)?;
         let capture = new_program(device, ProgramKey::Capture)?;
         Ok(Self {
@@ -398,6 +403,7 @@ impl GpuRenderer {
             material: None,
             output_srgb,
             output_linear,
+            output_scrgb,
             resolve,
             resolve_scratch: None,
             capture,
@@ -406,6 +412,7 @@ impl GpuRenderer {
             layer_bounds: Vec::new(),
             layer_radius: Vec::new(),
             hdr: None,
+            linear_encoding: ui_core::colour::LinearEncoding::Pq,
             destination: ui_core::colour::Destination::SDR,
             encode: Encode::Srgb,
             target_format: TargetFormat::Rgba8,
@@ -438,25 +445,38 @@ impl GpuRenderer {
         true
     }
 
-    /// Device pixels per logical point.
-    /// Turn on the PQ output transform; `None` writes sRGB straight through.
+    /// Draw for `destination` from the next frame on.
     ///
     /// The domain and the frame precision are one choice: linear light in eight bits bands
     /// in the shadows far worse than sRGB does, so HDR always stores f16.
-    /// Draw for `destination` from the next frame on.
     pub fn set_destination(&mut self, destination: ui_core::colour::Destination) {
         self.destination = destination;
-        self.hdr = match destination.domain {
-            ui_core::colour::Domain::Encoded => None,
-            ui_core::colour::Domain::Linear {
+        use ui_core::colour::{Domain, LinearEncoding};
+        let (hdr, encoding) = match destination.domain {
+            Domain::Encoded => (None, LinearEncoding::Pq),
+            Domain::Linear {
                 reference_nits,
                 min_nits,
+                encoding,
                 ..
-            } => Some([
-                ui_core::colour::reference_scale(reference_nits),
-                ui_core::colour::min_offset(min_nits),
-            ]),
+            } => (
+                Some(match encoding {
+                    LinearEncoding::Pq => [
+                        ui_core::colour::reference_scale(reference_nits),
+                        ui_core::colour::min_offset(min_nits),
+                    ],
+                    // scRGB's unit is 80 nits whatever the display's white is, so the
+                    // scene's white is what has to be carried into it.
+                    LinearEncoding::ScRgb => [
+                        reference_nits / ui_core::colour::SCRGB_WHITE_NITS,
+                        0.0,
+                    ],
+                }),
+                encoding,
+            ),
         };
+        self.hdr = hdr;
+        self.linear_encoding = encoding;
         self.encode = Encode::of(destination);
         self.target_format = match self.encode {
             Encode::Srgb => crate::format::TargetFormat::Rgba8,
@@ -479,6 +499,7 @@ impl GpuRenderer {
         self.gamut = gamut;
     }
 
+    /// Device pixels per logical point.
     pub fn set_scale(&mut self, scale: f32) {
         self.scale = if scale.is_finite() && scale > 0.0 {
             scale
@@ -923,9 +944,12 @@ impl GpuRenderer {
                 size.1,
                 self.target_format,
             )?;
-            let p = match self.encode {
-                Encode::Srgb => &self.output_srgb,
-                Encode::Linear => &self.output_linear,
+            let p = match self.linear_encoding {
+                ui_core::colour::LinearEncoding::ScRgb => &self.output_scrgb,
+                ui_core::colour::LinearEncoding::Pq => match self.encode {
+                    Encode::Srgb => &self.output_srgb,
+                    Encode::Linear => &self.output_linear,
+                },
             };
 
             device.bind_target(Some(scratch.fbo));
@@ -3385,6 +3409,7 @@ mod tests {
                 reference_nits: 203.0,
                 min_nits: 0.0,
                 peak_nits: 417.0,
+                encoding: ui_core::colour::LinearEncoding::Pq,
             },
             tone: ui_core::colour::ToneMapping::Bt2390,
         };

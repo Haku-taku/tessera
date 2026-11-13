@@ -55,6 +55,7 @@ fn destination(surface: HdrSurface) -> ui_core::colour::Destination {
             reference_nits: surface.reference_nits as f32,
             min_nits: surface.min_nits,
             peak_nits: surface.max_nits,
+            encoding: ui_core::colour::LinearEncoding::Pq,
         },
         tone: ui_core::colour::ToneMapping::Bt2390,
     }

@@ -249,7 +249,7 @@ fn uniforms(key: ProgramKey) -> &'static [Uniform] {
         ProgramKey::Layers => RECT,
         ProgramKey::Effects => EFFECT,
         ProgramKey::Box => BOX,
-        ProgramKey::OutputSrgb | ProgramKey::OutputLinear => OUTPUT,
+        ProgramKey::OutputSrgb | ProgramKey::OutputLinear | ProgramKey::OutputScRgb => OUTPUT,
         ProgramKey::Resolve => RESOLVE,
         ProgramKey::Capture => CAPTURE,
         ProgramKey::Rects
@@ -351,6 +351,7 @@ fn bodies(key: ProgramKey) -> (&'static str, &'static str, bool) {
         ProgramKey::Box => (LAYER_VERTEX, BOX_FRAGMENT, false),
         ProgramKey::OutputSrgb => (LAYER_VERTEX, OUTPUT_FRAGMENT, false),
         ProgramKey::OutputLinear => (LAYER_VERTEX, OUTPUT_FRAGMENT, true),
+        ProgramKey::OutputScRgb => (LAYER_VERTEX, OUTPUT_FRAGMENT, true),
         ProgramKey::Resolve => (LAYER_VERTEX, RESOLVE_FRAGMENT, false),
         ProgramKey::Capture => (LAYER_VERTEX, CAPTURE_FRAGMENT, false),
         ProgramKey::Rects => (RECT_VERTEX, RECT_FRAGMENT, false),
@@ -442,10 +443,11 @@ pub fn build(key: ProgramKey) -> Program {
     );
     let varyings = varyings(key);
 
-    let header = if linear {
-        "#define LINEAR_DOMAIN 1\n"
-    } else {
-        ""
+    let header = match (linear, key) {
+        (true, ProgramKey::OutputScRgb) => "#define LINEAR_DOMAIN 1\n#define SCRGB_OUTPUT 1\n",
+        (true, _) => "#define LINEAR_DOMAIN 1\n",
+        (false, ProgramKey::OutputScRgb) => "#define SCRGB_OUTPUT 1\n",
+        (false, _) => "",
     };
     let vertex = format!(
         "{header}{buffer}{COMMON}\n{}{}{vertex_body}",

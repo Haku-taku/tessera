@@ -24,8 +24,8 @@ fn windows_main() -> Result<(), String> {
     use std::time::{Duration, Instant};
 
     use ui_core::colour::{
-        Chromaticities, TransferFunction, WhiteAdaptation, encode_for_pq_output,
-        gamut_matrix_adapted,
+        Chromaticities, LinearEncoding, SCRGB_WHITE_NITS, TransferFunction, WhiteAdaptation,
+        encode_for_pq_output, gamut_matrix_adapted,
     };
     use ui_core::geom::{Color, Corners};
     use ui_core::{Id, NodeData, NodeKind, SizeClass};
@@ -136,18 +136,41 @@ fn windows_main() -> Result<(), String> {
         ]
     }
 
+    /// What the presenter took: the output it is on and how its chain encodes light.
+    #[derive(Clone, Copy)]
+    enum Target {
+        Sdr,
+        Hdr {
+            output: HdrOutput,
+            encoding: LinearEncoding,
+        },
+    }
+
+    impl Target {
+        fn of(presenter: &Win32Presenter) -> Self {
+            match (presenter.hdr(), presenter.hdr_encoding()) {
+                (Some(output), Some(encoding)) => Self::Hdr { output, encoding },
+                _ => Self::Sdr,
+            }
+        }
+    }
+
     /// The codes the presented buffer holds for `want`.
     ///
-    /// An HDR buffer holds PQ codes of linear light in BT.2020, so the expected value is the
-    /// colour through the same matrix and transfer the output shader uses.
-    fn expected(want: Color, hdr: Option<HdrOutput>) -> [u8; 4] {
-        let Some(output) = hdr else {
-            return [
-                (want.r * 255.0).round() as u8,
-                (want.g * 255.0).round() as u8,
-                (want.b * 255.0).round() as u8,
-                (want.a * 255.0).round() as u8,
-            ];
+    /// A linear destination holds light rather than codes: PQ over BT.2020 on one chain, or
+    /// scRGB in 80-nit units on another, where the readback stops at the surface's 1.0.
+    fn expected(want: Color, target: Target) -> [u8; 4] {
+        let alpha = (want.a * 255.0).round() as u8;
+        let (output, encoding) = match target {
+            Target::Sdr => {
+                return [
+                    (want.r * 255.0).round() as u8,
+                    (want.g * 255.0).round() as u8,
+                    (want.b * 255.0).round() as u8,
+                    alpha,
+                ];
+            }
+            Target::Hdr { output, encoding } => (output, encoding),
         };
         let linear = [
             TransferFunction::Srgb.decode(want.r),
@@ -156,21 +179,31 @@ fn windows_main() -> Result<(), String> {
         ];
         let gamut = gamut_matrix_adapted(
             Chromaticities::SRGB,
-            Chromaticities::BT2020,
+            match encoding {
+                LinearEncoding::Pq => Chromaticities::BT2020,
+                LinearEncoding::ScRgb => Chromaticities::SRGB,
+            },
             WhiteAdaptation::Bradford,
         );
         let mut codes = [0u8; 3];
         for (channel, row) in codes.iter_mut().zip(gamut) {
             let mapped: f32 = row.iter().zip(linear).map(|(m, l)| m * l).sum();
-            let code = encode_for_pq_output(mapped, output.reference_nits, output.min_nits);
+            let code = match encoding {
+                LinearEncoding::Pq => {
+                    encode_for_pq_output(mapped, output.reference_nits, output.min_nits)
+                }
+                LinearEncoding::ScRgb => {
+                    (mapped * output.reference_nits / SCRGB_WHITE_NITS).clamp(0.0, 1.0)
+                }
+            };
             *channel = (code * 255.0).round() as u8;
         }
-        [codes[0], codes[1], codes[2], (want.a * 255.0).round() as u8]
+        [codes[0], codes[1], codes[2], alpha]
     }
 
-    fn near(got: [u8; 4], want: Color, hdr: Option<HdrOutput>, tolerance: u8) -> bool {
+    fn near(got: [u8; 4], want: Color, target: Target, tolerance: u8) -> bool {
         got.iter()
-            .zip(expected(want, hdr))
+            .zip(expected(want, target))
             .all(|(got, want)| got.abs_diff(want) <= tolerance)
     }
 
@@ -179,7 +212,7 @@ fn windows_main() -> Result<(), String> {
         pixels: &[u8],
         size: (u32, u32),
         scale: f32,
-        hdr: Option<HdrOutput>,
+        target: Target,
     ) -> Result<(), String> {
         let (width, height) = size;
         let at = |x: f32, y: f32| {
@@ -199,7 +232,7 @@ fn windows_main() -> Result<(), String> {
         for (name, x, y, want) in probes {
             let (px, py) = at(x, y);
             let got = pixel(pixels, width, px, py);
-            let ok = near(got, want, hdr, 12);
+            let ok = near(got, want, target, 12);
             println!(
                 "{name:40} {} (at {px},{py}: {got:?})",
                 if ok { "OK" } else { "FAIL" }
@@ -233,12 +266,13 @@ fn windows_main() -> Result<(), String> {
     );
     let mut window = Win32Window::new(spec).map_err(|error| error.to_string())?;
     let mut presenter = Win32Presenter::new(&window).map_err(|error| error.to_string())?;
-    match presenter.hdr() {
-        Some(output) => println!(
-            "the output is HDR: SDR white {} nits, peak {} nits",
+    let target = Target::of(&presenter);
+    match target {
+        Target::Hdr { output, encoding } => println!(
+            "the output is HDR ({encoding:?}): SDR white {} nits, peak {} nits",
             output.reference_nits, output.peak_nits
         ),
-        None => println!("the output is SDR: 8-bit sRGB"),
+        Target::Sdr => println!("the output is SDR: 8-bit sRGB"),
     }
     let mut app = AppLoop::with_stack(Demo, &[]);
     let seconds = std::env::var("WINDOW_SECONDS")
@@ -298,7 +332,7 @@ fn windows_main() -> Result<(), String> {
         };
         let extent = if stage == 0 { "opening" } else { "resized" };
         if check {
-            verify(&pixels, size, scale, presenter.hdr())?;
+            verify(&pixels, size, scale, target)?;
             println!("PASS: the swap chain holds the scene at the {extent} size");
         }
         if let Some(path) = &dump
