@@ -1,0 +1,16 @@
+[package]
+name = "ui-gpu-scene"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Backend-neutral GPU paint scene: batches, layers, damage and pass planning."
+
+[dependencies]
+ui-core = { workspace = true }
+# Frame-phase timing for the `profile` feature; absent from normal builds.
+hotpath = { version = "0.30", optional = true, default-features = false }
+
+[features]
+# Times each render phase; the gallery's own `profile` feature turns it on.
+profile = ["dep:hotpath", "hotpath/hotpath"]

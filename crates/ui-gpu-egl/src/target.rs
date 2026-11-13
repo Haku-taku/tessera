@@ -8,12 +8,6 @@ use crate::GpuError;
 use crate::context::EglContext;
 use crate::ffi::{GBM_BO_USE_RENDERING, GBM_FORMAT_ARGB8888, GbmBuffer};
 
-/// A render target the renderer can draw into without knowing how it was allocated.
-pub trait GpuSurface {
-    fn size(&self) -> (u32, u32);
-    fn bind(&self, gl: &glow::Context);
-}
-
 /// A buffer the compositor can import, plus the GL objects that render into it.
 pub struct DmaBufTarget {
     width: u32,
@@ -72,13 +66,6 @@ impl DmaBufTarget {
         self.height
     }
 
-    pub fn bind(&self, gl: &glow::Context) {
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
-            gl.viewport(0, 0, self.width as i32, self.height as i32);
-        }
-    }
-
     pub fn desc(&self) -> crate::DmaBufDesc {
         crate::DmaBufDesc {
             fd: self.buffer.fd,
@@ -112,13 +99,13 @@ impl DmaBufTarget {
     }
 }
 
-impl GpuSurface for DmaBufTarget {
+impl ui_gpu_scene::RenderTarget for DmaBufTarget {
     fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
-    fn bind(&self, gl: &glow::Context) {
-        DmaBufTarget::bind(self, gl)
+    fn target_id(&self) -> ui_gpu_scene::TargetId {
+        ui_gpu_scene::TargetId(u64::from(self.fbo.0.get()))
     }
 }
 

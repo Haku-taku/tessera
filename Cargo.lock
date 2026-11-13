@@ -1912,6 +1912,15 @@ dependencies = [
  "glow",
  "khronos-egl",
  "libc",
+ "ui-gpu-scene",
+]
+
+[[package]]
+name = "ui-gpu-scene"
+version = "0.1.0"
+dependencies = [
+ "hotpath",
+ "ui-core",
 ]
 
 [[package]]
@@ -1970,6 +1979,7 @@ dependencies = [
  "hotpath",
  "ui-core",
  "ui-gpu-egl",
+ "ui-gpu-scene",
  "ui-paint",
  "ui-platform",
  "ui-widgets-fluent",
@@ -2000,6 +2010,7 @@ dependencies = [
  "rustix",
  "tempfile",
  "ui-core",
+ "ui-gpu-egl",
  "ui-paint",
  "ui-paint-gpu",
  "ui-platform",

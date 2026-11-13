@@ -7,7 +7,8 @@ use ui_core::damage::Damage;
 use ui_core::draw::{DrawList, RectPrim};
 use ui_core::geom::{Color, Corners, Rect};
 
-use ui_paint_gpu::{EglContext, GpuRenderer, OffscreenFbo};
+use ui_gpu_egl::{EglContext, output_render_node};
+use ui_paint_gpu::{GlDevice, GpuRenderer, OffscreenFbo};
 
 const W: u32 = 160;
 const H: u32 = 80;
@@ -75,20 +76,21 @@ fn report(name: &str, value: f64, limit: f64, unit: &str, failures: &mut u32) {
 fn main() {
     let node = std::env::args()
         .nth(1)
-        .or_else(ui_paint_gpu::output_render_node)
+        .or_else(output_render_node)
         .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
     let cnode = std::ffi::CString::new(node.clone()).expect("node path");
     let ctx = EglContext::new(cnode.as_c_str()).expect("EGL context");
     println!("GPU: {} ({node})", ctx.renderer());
 
     let target = OffscreenFbo::new(ctx.gl(), W, H).expect("target");
-    let mut gpu = GpuRenderer::new(ctx.gl(), ctx.is_gles()).expect("renderer");
-    gpu.clear(ctx.gl(), &target, [0.0, 0.0, 0.0, 0.0]);
+    let mut device = GlDevice::new(ctx.gl_handle(), ctx.is_gles());
+    let mut gpu = GpuRenderer::new(&mut device).expect("renderer");
+    gpu.clear(&mut device, &target, [0.0, 0.0, 0.0, 0.0]);
     let mut failures = 0;
 
     let inside = Rect::new(25.0, 15.0, 20.0, 20.0);
     let stats = gpu
-        .render_frame(ctx.gl(), &target, &scene(inside), &Damage::Full)
+        .render_frame(&mut device, &target, &scene(inside), &Damage::Full)
         .expect("first frame");
     // A cold cache has nothing to reuse, so the first frame must paint the subtree.
     report(
@@ -98,7 +100,7 @@ fn main() {
         "",
         &mut failures,
     );
-    let px = gpu.read_pixels(ctx.gl(), &target).expect("readback");
+    let px = gpu.read_pixels(&mut device, &target).expect("readback");
     report(
         "[2] canvas painted",
         (255 - alpha_at(&px, 30, 20)) as f64,
@@ -114,7 +116,7 @@ fn main() {
         Rect::new(132.0, 20.0, 28.0, 20.0),
     ]);
     let stats = gpu
-        .render_frame(ctx.gl(), &target, &scene(inside), &across)
+        .render_frame(&mut device, &target, &scene(inside), &across)
         .expect("second frame");
     report(
         "[3] batches skipped over an untouched canvas",
@@ -123,7 +125,7 @@ fn main() {
         "",
         &mut failures,
     );
-    let px = gpu.read_pixels(ctx.gl(), &target).expect("readback");
+    let px = gpu.read_pixels(&mut device, &target).expect("readback");
     report(
         "[4] canvas restored from its cache",
         (255 - alpha_at(&px, 30, 20)) as f64,
@@ -137,7 +139,7 @@ fn main() {
     let moved = Rect::new(45.0, 15.0, 20.0, 20.0);
     let inside_damage = Damage::Rects(vec![inside.union(moved)]);
     let stats = gpu
-        .render_frame(ctx.gl(), &target, &scene(moved), &inside_damage)
+        .render_frame(&mut device, &target, &scene(moved), &inside_damage)
         .expect("third frame");
     report(
         "[5] no skip when the canvas changed",
@@ -146,7 +148,7 @@ fn main() {
         "",
         &mut failures,
     );
-    let px = gpu.read_pixels(ctx.gl(), &target).expect("readback");
+    let px = gpu.read_pixels(&mut device, &target).expect("readback");
     report(
         "[6] moved content painted",
         (255 - alpha_at(&px, 50, 20)) as f64,
@@ -166,11 +168,11 @@ fn main() {
     // and the layer's own opacity still applies where the damage landed.
     let mover_a = Rect::new(120.0, 50.0, 20.0, 20.0);
     let mover_b = Rect::new(120.0, 10.0, 20.0, 20.0);
-    gpu.render_frame(ctx.gl(), &target, &nested_scene(mover_a), &Damage::Full)
+    gpu.render_frame(&mut device, &target, &nested_scene(mover_a), &Damage::Full)
         .expect("nested first");
     let stats = gpu
         .render_frame(
-            ctx.gl(),
+            &mut device,
             &target,
             &nested_scene(mover_b),
             &Damage::Rects(vec![mover_a.union(mover_b)]),
@@ -183,7 +185,7 @@ fn main() {
         "",
         &mut failures,
     );
-    let px = gpu.read_pixels(ctx.gl(), &target).expect("readback");
+    let px = gpu.read_pixels(&mut device, &target).expect("readback");
     report(
         "[9] cached canvas keeps the layer's opacity",
         (127 - alpha_at(&px, 35, 25) as i32).unsigned_abs() as f64,
@@ -192,7 +194,6 @@ fn main() {
         &mut failures,
     );
 
-    gpu.release(ctx.gl());
     target.release(ctx.gl());
 
     if failures > 0 {

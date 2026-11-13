@@ -9,6 +9,7 @@ description = "Wayland XDG window target: wl_shm buffers presented through a rea
 [dependencies]
 ui-core = { workspace = true }
 ui-paint = { workspace = true }
+ui-gpu-egl = { path = "../ui-gpu-egl", optional = true }
 ui-paint-gpu = { workspace = true, optional = true }
 ui-platform = { workspace = true }
 ui-text = { workspace = true }
@@ -36,7 +37,7 @@ libc = "0.2"
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
 [features]
-gpu = ["dep:ui-paint-gpu"]
+gpu = ["dep:ui-paint-gpu", "dep:ui-gpu-egl"]
 # Times the present path; the gallery's own `profile` feature turns it on.
 profile = ["dep:hotpath", "hotpath/hotpath", "ui-paint-gpu?/profile"]
 global-hotkeys = []

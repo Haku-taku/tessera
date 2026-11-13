@@ -11,9 +11,10 @@ use ui_core::colour::BufferFormat;
 use ui_core::damage::Damage;
 use ui_core::draw::DrawList;
 use ui_core::timed;
-use ui_paint_gpu::{
-    AtlasUpload, CanvasUpload, EglContext, GpuError, GpuRenderer, GpuTarget, SyncTimeline,
+use ui_gpu_egl::{
+    DmaBufTarget as GpuTarget, EglContext, GpuError, SyncTimeline, output_render_node,
 };
+use ui_paint_gpu::{AtlasUpload, CanvasUpload, GlDevice, GpuRenderer};
 use ui_platform::TextPass;
 
 use crate::dmabuf::DmaBufImage;
@@ -117,6 +118,8 @@ pub enum GpuWindowError {
     NotPresented,
     /// EGL, the target pool, or a GL call failed.
     Gpu(GpuError),
+    /// The scene painter could not allocate or draw.
+    Draw(ui_paint_gpu::GpuError),
     /// The Wayland side refused the buffer or the commit.
     Window(WindowError),
     /// Writing a read-back image failed.
@@ -133,6 +136,7 @@ impl std::fmt::Display for GpuWindowError {
             Self::InvalidNode(path) => write!(f, "render node {path:?} is not a valid path"),
             Self::NotPresented => write!(f, "no frame has been presented yet"),
             Self::Gpu(e) => write!(f, "GPU: {e}"),
+            Self::Draw(e) => write!(f, "draw: {e}"),
             Self::Window(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "write failed: {e}"),
         }
@@ -144,6 +148,12 @@ impl std::error::Error for GpuWindowError {}
 impl From<GpuError> for GpuWindowError {
     fn from(e: GpuError) -> Self {
         Self::Gpu(e)
+    }
+}
+
+impl From<ui_paint_gpu::GpuError> for GpuWindowError {
+    fn from(e: ui_paint_gpu::GpuError) -> Self {
+        Self::Draw(e)
     }
 }
 
@@ -176,6 +186,7 @@ pub struct PresentOutcome {
 pub struct GpuWindow {
     /// Shared with every other window on the same GPU.
     ctx: Rc<EglContext>,
+    device: GlDevice,
     renderer: GpuRenderer,
     /// The DRM timelines carrying this window's acquire/release points.
     sync_timeline: Option<SyncTimeline>,
@@ -218,12 +229,13 @@ impl GpuWindow {
         }
         let node = config
             .render_node
-            .or_else(ui_paint_gpu::output_render_node)
+            .or_else(output_render_node)
             .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
         let cnode = std::ffi::CString::new(node.clone())
             .map_err(|_| GpuWindowError::InvalidNode(node.clone()))?;
         let ctx = context_for(&node, cnode.as_c_str())?;
-        let mut renderer = GpuRenderer::new(ctx.gl(), ctx.is_gles())?;
+        let mut device = GlDevice::new(ctx.gl_handle(), ctx.is_gles());
+        let mut renderer = GpuRenderer::new(&mut device)?;
         // The surface takes its output's description, so its pixels mean what the display
         // expects; on an HDR output that also means encoding to PQ in a wide-enough buffer.
         let colour = match config.colour {
@@ -268,6 +280,7 @@ impl GpuWindow {
         };
         Ok(Self {
             ctx,
+            device,
             renderer,
             sync_timeline,
             sync_release_timeline,
@@ -309,7 +322,7 @@ impl GpuWindow {
             eprintln!("gpu: no current context to finish the queue: {error}");
             return;
         }
-        self.renderer.finish(self.ctx.gl());
+        self.renderer.finish(&mut self.device);
     }
 
     /// Format of the presented buffers.
@@ -340,7 +353,7 @@ impl GpuWindow {
             self.atlas_version = pass.version();
             let (width, height) = pass.dimensions();
             self.renderer.set_atlas(
-                self.ctx.gl(),
+                &mut self.device,
                 AtlasUpload {
                     width,
                     height,
@@ -355,7 +368,7 @@ impl GpuWindow {
             if !pass.color_atlas().is_empty() {
                 let (width, height) = pass.color_dimensions();
                 self.renderer.set_color_atlas(
-                    self.ctx.gl(),
+                    &mut self.device,
                     AtlasUpload {
                         width,
                         height,
@@ -425,7 +438,7 @@ impl GpuWindow {
         let stats = timed!(
             "gpu_draw",
             self.renderer.render_frame_with_canvases(
-                self.ctx.gl(),
+                &mut self.device,
                 target,
                 list,
                 damage,
@@ -453,7 +466,7 @@ impl GpuWindow {
                 None => {
                     // Without explicit sync the compositor cannot tell when these writes land, so
                     // wait here. Measured: this blocks (200–300µs) but burns no CPU.
-                    self.renderer.finish(self.ctx.gl());
+                    self.renderer.finish(&mut self.device);
                     None
                 }
             }
@@ -489,14 +502,14 @@ impl GpuWindow {
         };
         // Probe: a handed-over buffer promises the whole surface, so it must match the frame.
         if std::env::var_os("CRABSNAP_TARGET_CHECK").is_some() {
-            if let Some((n, bbox)) = self.renderer.diff_frame(self.ctx.gl(), target) {
+            if let Some((n, bbox)) = self.renderer.diff_frame(&mut self.device, target) {
                 eprintln!(
                     "[target-check] differing={n} bbox={bbox:?} band={:?} reported={reported:?}",
                     stats.band
                 );
             }
             // A change outside the band would never reach the compositor: it is not reported.
-            if let Some((w, h, px)) = self.renderer.frame_pixels(self.ctx.gl()) {
+            if let Some((w, h, px)) = self.renderer.frame_pixels(&mut self.device) {
                 let mut prev = PREV_FRAME.lock().unwrap();
                 if let Some(p) = prev.as_ref().filter(|p| p.len() == px.len()) {
                     let band = stats.band.unwrap_or([0, 0, w as i32, h as i32]);
@@ -559,15 +572,14 @@ impl GpuWindow {
         layer: &Path,
     ) -> Result<Option<(u32, u32)>, GpuWindowError> {
         self.ctx.make_current()?;
-        let gl = self.ctx.gl();
         let (w, h, pixels) = self
             .renderer
-            .capture(gl)
+            .capture(&mut self.device)
             .ok_or(GpuWindowError::NotPresented)?;
         write_ppm(frame, w, h, &pixels, |p| [p[0], p[1], p[2]])?;
         // Alpha as grey, so transparency is visible instead of guessed.
         // Layer 0 is absent when the frame painted no group; that is not an error.
-        match self.renderer.read_layer(self.ctx.gl(), 0) {
+        match self.renderer.read_layer(&mut self.device, 0) {
             Some((w, h, buf)) => {
                 write_ppm(layer, w, h, &buf, |p| [p[3], p[3], p[3]])?;
                 Ok(Some((w, h)))
@@ -669,12 +681,13 @@ impl Drop for GpuWindow {
         // deleting here under that other context deletes *its* objects with the same ids.
         if let Err(error) = self.ctx.make_current() {
             eprintln!("gpu: teardown without a current context: {error}");
+            self.device.forget();
             return;
         }
         ui_platform::exit_probe::stage("gpu: targets");
         self.release_targets();
         ui_platform::exit_probe::stage("gpu: renderer");
-        self.renderer.release(self.ctx.gl());
+        self.device.release();
         // EGL teardown is the driver's: `eglTerminate` waits for its worker threads.
         ui_platform::exit_probe::stage("gpu: egl");
     }

@@ -30,7 +30,7 @@ pub struct EglContext {
     egl: egl::DynamicInstance<egl::EGL1_5>,
     display: egl::Display,
     context: egl::Context,
-    gl: glow::Context,
+    gl: std::rc::Rc<glow::Context>,
     images: ImageFns,
     gbm: GbmDevice,
     is_gles: bool,
@@ -130,7 +130,7 @@ impl EglContext {
             egl,
             display,
             context,
-            gl,
+            gl: std::rc::Rc::new(gl),
             images,
             gbm,
             is_gles,
@@ -152,6 +152,11 @@ impl EglContext {
     /// The GL context.
     pub fn gl(&self) -> &glow::Context {
         &self.gl
+    }
+
+    /// The same context as a shared handle, for a device that outlives the borrow.
+    pub fn gl_handle(&self) -> std::rc::Rc<glow::Context> {
+        std::rc::Rc::clone(&self.gl)
     }
 
     /// Human-readable renderer string, for reporting which GPU is in use.

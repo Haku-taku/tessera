@@ -7,7 +7,8 @@ use ui_core::damage::Damage;
 use ui_core::draw::{DrawList, RectPrim};
 use ui_core::geom::{Color, Corners, Rect};
 
-use ui_paint_gpu::{EglContext, GpuRenderer, OffscreenFbo};
+use ui_gpu_egl::{EglContext, output_render_node};
+use ui_paint_gpu::{GlDevice, GpuRenderer, OffscreenFbo};
 
 const W: u32 = 200;
 const H: u32 = 80;
@@ -92,7 +93,7 @@ fn report(name: &str, value: f64, limit: f64, unit: &str, failures: &mut u32) {
 fn main() {
     let node = std::env::args()
         .nth(1)
-        .or_else(ui_paint_gpu::output_render_node)
+        .or_else(output_render_node)
         .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
     let cnode = std::ffi::CString::new(node.clone()).expect("node path");
     let ctx = EglContext::new(cnode.as_c_str()).expect("EGL context");
@@ -100,19 +101,25 @@ fn main() {
 
     let target = OffscreenFbo::new(ctx.gl(), W, H).expect("target");
     let reference = OffscreenFbo::new(ctx.gl(), W, H).expect("reference");
-    let mut gpu = GpuRenderer::new(ctx.gl(), ctx.is_gles()).expect("renderer");
-    let mut truth = GpuRenderer::new(ctx.gl(), ctx.is_gles()).expect("reference renderer");
-    gpu.clear(ctx.gl(), &target, [0.0, 0.0, 0.0, 0.0]);
-    truth.clear(ctx.gl(), &reference, [0.0, 0.0, 0.0, 0.0]);
+    let mut device = GlDevice::new(ctx.gl_handle(), ctx.is_gles());
+    let mut gpu = GpuRenderer::new(&mut device).expect("renderer");
+    let mut truth = GpuRenderer::new(&mut device).expect("reference renderer");
+    gpu.clear(&mut device, &target, [0.0, 0.0, 0.0, 0.0]);
+    truth.clear(&mut device, &reference, [0.0, 0.0, 0.0, 0.0]);
     let mut failures = 0;
 
     // A blurred square spreads past its own box: this is the tail a cull would cut off.
-    gpu.render_frame(ctx.gl(), &target, &scene(LEFT, MOVER_A), &Damage::Full)
+    gpu.render_frame(&mut device, &target, &scene(LEFT, MOVER_A), &Damage::Full)
         .expect("first frame");
     truth
-        .render_frame(ctx.gl(), &reference, &scene(LEFT, MOVER_A), &Damage::Full)
+        .render_frame(
+            &mut device,
+            &reference,
+            &scene(LEFT, MOVER_A),
+            &Damage::Full,
+        )
         .expect("first reference");
-    let px = gpu.read_pixels(ctx.gl(), &target).expect("readback");
+    let px = gpu.read_pixels(&mut device, &target).expect("readback");
     let tail = alpha_at(&px, 27, 17);
     report(
         "[1] the blur reaches past its box",
@@ -126,13 +133,20 @@ fn main() {
     // result is what a full redraw would have produced.
     let far = Damage::Rects(vec![MOVER_A.union(MOVER_B)]);
     let stats = gpu
-        .render_frame(ctx.gl(), &target, &scene(LEFT, MOVER_B), &far)
+        .render_frame(&mut device, &target, &scene(LEFT, MOVER_B), &far)
         .expect("second frame");
     truth
-        .render_frame(ctx.gl(), &reference, &scene(LEFT, MOVER_B), &Damage::Full)
+        .render_frame(
+            &mut device,
+            &reference,
+            &scene(LEFT, MOVER_B),
+            &Damage::Full,
+        )
         .expect("second reference");
-    let expect = truth.read_pixels(ctx.gl(), &reference).expect("readback");
-    let px = gpu.read_pixels(ctx.gl(), &target).expect("readback");
+    let expect = truth
+        .read_pixels(&mut device, &reference)
+        .expect("readback");
+    let px = gpu.read_pixels(&mut device, &target).expect("readback");
     report(
         "[2] a band clear of the layer is still partial",
         if stats.band.is_some() { 0.0 } else { 1.0 },
@@ -159,18 +173,20 @@ fn main() {
     // across the band's edge instead of the hole a cull would leave there.
     let near = Damage::Rects(vec![LEFT.union(LEFT_MOVED)]);
     let stats = gpu
-        .render_frame(ctx.gl(), &target, &scene(LEFT_MOVED, MOVER_B), &near)
+        .render_frame(&mut device, &target, &scene(LEFT_MOVED, MOVER_B), &near)
         .expect("third frame");
     truth
         .render_frame(
-            ctx.gl(),
+            &mut device,
             &reference,
             &scene(LEFT_MOVED, MOVER_B),
             &Damage::Full,
         )
         .expect("third reference");
-    let expect = truth.read_pixels(ctx.gl(), &reference).expect("readback");
-    let px = gpu.read_pixels(ctx.gl(), &target).expect("readback");
+    let expect = truth
+        .read_pixels(&mut device, &reference)
+        .expect("readback");
+    let px = gpu.read_pixels(&mut device, &target).expect("readback");
     report(
         "[5] a band inside the layer is partial too",
         if stats.band.is_some() { 0.0 } else { 1.0 },
@@ -193,8 +209,6 @@ fn main() {
         &mut failures,
     );
 
-    gpu.release(ctx.gl());
-    truth.release(ctx.gl());
     target.release(ctx.gl());
     reference.release(ctx.gl());
 

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+ui-gpu-scene = { workspace = true }
 khronos-egl = { version = "6.0", features = ["dynamic"] }
 glow = "0.18"
 libc = "0.2"

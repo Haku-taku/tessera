@@ -18,6 +18,7 @@ ui-core = { path = "crates/ui-core" }
 ui-i18n = { path = "crates/ui-i18n" }
 ui-text = { path = "crates/ui-text" }
 ui-paint = { path = "crates/ui-paint" }
+ui-gpu-scene = { path = "crates/ui-gpu-scene" }
 ui-paint-gpu = { path = "crates/ui-paint-gpu" }
 ui-platform = { path = "crates/ui-platform" }
 ui-style = { path = "crates/ui-style" }

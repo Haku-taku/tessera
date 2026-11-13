@@ -6,7 +6,8 @@
 use ui_core::NodeId;
 use ui_core::draw::{DrawList, PrimKind, RectPrim, ShadowBound, ShadowPrim, ShadowSide};
 use ui_core::geom::{Color, Corners, Rect};
-use ui_paint_gpu::{EglContext, GpuRenderer, OffscreenFbo};
+use ui_gpu_egl::EglContext;
+use ui_paint_gpu::{GlDevice, GpuRenderer, OffscreenFbo};
 
 const W: u32 = 300;
 const H: u32 = 320;
@@ -84,11 +85,12 @@ fn main() {
     let cnode = std::ffi::CString::new(node.clone()).expect("node path");
     let egl = EglContext::new(cnode.as_c_str()).expect("EGL");
     let target = OffscreenFbo::new(egl.gl(), W, H).expect("target");
-    let mut gpu = GpuRenderer::new(egl.gl(), egl.is_gles()).expect("renderer");
+    let mut device = GlDevice::new(egl.gl_handle(), egl.is_gles());
+    let mut gpu = GpuRenderer::new(&mut device).expect("renderer");
     let list = scene();
-    gpu.clear(egl.gl(), &target, [0.0, 0.0, 0.0, 1.0]);
-    let stats = gpu.render(egl.gl(), &target, &list).expect("render");
-    let out = gpu.read_pixels(egl.gl(), &target).expect("readback");
+    gpu.clear(&mut device, &target, [0.0, 0.0, 0.0, 1.0]);
+    let stats = gpu.render(&mut device, &target, &list).expect("render");
+    let out = gpu.read_pixels(&mut device, &target).expect("readback");
 
     let mut fail = 0;
     let mut check = |name: &str, got: f32, limit: f32, want_below: bool| {

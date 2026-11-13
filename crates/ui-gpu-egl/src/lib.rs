@@ -5,12 +5,14 @@
 
 pub mod context;
 pub mod ffi;
+pub mod node;
 pub mod syncobj;
 pub mod target;
 
 pub use context::{DmaBufDesc, EglContext, ExportedFence};
+pub use node::{candidate_nodes, output_render_node};
 pub use syncobj::SyncTimeline;
-pub use target::{DmaBufTarget, GpuSurface};
+pub use target::DmaBufTarget;
 
 /// Why a GPU operation failed.
 #[derive(Debug)]

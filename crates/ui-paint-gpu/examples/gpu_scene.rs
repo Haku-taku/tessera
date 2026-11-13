@@ -9,8 +9,9 @@ use ui_core::NodeId;
 use ui_core::damage::Damage;
 use ui_core::draw::{DrawList, GlyphPrim, LinePrim, RectPrim};
 use ui_core::geom::{Color, Corners, Rect};
+use ui_gpu_egl::EglContext;
 use ui_paint::{CoverageAtlas, CpuRenderer, Pixels};
-use ui_paint_gpu::{AtlasUpload, EglContext, GpuRenderer, OffscreenFbo};
+use ui_paint_gpu::{AtlasUpload, GlDevice, GpuRenderer, OffscreenFbo};
 
 const W: u32 = 240;
 const H: u32 = 180;
@@ -228,9 +229,10 @@ fn main() {
     println!("GPU: {} ({node})", ctx.renderer());
 
     let target = OffscreenFbo::new(ctx.gl(), W, H).expect("target");
-    let mut gpu = GpuRenderer::new(ctx.gl(), ctx.is_gles()).expect("renderer");
+    let mut device = GlDevice::new(ctx.gl_handle(), ctx.is_gles());
+    let mut gpu = GpuRenderer::new(&mut device).expect("renderer");
     gpu.set_atlas(
-        ctx.gl(),
+        &mut device,
         AtlasUpload {
             width: ATLAS,
             height: ATLAS,
@@ -238,9 +240,9 @@ fn main() {
         },
     )
     .expect("atlas");
-    gpu.clear(ctx.gl(), &target, [0.0, 0.0, 0.0, 1.0]);
-    let stats = gpu.render(ctx.gl(), &target, &list).expect("render");
-    let raw = gpu.read_pixels(ctx.gl(), &target).expect("readback");
+    gpu.clear(&mut device, &target, [0.0, 0.0, 0.0, 1.0]);
+    let stats = gpu.render(&mut device, &target, &list).expect("render");
+    let raw = gpu.read_pixels(&mut device, &target).expect("readback");
     if std::env::var("GPU_RAW").is_ok() {
         // Un-premultiplied already; print a few overlay pixels to see the truth.
         for x in [165usize, 175, 185, 195] {
@@ -430,7 +432,6 @@ fn main() {
         );
     }
 
-    gpu.release(ctx.gl());
     target.release(ctx.gl());
 
     if failures > 0 {

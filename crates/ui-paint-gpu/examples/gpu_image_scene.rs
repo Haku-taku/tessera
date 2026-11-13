@@ -10,8 +10,9 @@ use std::sync::Arc;
 use ui_core::draw::{CanvasId, DrawList, ImageEntry, ImagePrim, ImageSource, RectPrim, Sampling};
 use ui_core::geom::{Color, Corners, Rect};
 use ui_core::{Damage, NodeId};
+use ui_gpu_egl::{EglContext, output_render_node};
 use ui_paint::{CpuRenderer, Pixels};
-use ui_paint_gpu::{CanvasUpload, EglContext, GpuRenderer, OffscreenFbo, RenderStats};
+use ui_paint_gpu::{CanvasUpload, GlDevice, GpuRenderer, OffscreenFbo, RenderStats, Wrap};
 
 const W: u32 = 320;
 const H: u32 = 240;
@@ -94,13 +95,13 @@ fn add_image(
 
 fn draw(
     gpu: &mut GpuRenderer,
-    ctx: &EglContext,
+    device: &mut GlDevice,
     target: &OffscreenFbo,
     list: &DrawList,
 ) -> (Vec<u8>, RenderStats) {
-    gpu.clear(ctx.gl(), target, [0.0, 0.0, 0.0, 0.0]);
-    let stats = gpu.render(ctx.gl(), target, list).expect("render");
-    let pixels = gpu.read_pixels(ctx.gl(), target).expect("readback");
+    gpu.clear(device, target, [0.0, 0.0, 0.0, 0.0]);
+    let stats = gpu.render(device, target, list).expect("render");
+    let pixels = gpu.read_pixels(device, target).expect("readback");
     (pixels, stats)
 }
 
@@ -255,30 +256,31 @@ fn canvas_scene(sampling: Sampling, rect: Rect, id: u64) -> DrawList {
 
 fn draw_canvases(
     gpu: &mut GpuRenderer,
-    ctx: &EglContext,
+    device: &mut GlDevice,
     target: &OffscreenFbo,
     list: &DrawList,
     canvases: &[CanvasUpload<'_>],
 ) -> (Vec<u8>, RenderStats) {
-    gpu.clear(ctx.gl(), target, [0.0, 0.0, 0.0, 0.0]);
+    gpu.clear(device, target, [0.0, 0.0, 0.0, 0.0]);
     let stats = gpu
-        .render_frame_with_canvases(ctx.gl(), target, list, &Damage::Full, &[], canvases)
+        .render_frame_with_canvases(device, target, list, &Damage::Full, &[], canvases)
         .expect("render");
-    let pixels = gpu.read_pixels(ctx.gl(), target).expect("readback");
+    let pixels = gpu.read_pixels(device, target).expect("readback");
     (pixels, stats)
 }
 
 fn main() {
     let node = std::env::args()
         .nth(1)
-        .or_else(ui_paint_gpu::output_render_node)
+        .or_else(output_render_node)
         .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
     let cnode = std::ffi::CString::new(node.clone()).expect("node path");
     let ctx = EglContext::new(cnode.as_c_str()).expect("EGL context");
     println!("GPU: {} ({node})", ctx.renderer());
 
     let target = OffscreenFbo::new(ctx.gl(), W, H).expect("target");
-    let mut gpu = GpuRenderer::new(ctx.gl(), ctx.is_gles()).expect("renderer");
+    let mut device = GlDevice::new(ctx.gl_handle(), ctx.is_gles());
+    let mut gpu = GpuRenderer::new(&mut device).expect("renderer");
     let data = Arc::new(texture());
     let mut failures = 0;
 
@@ -293,7 +295,7 @@ fn main() {
         Rect::new(0.0, 0.0, TEX as f32, TEX as f32),
         Corners::ZERO,
     );
-    let (pixels, stats_full) = draw(&mut gpu, &ctx, &target, &full);
+    let (pixels, stats_full) = draw(&mut gpu, &mut device, &target, &full);
     println!("stats: {stats_full:?}");
 
     let interior = mean(&pixels, 24, 24, 148, 148);
@@ -337,7 +339,7 @@ fn main() {
         Rect::new(0.0, 0.0, QUAD as f32, QUAD as f32),
         Corners::ZERO,
     );
-    let (pixels, _) = draw(&mut gpu, &ctx, &target, &crop);
+    let (pixels, _) = draw(&mut gpu, &mut device, &target, &crop);
     let left = mean(&pixels, 175, 21, 235, 141);
     let right = mean(&pixels, 235, 21, 295, 141);
     report(
@@ -372,7 +374,7 @@ fn main() {
         Rect::new(0.0, 0.0, QUAD as f32, QUAD as f32),
         Corners::all(24.0),
     );
-    let (pixels, _) = draw(&mut gpu, &ctx, &target, &round);
+    let (pixels, _) = draw(&mut gpu, &mut device, &target, &round);
     let corner = at(&pixels, 102, 162);
     report(
         "[5] pixel outside the corner radius",
@@ -391,7 +393,7 @@ fn main() {
     );
 
     // [7][8][9] One upload per `ImageEntry::id`: a second frame with the same id reuses it.
-    let (_, again) = draw(&mut gpu, &ctx, &target, &full);
+    let (_, again) = draw(&mut gpu, &mut device, &target, &full);
     let mut other = canvas();
     add_image(
         &mut other,
@@ -401,7 +403,7 @@ fn main() {
         Rect::new(0.0, 0.0, TEX as f32, TEX as f32),
         Corners::ZERO,
     );
-    let (_, fresh) = draw(&mut gpu, &ctx, &target, &other);
+    let (_, fresh) = draw(&mut gpu, &mut device, &target, &other);
     report_eq(
         "[7] uploads on first use",
         stats_full.image_uploads as i64,
@@ -428,10 +430,9 @@ fn main() {
     );
 
     // [11] With `src` inside [0,1] the wrap mode is invisible in pixels, so query the sampler.
-    let clamp = glow::CLAMP_TO_EDGE as i32;
-    match gpu.image_wrap(ctx.gl(), ID_B) {
+    match gpu.image_wrap(&device, ID_B) {
         Some((s, t)) => {
-            let bad = i64::from(s != clamp) + i64::from(t != clamp);
+            let bad = i64::from(s != Wrap::Clamp) + i64::from(t != Wrap::Clamp);
             report_eq("[11] wrap mode is CLAMP_TO_EDGE", bad, 0, &mut failures);
         }
         None => {
@@ -472,7 +473,7 @@ fn main() {
             (145, 85, 175, 155),
         ),
     ] {
-        let (gpu_pixels, _) = draw(&mut gpu, &ctx, &target, scene);
+        let (gpu_pixels, _) = draw(&mut gpu, &mut device, &target, scene);
         let cpu_pixels = cpu(scene);
         report(
             name,
@@ -490,7 +491,7 @@ fn main() {
     let scene = canvas_scene(Sampling::Pixelated, rect, 0xD4);
     let (pixels, stats) = draw_canvases(
         &mut gpu,
-        &ctx,
+        &mut device,
         &target,
         &scene,
         &[CanvasUpload {
@@ -526,7 +527,7 @@ fn main() {
 
     let (pixels, _) = draw_canvases(
         &mut gpu,
-        &ctx,
+        &mut device,
         &target,
         &scene,
         &[CanvasUpload {
@@ -549,7 +550,7 @@ fn main() {
     let second = canvas_pixels(GREEN, YELLOW);
     let (pixels, _) = draw_canvases(
         &mut gpu,
-        &ctx,
+        &mut device,
         &target,
         &scene,
         &[CanvasUpload {
@@ -592,7 +593,7 @@ fn main() {
     );
     let (pixels, _) = draw_canvases(
         &mut gpu,
-        &ctx,
+        &mut device,
         &target,
         &sampled,
         &[CanvasUpload {
@@ -636,7 +637,7 @@ fn main() {
     let mut still_frames = 0;
     for _ in 0..2 {
         if gpu
-            .render_frame_with_canvases(ctx.gl(), &target, &sampled, &Damage::Full, &[], &still)
+            .render_frame_with_canvases(&mut device, &target, &sampled, &Damage::Full, &[], &still)
             .is_ok()
         {
             still_frames += 1;
@@ -649,7 +650,6 @@ fn main() {
         &mut failures,
     );
 
-    gpu.release(ctx.gl());
     target.release(ctx.gl());
 
     println!("\nFAIL={failures}");

@@ -13,11 +13,13 @@ const PORTABLE: &[&str] = &[
     "ui-color-hct",
     "ui-design",
     "ui-gallery",
+    "ui-gpu-scene",
     "ui-highlight",
     "ui-i18n",
     "ui-math",
     "ui-text",
     "ui-paint",
+    "ui-paint-gpu",
     "ui-platform",
     "ui-text-fontique",
     "ui-richtext",
@@ -41,10 +43,6 @@ const PLATFORM_BOUND: &[(&str, &str)] = &[
     (
         "ui-gpu-egl",
         "EGL device + gbm + dma-buf: unix fds, libc, libgbm",
-    ),
-    (
-        "ui-paint-gpu",
-        "GL renderer; platform-bound only through ui-gpu-egl",
     ),
 ];
 

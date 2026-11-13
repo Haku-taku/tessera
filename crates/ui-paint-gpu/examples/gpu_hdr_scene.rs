@@ -10,7 +10,8 @@ use ui_core::NodeId;
 use ui_core::colour::{TransferFunction, encode_for_pq_output};
 use ui_core::draw::{DrawList, RectPrim};
 use ui_core::geom::{Color, Rect};
-use ui_paint_gpu::{EglContext, GpuRenderer, OffscreenFbo};
+use ui_gpu_egl::{EglContext, output_render_node};
+use ui_paint_gpu::{GlDevice, GpuRenderer, OffscreenFbo};
 
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
@@ -60,7 +61,7 @@ fn halves() -> DrawList {
 fn main() {
     let node = std::env::args()
         .nth(1)
-        .or_else(ui_paint_gpu::output_render_node)
+        .or_else(output_render_node)
         .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
     let cnode = std::ffi::CString::new(node.clone()).expect("node path");
     let ctx = EglContext::new(cnode.as_c_str()).expect("EGL context");
@@ -68,7 +69,8 @@ fn main() {
     println!("reference {REFERENCE_NITS} nits, min {MIN_NITS} nits");
 
     let target = OffscreenFbo::new(ctx.gl(), WIDTH, HEIGHT).expect("target");
-    let mut gpu = GpuRenderer::new(ctx.gl(), ctx.is_gles()).expect("renderer");
+    let mut device = GlDevice::new(ctx.gl_handle(), ctx.is_gles());
+    let mut gpu = GpuRenderer::new(&mut device).expect("renderer");
     gpu.set_destination(ui_core::colour::Destination {
         domain: ui_core::colour::Domain::Linear {
             reference_nits: REFERENCE_NITS,
@@ -82,8 +84,8 @@ fn main() {
     println!("  sRGB  expected  actual  delta");
     for code in CODES {
         let list = scene(code);
-        gpu.render(ctx.gl(), &target, &list).expect("render");
-        let data = gpu.read_pixels(ctx.gl(), &target).expect("readback");
+        gpu.render(&mut device, &target, &list).expect("render");
+        let data = gpu.read_pixels(&mut device, &target).expect("readback");
 
         // Centre pixel, straight RGBA after readback.
         let i = ((HEIGHT / 2) * WIDTH + WIDTH / 2) as usize * 4;
@@ -120,17 +122,17 @@ fn main() {
 
     // A capture is a picture of the interface, so it must be the sRGB input whatever the
     // output transfer does. Reading the presented buffer instead hands back its PQ codes.
-    let captures = |gpu: &mut GpuRenderer, ctx: &EglContext| {
+    let captures = |gpu: &mut GpuRenderer, device: &mut GlDevice| {
         let mut worst = 0i32;
         for code in CODES {
-            gpu.render(ctx.gl(), &target, &scene(code)).expect("render");
-            let (w, h, px) = gpu.capture(ctx.gl()).expect("capture");
+            gpu.render(device, &target, &scene(code)).expect("render");
+            let (w, h, px) = gpu.capture(device).expect("capture");
             let i = ((h / 2) * w + w / 2) as usize * 4;
             worst = worst.max((px[i] as i32 - code as i32).abs());
         }
         worst
     };
-    let wrong = captures(&mut gpu, &ctx);
+    let wrong = captures(&mut gpu, &mut device);
     let ok = wrong <= 1;
     if !ok {
         failures += 1;
@@ -153,7 +155,7 @@ fn main() {
 
     // A supersampled frame is larger than the picture; a capture averages it down.
     gpu.set_supersample(2);
-    let wrong = captures(&mut gpu, &ctx);
+    let wrong = captures(&mut gpu, &mut device);
     let ok = wrong <= 1;
     if !ok {
         failures += 1;
@@ -165,13 +167,13 @@ fn main() {
 
     // An edge pins the frame's own size: a resize that did not happen crops the picture, and
     // a frame that never became float draws nothing at all.
-    let edge = |gpu: &mut GpuRenderer, ctx: &EglContext, ss: u32| {
+    let edge = |gpu: &mut GpuRenderer, device: &mut GlDevice, ss: u32| {
         gpu.set_supersample(ss);
-        gpu.render(ctx.gl(), &target, &halves()).expect("render");
-        gpu.capture(ctx.gl()).expect("capture").2
+        gpu.render(device, &target, &halves()).expect("render");
+        gpu.capture(device).expect("capture").2
     };
-    let plain = edge(&mut gpu, &ctx, 1);
-    let sampled = edge(&mut gpu, &ctx, 2);
+    let plain = edge(&mut gpu, &mut device, 1);
+    let sampled = edge(&mut gpu, &mut device, 2);
     let differing = plain.iter().zip(&sampled).filter(|(a, b)| a != b).count();
     let ok = differing == 0;
     if !ok {

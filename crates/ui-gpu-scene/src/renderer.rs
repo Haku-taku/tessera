@@ -3,14 +3,13 @@
 //! Rectangles use an instanced signed-distance shader; glyphs sample a coverage
 //! atlas. Both emit premultiplied alpha so one blend equation covers both.
 
-use glow::HasContext;
 use std::collections::{HashMap, HashSet};
 use ui_core::draw::{DrawList, GlyphPrim, ImageEntry, ImagePrim, PrimKind, RectPrim, ShadowPrim};
 use ui_core::effect::Effect;
 use ui_core::geom::Color;
 use ui_core::timed;
 
-use crate::material::BackdropMaterial;
+use ui_core::draw::BackdropMaterial;
 
 /// Which program shades a blurred backdrop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,18 +48,21 @@ pub(crate) fn composites(material: Option<BackdropMaterial>, blurred: bool) -> b
     blurred || !matches!(material, None | Some(BackdropMaterial::Plain))
 }
 
-use crate::GpuError;
-use crate::shader;
-use ui_gpu_egl::GpuSurface;
+use crate::device::{Device, TargetId, TextureId};
+use crate::error::GpuError;
+use crate::format::{TargetFormat, TextureFormat, Wrap};
+use crate::layout;
+use crate::program::{Program, ProgramKey, new_program};
+use crate::target::{RenderTarget, Target};
 
 /// Fused shapes arrive in the node's logical space; the shader works in device pixels, so
 /// each is offset by the node's origin and scaled once.
 fn upload_shapes(
-    gl: &glow::Context,
+    device: &mut dyn Device,
     p: &Program,
     blend: &[ui_core::draw::BlendShape],
     count: u8,
-    device: ui_core::geom::Rect,
+    node: ui_core::geom::Rect,
     s: f32,
 ) {
     if count == 0 {
@@ -71,8 +73,8 @@ fn upload_shapes(
     for (i, shape) in blend.iter().take(count as usize).enumerate() {
         let hw = shape.rect.size.w.abs() * 0.5 * s;
         let hh = shape.rect.size.h.abs() * 0.5 * s;
-        boxes[i * 4] = device.origin.x + shape.rect.origin.x * s + hw;
-        boxes[i * 4 + 1] = device.origin.y + shape.rect.origin.y * s + hh;
+        boxes[i * 4] = node.origin.x + shape.rect.origin.x * s + hw;
+        boxes[i * 4 + 1] = node.origin.y + shape.rect.origin.y * s + hh;
         boxes[i * 4 + 2] = hw;
         boxes[i * 4 + 3] = hh;
         let cap = hw.min(hh);
@@ -82,10 +84,10 @@ fn upload_shapes(
         radii[i * 4 + 3] = (shape.corners.bl * s).min(cap);
     }
     if let Some(u) = p.uniforms.shapes {
-        unsafe { gl.uniform_4_f32_slice(Some(&u), &boxes) };
+        device.set_uniform_vec4_slice(u, &boxes);
     }
     if let Some(u) = p.uniforms.shape_radius {
-        unsafe { gl.uniform_4_f32_slice(Some(&u), &radii) };
+        device.set_uniform_vec4_slice(u, &radii);
     }
 }
 
@@ -121,84 +123,6 @@ pub struct AtlasUpload {
     pub height: u32,
     /// Single-channel coverage.
     pub data: Vec<u8>,
-}
-
-pub(crate) struct Program {
-    pub(crate) program: glow::Program,
-    pub(crate) vao: glow::VertexArray,
-    unit_vbo: glow::Buffer,
-    pub(crate) instance_vbo: glow::Buffer,
-    pub(crate) uniforms: Uniforms,
-}
-
-pub(crate) struct Uniforms {
-    pub(crate) viewport: Option<glow::UniformLocation>,
-    atlas_size: Option<glow::UniformLocation>,
-    atlas: Option<glow::UniformLocation>,
-    color_atlas_size: Option<glow::UniformLocation>,
-    color_atlas: Option<glow::UniformLocation>,
-    image: Option<glow::UniformLocation>,
-    opacity: Option<glow::UniformLocation>,
-    /// Sampler name differs per program: glyphs use `u_atlas`, layers `u_layer`.
-    layer_tex: Option<glow::UniformLocation>,
-    clip_rect: Option<glow::UniformLocation>,
-    clip_radius: Option<glow::UniformLocation>,
-    clip_shape: Option<glow::UniformLocation>,
-    clip_on: Option<glow::UniformLocation>,
-    /// Effect pass inputs; `None` for programs that do not run one.
-    pub(crate) src: Option<glow::UniformLocation>,
-    pub(crate) texel: Option<glow::UniformLocation>,
-    pub(crate) dir: Option<glow::UniformLocation>,
-    pub(crate) taps: Option<glow::UniformLocation>,
-    /// Sliding-window radius, used by the box program instead of `u_weights`.
-    pub(crate) radius: Option<glow::UniformLocation>,
-    /// Supersample factor, used by the resolve program.
-    pub(crate) supersample: Option<glow::UniformLocation>,
-    /// Whether the resolve pass must encode linear light back into sRGB bytes.
-    pub(crate) encode: Option<glow::UniformLocation>,
-    /// The lens capture in device pixels, read by the kit shader; the capture pass takes the
-    /// same region in frame uv under `u_region`.
-    pub(crate) capture: Option<glow::UniformLocation>,
-    pub(crate) region: Option<glow::UniformLocation>,
-    pub(crate) weights: Option<glow::UniformLocation>,
-    pub(crate) color: Option<glow::UniformLocation>,
-    /// Output transform inputs; `None` for programs that do not encode.
-    pub(crate) scale: Option<glow::UniformLocation>,
-    pub(crate) offset: Option<glow::UniformLocation>,
-    pub(crate) gamut: Option<glow::UniformLocation>,
-    layer_rect: Option<glow::UniformLocation>,
-    layer_radius: Option<glow::UniformLocation>,
-    layer_exp: Option<glow::UniformLocation>,
-    layer_skip_empty: Option<glow::UniformLocation>,
-    /// Material uniforms; `None` for programs that shade no backdrop.
-    tint: Option<glow::UniformLocation>,
-    luminosity: Option<glow::UniformLocation>,
-    noise: Option<glow::UniformLocation>,
-    /// Glass: the neutral body transfer.
-    body: Option<glow::UniformLocation>,
-    glass: Option<glow::UniformLocation>,
-    light: Option<glow::UniformLocation>,
-    /// Glass: refractive index, dispersion, thickness, capture density.
-    optical: Option<glow::UniformLocation>,
-    /// Blend group: live shape count and smooth-union radius.
-    blend: Option<glow::UniformLocation>,
-    /// Kit lens: Fresnel intensity, distance, sharpness, glare convergence.
-    kit: Option<glow::UniformLocation>,
-    /// Blend group: each shape's centre and half size, device pixels.
-    shapes: Option<glow::UniformLocation>,
-    /// Blend group: each shape's four corner radii, device pixels.
-    shape_radius: Option<glow::UniformLocation>,
-}
-
-/// GPU painter.
-/// One offscreen render target for a layer, reused across frames by depth.
-pub(crate) struct LayerTarget {
-    pub(crate) fbo: glow::Framebuffer,
-    pub(crate) tex: glow::Texture,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    /// Storage precision, so a format change reallocates instead of silently reusing.
-    pub(crate) format: crate::effect_pass::TargetFormat,
 }
 
 /// Where a batch is drawn: the render target's extent and the band it may touch.
@@ -281,7 +205,7 @@ fn frame_cleared_over(band: Option<[i32; 4]>, bounds: Option<ui_core::geom::Rect
 
 /// A subtree target that outlives the frame, keyed by `LayerEntry::cache_key`.
 pub(crate) struct CachedTarget {
-    pub(crate) target: LayerTarget,
+    pub(crate) target: Target,
     /// Whether `target` holds a finished composite of the subtree.
     pub(crate) valid: bool,
     /// Frame number this target was last asked for, so vanished canvases are freed.
@@ -292,7 +216,7 @@ pub(crate) struct CachedTarget {
 /// alternate within a frame, so a single slot would re-specify a texture the queue still
 /// samples twice per frame — which stalls the driver.
 struct CaptureTarget {
-    target: LayerTarget,
+    target: Target,
     /// Frame number this capture was last written, so the pool can re-form a stale slot.
     last_used: u64,
 }
@@ -302,7 +226,7 @@ const CAPTURE_TARGETS: usize = 4;
 
 /// One cached image texture; `id` and size decide whether the upload is reused.
 struct ImageTexture {
-    tex: glow::Texture,
+    tex: TextureId,
     width: u32,
     height: u32,
     /// The buffer this texture was uploaded from. Holding it keeps the address unique, so
@@ -317,7 +241,7 @@ struct ImageTexture {
 /// The texture one `ImagePrim` samples, resolved for the current frame.
 #[derive(Clone, Copy)]
 struct FrameImage {
-    tex: glow::Texture,
+    tex: TextureId,
     width: u32,
     height: u32,
     /// The filter this draw must set: a canvas texture serves every sampling, so its state
@@ -335,7 +259,7 @@ pub struct CanvasUpload<'a> {
 
 /// A canvas's persistent target, kept until a frame stops naming it.
 struct CanvasTarget {
-    target: Option<LayerTarget>,
+    target: Option<Target>,
     /// The frame that last named this canvas.
     last_used: u64,
 }
@@ -362,7 +286,7 @@ pub struct GpuRenderer {
     output_linear: Program,
     /// Box average from the supersampled frame down to the presented buffer.
     resolve: Program,
-    resolve_scratch: Option<LayerTarget>,
+    resolve_scratch: Option<Target>,
     /// Resample one region of the frame into a lens's own capture.
     capture: Program,
     capture_targets: Vec<CaptureTarget>,
@@ -376,21 +300,21 @@ pub struct GpuRenderer {
     /// Working domain: encoded sRGB for SDR, linear light for HDR.
     encode: Encode,
     /// Internal storage precision for the frame and every layer target.
-    target_format: crate::effect_pass::TargetFormat,
+    target_format: crate::format::TargetFormat,
     /// sRGB -> output gamut, row-major; identity until a description is read.
     gamut: [[f32; 3]; 3],
-    output_scratch: Option<LayerTarget>,
+    output_scratch: Option<Target>,
     /// Device-space bounds per nesting depth: the only region worth filtering or compositing.
     layer_bounds: Vec<ui_core::geom::Rect>,
     /// Device-space corner radii per depth, mirroring `layer_bounds`.
     layer_radius: Vec<ui_core::geom::Corners>,
     /// Persistent frame buffer: the target rotates, so the accumulated frame lives here.
-    frame: Option<LayerTarget>,
+    frame: Option<Target>,
     /// Root of the active layer chain; `end_layer` composites depth 0 here.
-    root_fbo: Option<glow::Framebuffer>,
+    root_fbo: Option<TargetId>,
     /// Ping-pong scratch per nesting depth. These hold no meaningful content between
     /// frames: each frame recomputes every stage from the live scene.
-    effect_scratch: Vec<crate::effect_pass::Scratch>,
+    effect_scratch: Vec<crate::effect::Scratch>,
     /// Sliding-window box pass, used for blurs whose radius exceeds the kernel array.
     boxpass: Program,
     /// Acrylic composite over the blurred backdrop.
@@ -404,16 +328,16 @@ pub struct GpuRenderer {
     material: Option<BackdropMaterial>,
     /// Scratch for backdrop blurs; kept apart from the layer scratch so a frost and a
     /// layer effect in the same frame cannot overwrite each other's intermediates.
-    backdrop_scratch: crate::effect_pass::Scratch,
+    backdrop_scratch: crate::effect::Scratch,
     /// Offscreen targets indexed by nesting depth.
-    layer_targets: Vec<LayerTarget>,
+    layer_targets: Vec<Target>,
     /// Subtree targets that persist across frames, keyed by the layer's cache key.
     cached_targets: HashMap<u64, CachedTarget>,
     /// Frame counter, so a canvas absent this frame can be freed.
     frame_serial: u64,
-    atlas_tex: Option<glow::Texture>,
+    atlas_tex: Option<TextureId>,
     atlas_size: (u32, u32),
-    color_atlas_tex: Option<glow::Texture>,
+    color_atlas_tex: Option<TextureId>,
     color_atlas_size: (u32, u32),
     /// Uploaded image textures keyed by picture and sampling; keys absent from a frame are
     /// freed. One picture drawn both ways holds two textures, because the filter is a
@@ -436,317 +360,26 @@ pub struct GpuRenderer {
 }
 
 impl GpuRenderer {
-    /// Compile both programs and set up vertex arrays.
-    pub fn new(gl: &glow::Context, is_gles: bool) -> Result<Self, GpuError> {
-        let layers = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            &shader::layer_fragment(),
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &[
-                "u_viewport",
-                "u_opacity",
-                "u_layer",
-                "u_rect",
-                "u_radius",
-                "u_exp",
-                "u_skip_empty",
-            ],
-        )?;
-        let effects = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            shader::EFFECT_FRAGMENT,
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &[
-                "u_viewport",
-                "u_src",
-                "u_texel",
-                "u_dir",
-                "u_taps",
-                "u_weights",
-                "u_color",
-            ],
-        )?;
-        let boxpass = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            shader::BOX_FRAGMENT,
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &[
-                "u_viewport",
-                "u_src",
-                "u_texel",
-                "u_dir",
-                "u_radius",
-                "u_color",
-            ],
-        )?;
-        // One source, two programs: the branch sits at the encoding boundary only.
-        let output_srgb = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            shader::OUTPUT_FRAGMENT,
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &["u_viewport", "u_src", "u_scale", "u_offset", "u_gamut"],
-        )?;
-        let output_linear = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            &format!("#define LINEAR_DOMAIN\n{}", shader::OUTPUT_FRAGMENT),
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &["u_viewport", "u_src", "u_scale", "u_offset", "u_gamut"],
-        )?;
-        let resolve = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            shader::RESOLVE_FRAGMENT,
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &["u_viewport", "u_src", "u_ss", "u_encode"],
-        )?;
-        let capture = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            shader::CAPTURE_FRAGMENT,
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &["u_viewport", "u_src", "u_region"],
-        )?;
-        let rects = Program::new(
-            gl,
-            is_gles,
-            shader::RECT_VERTEX,
-            &shader::rect_fragment(),
-            shader::RECT_STRIDE,
-            &[
-                ("a_rect", 4),
-                ("a_radius", 4),
-                ("a_fill", 4),
-                ("a_border", 4),
-                ("a_border2", 4),
-                ("a_border_g", 1),
-                ("a_shape", 1),
-                ("a_fill2", 4),
-                ("a_grad", 2),
-                ("a_stops", 4),
-                ("a_extent", 2),
-                ("a_border_w", 1),
-                ("a_notch", 2),
-                ("a_flip", 2),
-            ],
-            &[
-                "u_viewport",
-                "u_clip_rect",
-                "u_clip_radius",
-                "u_clip_shape",
-                "u_clip_on",
-            ],
-        )?;
-        let sectors = Program::new(
-            gl,
-            is_gles,
-            shader::SECTOR_VERTEX,
-            &shader::sector_fragment(),
-            shader::SECTOR_STRIDE,
-            &[("a_centre", 2), ("a_geom", 4), ("a_fill", 4), ("a_caps", 1)],
-            &[
-                "u_viewport",
-                "u_clip_rect",
-                "u_clip_radius",
-                "u_clip_shape",
-                "u_clip_on",
-            ],
-        )?;
-        let ellipses = Program::new(
-            gl,
-            is_gles,
-            shader::ELLIPSE_VERTEX,
-            &shader::ellipse_fragment(),
-            shader::ELLIPSE_STRIDE,
-            &[
-                ("a_centre", 2),
-                ("a_radii", 2),
-                ("a_width", 1),
-                ("a_fill", 4),
-                ("a_stroke", 4),
-            ],
-            &[
-                "u_viewport",
-                "u_clip_rect",
-                "u_clip_radius",
-                "u_clip_shape",
-                "u_clip_on",
-            ],
-        )?;
-        let lines = Program::new(
-            gl,
-            is_gles,
-            shader::LINE_VERTEX,
-            &shader::line_fragment(),
-            shader::LINE_STRIDE,
-            &[("a_from", 2), ("a_to", 2), ("a_width", 1), ("a_fill", 4)],
-            &[
-                "u_viewport",
-                "u_clip_rect",
-                "u_clip_radius",
-                "u_clip_shape",
-                "u_clip_on",
-            ],
-        )?;
-        let glyphs = Program::new(
-            gl,
-            is_gles,
-            shader::GLYPH_VERTEX,
-            &shader::glyph_fragment(),
-            shader::GLYPH_STRIDE,
-            &[("a_rect", 4), ("a_atlas", 4), ("a_color", 4), ("a_kind", 1)],
-            &[
-                "u_viewport",
-                "u_atlas_size",
-                "u_atlas",
-                "u_color_atlas_size",
-                "u_color_atlas",
-                "u_clip_rect",
-                "u_clip_radius",
-                "u_clip_shape",
-                "u_clip_on",
-            ],
-        )?;
-        let shadows = Program::new(
-            gl,
-            is_gles,
-            shader::SHADOW_VERTEX,
-            &shader::shadow_fragment(),
-            shader::SHADOW_STRIDE,
-            &[
-                ("a_rect", 4),
-                ("a_radius", 4),
-                ("a_colour", 4),
-                ("a_soft", 2),
-                ("a_shape", 1),
-                ("a_ring", 1),
-                ("a_cut", 4),
-                ("a_inset", 1),
-            ],
-            &[
-                "u_viewport",
-                "u_clip_rect",
-                "u_clip_radius",
-                "u_clip_shape",
-                "u_clip_on",
-            ],
-        )?;
-        let images = Program::new(
-            gl,
-            is_gles,
-            shader::IMAGE_VERTEX,
-            &shader::image_fragment(),
-            shader::IMAGE_STRIDE,
-            &[("a_rect", 4), ("a_radius", 4), ("a_uv", 4), ("a_shape", 1)],
-            &[
-                "u_viewport",
-                "u_image",
-                "u_clip_rect",
-                "u_clip_radius",
-                "u_clip_shape",
-                "u_clip_on",
-            ],
-        )?;
-        let acrylic = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            &shader::acrylic_fragment(),
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &[
-                "u_viewport",
-                "u_src",
-                "u_rect",
-                "u_radius",
-                "u_exp",
-                "u_tint",
-                "u_luminosity",
-                "u_noise",
-            ],
-        )?;
-        let acrylic_linear = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            &format!("#define LINEAR_DOMAIN\n{}", shader::acrylic_fragment()),
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &[
-                "u_viewport",
-                "u_src",
-                "u_rect",
-                "u_radius",
-                "u_exp",
-                "u_tint",
-                "u_luminosity",
-                "u_noise",
-            ],
-        )?;
-        let glass_kit_linear = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            &format!("#define LINEAR_DOMAIN\n{}", shader::liquid_glass_fragment()),
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &[
-                "u_viewport",
-                "u_src",
-                "u_rect",
-                "u_radius",
-                "u_exp",
-                "u_glass",
-                "u_optical",
-                "u_light",
-                "u_kit",
-                "u_blend",
-                "u_capture",
-                "u_shape[0]",
-                "u_shape_radius[0]",
-            ],
-        )?;
-        let glass_kit = Program::new(
-            gl,
-            is_gles,
-            shader::LAYER_VERTEX,
-            &shader::liquid_glass_fragment(),
-            shader::RECT_STRIDE,
-            &[("a_rect", 4)],
-            &[
-                "u_viewport",
-                "u_src",
-                "u_rect",
-                "u_radius",
-                "u_exp",
-                "u_glass",
-                "u_optical",
-                "u_light",
-                "u_kit",
-                "u_blend",
-                "u_capture",
-                "u_shape[0]",
-                "u_shape_radius[0]",
-            ],
-        )?;
+    /// Build every program the painter draws with.
+    pub fn new(device: &mut dyn Device) -> Result<Self, GpuError> {
+        let layers = new_program(device, ProgramKey::Layers)?;
+        let sectors = new_program(device, ProgramKey::Sectors)?;
+        let ellipses = new_program(device, ProgramKey::Ellipses)?;
+        let lines = new_program(device, ProgramKey::Lines)?;
+        let glyphs = new_program(device, ProgramKey::Glyphs)?;
+        let images = new_program(device, ProgramKey::Images)?;
+        let shadows = new_program(device, ProgramKey::Shadows)?;
+        let rects = new_program(device, ProgramKey::Rects)?;
+        let effects = new_program(device, ProgramKey::Effects)?;
+        let boxpass = new_program(device, ProgramKey::Box)?;
+        let acrylic = new_program(device, ProgramKey::Acrylic)?;
+        let acrylic_linear = new_program(device, ProgramKey::AcrylicLinear)?;
+        let glass_kit = new_program(device, ProgramKey::GlassKit)?;
+        let glass_kit_linear = new_program(device, ProgramKey::GlassKitLinear)?;
+        let output_srgb = new_program(device, ProgramKey::OutputSrgb)?;
+        let output_linear = new_program(device, ProgramKey::OutputLinear)?;
+        let resolve = new_program(device, ProgramKey::Resolve)?;
+        let capture = new_program(device, ProgramKey::Capture)?;
         Ok(Self {
             rects,
             sectors,
@@ -775,7 +408,7 @@ impl GpuRenderer {
             hdr: None,
             destination: ui_core::colour::Destination::SDR,
             encode: Encode::Srgb,
-            target_format: crate::effect_pass::TargetFormat::Rgba8,
+            target_format: TargetFormat::Rgba8,
             gamut: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             output_scratch: None,
             frame: None,
@@ -826,8 +459,8 @@ impl GpuRenderer {
         };
         self.encode = Encode::of(destination);
         self.target_format = match self.encode {
-            Encode::Srgb => crate::effect_pass::TargetFormat::Rgba8,
-            Encode::Linear => crate::effect_pass::TargetFormat::Rgba16F,
+            Encode::Srgb => crate::format::TargetFormat::Rgba8,
+            Encode::Linear => crate::format::TargetFormat::Rgba16F,
         };
     }
 
@@ -837,7 +470,7 @@ impl GpuRenderer {
     }
 
     /// The frame's storage precision, which follows the working domain.
-    pub fn frame_format(&self) -> crate::effect_pass::TargetFormat {
+    pub fn frame_format(&self) -> crate::format::TargetFormat {
         self.target_format
     }
 
@@ -878,15 +511,17 @@ impl GpuRenderer {
     }
 
     /// Upload (or replace) the coverage atlas.
-    pub fn set_atlas(&mut self, gl: &glow::Context, atlas: AtlasUpload) -> Result<(), GpuError> {
+    pub fn set_atlas(
+        &mut self,
+        device: &mut dyn Device,
+        atlas: AtlasUpload,
+    ) -> Result<(), GpuError> {
         upload_atlas(
-            gl,
+            device,
             &mut self.atlas_tex,
             atlas.width,
             atlas.height,
-            glow::R8,
-            glow::RED,
-            glow::UNSIGNED_BYTE,
+            TextureFormat::R8,
             &atlas.data,
         )?;
         self.atlas_size = (atlas.width, atlas.height);
@@ -896,25 +531,23 @@ impl GpuRenderer {
     /// Upload (or replace) the colour atlas: premultiplied RGBA8, converted to the domain.
     pub fn set_color_atlas(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         atlas: AtlasUpload,
     ) -> Result<(), GpuError> {
         let linear = match self.encode {
             Encode::Srgb => None,
             Encode::Linear => Some(premultiplied_to_linear(&atlas.data)),
         };
-        let (internal, kind, data) = match &linear {
-            None => (glow::RGBA8, glow::UNSIGNED_BYTE, atlas.data.as_slice()),
-            Some(bytes) => (glow::RGBA16F, glow::HALF_FLOAT, bytes.as_slice()),
+        let (format, data) = match &linear {
+            None => (TextureFormat::Rgba8, atlas.data.as_slice()),
+            Some(bytes) => (TextureFormat::Rgba16F, bytes.as_slice()),
         };
         upload_atlas(
-            gl,
+            device,
             &mut self.color_atlas_tex,
             atlas.width,
             atlas.height,
-            internal,
-            glow::RGBA,
-            kind,
+            format,
             data,
         )?;
         self.color_atlas_size = (atlas.width, atlas.height);
@@ -922,13 +555,12 @@ impl GpuRenderer {
     }
 
     /// Clear `target` to `color` (straight alpha, 0..=1).
-    pub fn clear(&mut self, gl: &glow::Context, target: &dyn GpuSurface, color: [f32; 4]) {
-        target.bind(gl);
-        unsafe {
-            gl.disable(glow::SCISSOR_TEST);
-            gl.clear_color(color[0], color[1], color[2], color[3]);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-        }
+    pub fn clear(&mut self, device: &mut dyn Device, target: &dyn RenderTarget, color: [f32; 4]) {
+        device.bind_target(Some(target.target_id()));
+
+        device.set_scissor(None);
+        device.set_clear_color([color[0], color[1], color[2], color[3]]);
+        device.clear();
     }
 
     /// Render `list` into `target`.
@@ -940,11 +572,11 @@ impl GpuRenderer {
     /// `docs/effect-cache-plan.md` §11.
     pub fn render(
         &mut self,
-        gl: &glow::Context,
-        target: &dyn GpuSurface,
+        device: &mut dyn Device,
+        target: &dyn RenderTarget,
         list: &DrawList,
     ) -> Result<RenderStats, GpuError> {
-        self.render_frame(gl, target, list, &ui_core::damage::Damage::Full)
+        self.render_frame(device, target, list, &ui_core::damage::Damage::Full)
     }
 
     /// Render only `damage` into the persistent frame, then hand that band to `target`.
@@ -953,12 +585,12 @@ impl GpuRenderer {
     /// surface is drawn twice; a frost widens the band over itself instead.
     pub fn render_frame(
         &mut self,
-        gl: &glow::Context,
-        target: &dyn GpuSurface,
+        device: &mut dyn Device,
+        target: &dyn RenderTarget,
         list: &DrawList,
         damage: &ui_core::damage::Damage,
     ) -> Result<RenderStats, GpuError> {
-        self.render_frame_into(gl, target, list, damage, &[])
+        self.render_frame_into(device, target, list, damage, &[])
     }
 
     /// The same, also copying `carry` to `target`: the rects it is still missing.
@@ -967,13 +599,13 @@ impl GpuRenderer {
     /// assigned to, so everything drawn since then has to travel with this frame's band.
     pub fn render_frame_into(
         &mut self,
-        gl: &glow::Context,
-        target: &dyn GpuSurface,
+        device: &mut dyn Device,
+        target: &dyn RenderTarget,
         list: &DrawList,
         damage: &ui_core::damage::Damage,
         carry: &[[i32; 4]],
     ) -> Result<RenderStats, GpuError> {
-        self.render_frame_with_canvases(gl, target, list, damage, carry, &[])
+        self.render_frame_with_canvases(device, target, list, damage, carry, &[])
     }
 
     /// The same, painting `canvases` before the frame that samples them.
@@ -982,8 +614,8 @@ impl GpuRenderer {
     /// surface scale never reach it; the frame then samples its target as one picture.
     pub fn render_frame_with_canvases(
         &mut self,
-        gl: &glow::Context,
-        target: &dyn GpuSurface,
+        device: &mut dyn Device,
+        target: &dyn RenderTarget,
         list: &DrawList,
         damage: &ui_core::damage::Damage,
         carry: &[[i32; 4]],
@@ -994,7 +626,7 @@ impl GpuRenderer {
         // frame touches is stamped with it, and anything older is freed at the end.
         self.frame_serial += 1;
         self.frame_keys.clear();
-        self.paint_canvases(gl, canvases)?;
+        self.paint_canvases(device, canvases)?;
         // Everything below is measured in render pixels: the surface times `ss`. Geometry
         // and scissor conversion ride the same factor, so the scene is simply drawn finer.
         let surface = (target.size().0, target.size().1);
@@ -1002,13 +634,14 @@ impl GpuRenderer {
         let size = (surface.0 * ss, surface.1 * ss);
         let scale = self.scale;
         self.scale = scale * ss as f32;
-        let (frame_fbo, frame_tex) = crate::effect_pass::ensure_target(
+        let frame_target = crate::target::ensure_target(
             &mut self.frame,
-            gl,
+            device,
             size.0,
             size.1,
             self.target_format,
         )?;
+        let (frame_fbo, frame_tex) = (frame_target.fbo, frame_target.tex);
         // Only the redraw band is cleared: everything outside it still holds the pixels the
         // previous frame left there, and that is exactly what the band promises.
         let band = timed!("gpu_band", self.damage_band(damage, surface, list));
@@ -1017,31 +650,26 @@ impl GpuRenderer {
             Some(_) => PARTIAL_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             None => FULL_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(frame_fbo));
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            match band {
-                Some(b) => {
-                    gl.enable(glow::SCISSOR_TEST);
-                    gl.scissor(b[0], b[1], b[2], b[3]);
-                }
-                None => gl.disable(glow::SCISSOR_TEST),
+
+        device.bind_target(Some(frame_fbo));
+        device.set_clear_color([0.0, 0.0, 0.0, 0.0]);
+        match band {
+            Some(b) => {
+                device.set_scissor(Some([b[0], b[1], b[2], b[3]]));
             }
-            gl.clear(glow::COLOR_BUFFER_BIT);
+            None => device.set_scissor(None),
         }
+        device.clear();
+
         self.root_fbo = Some(frame_fbo);
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(frame_fbo));
-            gl.viewport(0, 0, size.0 as i32, size.1 as i32);
-        }
+
+        device.bind_target(Some(frame_fbo));
+        device.set_viewport(size.0, size.1);
+
         let viewport = (size.0 as f32, size.1 as f32);
-        unsafe {
-            gl.enable(glow::BLEND);
-            // Premultiplied source over destination.
-            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-            gl.disable(glow::DEPTH_TEST);
-            gl.enable(glow::SCISSOR_TEST);
-        }
+
+        device.set_blend(true);
+        // Premultiplied source over destination.
 
         let mut rect_data: Vec<f32> = Vec::new();
         let mut glyph_data: Vec<f32> = Vec::new();
@@ -1057,14 +685,14 @@ impl GpuRenderer {
         // layer is composited back over that same parent, so it is what the surface covers.
         let backdrops = list.backdrop_order();
         let mut done = 0usize;
-        timed!("gpu_upload", self.sync_images(gl, list))?;
+        timed!("gpu_upload", self.sync_images(device, list))?;
         // Probe: `CRABSNAP_NO_CULL=1` draws every batch, so an A/B can price the culling.
         let cull = std::env::var_os("CRABSNAP_NO_CULL").is_none();
 
         for batch in list.plan_batches() {
             timed!(
                 "gpu_layers",
-                self.sync_layers(gl, list, &frame, &mut chain, &batch.layers)
+                self.sync_layers(device, list, &frame, &mut chain, &batch.layers)
             )?;
             // A cached subtree that did not change keeps the pixels the frame already has;
             // rebuilding its vertices and submitting them would write nothing new.
@@ -1088,7 +716,7 @@ impl GpuRenderer {
                     let (src, dst) = self.backdrop_pair(frame_tex, frame_fbo, &chain.stack);
                     timed!(
                         "gpu_backdrop",
-                        self.apply_backdrop(gl, size, dst, src, entry, band)
+                        self.apply_backdrop(device, size, dst, src, entry, band)
                     )?;
                 }
             }
@@ -1109,7 +737,7 @@ impl GpuRenderer {
                 }
             }
             self.draw_batch(
-                gl,
+                device,
                 list,
                 &batch,
                 Pass { viewport, band },
@@ -1125,7 +753,7 @@ impl GpuRenderer {
             done += 1;
             if std::env::var("CRABSNAP_NO_BACKDROP").is_err() {
                 let (src, dst) = self.backdrop_pair(frame_tex, frame_fbo, &chain.stack);
-                self.apply_backdrop(gl, size, dst, src, entry, band)?;
+                self.apply_backdrop(device, size, dst, src, entry, band)?;
             }
         }
         while let Some(index) = chain.stack.pop() {
@@ -1142,7 +770,7 @@ impl GpuRenderer {
                 None => frame_cleared_over(band, self.layer_bounds.get(depth).copied()),
             };
             self.end_layer(
-                gl,
+                device,
                 depth,
                 effects,
                 viewport,
@@ -1156,13 +784,13 @@ impl GpuRenderer {
         }
         self.cached_targets
             .retain(|_, c| c.last_used == self.frame_serial);
-        self.evict_images(gl);
+        self.evict_images(device);
         // The target must end up equal to the frame: this frame's band plus whatever it
         // missed on the frames it was not handed. A full band copies everything anyway.
         let copy = band.map(|b| carry.iter().fold(b, |acc, c| union_device(acc, *c, size)));
         let blitted = timed!(
             "gpu_blit",
-            self.blit_frame(gl, target, surface, frame_fbo, frame_tex, copy)
+            self.blit_frame(device, target, surface, frame_fbo, frame_tex, copy)
         );
         self.scale = scale;
         blitted?;
@@ -1172,30 +800,29 @@ impl GpuRenderer {
     /// Bind the target that layer `depth` renders into, creating it on demand.
     fn begin_layer(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         depth: usize,
         width: u32,
         height: u32,
     ) -> Result<(), GpuError> {
         while self.layer_targets.len() <= depth {
-            self.layer_targets.push(crate::effect_pass::new_target(gl)?);
+            self.layer_targets.push(Target::EMPTY);
         }
 
         let slot = &mut self.layer_targets[depth];
         if slot.width != width || slot.height != height || slot.format != self.target_format {
-            crate::effect_pass::resize_target(gl, slot, width, height, self.target_format);
+            crate::target::resize_target(slot, device, width, height, self.target_format)?;
         }
 
         let fbo = slot.fbo;
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.viewport(0, 0, width as i32, height as i32);
-            // A layer starts fully transparent; leftovers would leak through.
-            gl.disable(glow::SCISSOR_TEST);
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.enable(glow::SCISSOR_TEST);
-        }
+
+        device.bind_target(Some(fbo));
+        device.set_viewport(width, height);
+        // A layer starts fully transparent; leftovers would leak through.
+        device.set_scissor(None);
+        device.set_clear_color([0.0, 0.0, 0.0, 0.0]);
+        device.clear();
+
         Ok(())
     }
 
@@ -1265,11 +892,11 @@ impl GpuRenderer {
     /// frame leaves sRGB values in a surface declared as PQ, which reads as washed out.
     fn blit_frame(
         &mut self,
-        gl: &glow::Context,
-        target: &dyn GpuSurface,
+        device: &mut dyn Device,
+        target: &dyn RenderTarget,
         size: (u32, u32),
-        frame_fbo: glow::Framebuffer,
-        frame_tex: glow::Texture,
+        frame_fbo: TargetId,
+        frame_tex: TextureId,
         band: Option<[i32; 4]>,
     ) -> Result<(), GpuError> {
         // Resolve before the output transform: the transform must encode averaged pixels,
@@ -1277,21 +904,21 @@ impl GpuRenderer {
         let mut from = frame_fbo;
         let mut source = frame_tex;
         if self.supersample > 1 {
-            let scratch = crate::effect_pass::ensure_target(
+            let scratch = crate::target::ensure_target(
                 &mut self.resolve_scratch,
-                gl,
+                device,
                 size.0,
                 size.1,
                 self.target_format,
             )?;
-            self.resolve_frame(gl, scratch.0, source, size, false)?;
-            from = scratch.0;
-            source = scratch.1;
+            self.resolve_frame(device, scratch.fbo, source, size, false)?;
+            from = scratch.fbo;
+            source = scratch.tex;
         }
         if let Some([scale, offset]) = self.hdr {
-            let scratch = crate::effect_pass::ensure_target(
+            let scratch = crate::target::ensure_target(
                 &mut self.output_scratch,
-                gl,
+                device,
                 size.0,
                 size.1,
                 self.target_format,
@@ -1300,109 +927,86 @@ impl GpuRenderer {
                 Encode::Srgb => &self.output_srgb,
                 Encode::Linear => &self.output_linear,
             };
-            unsafe {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scratch.0));
-                gl.viewport(0, 0, size.0 as i32, size.1 as i32);
-                gl.disable(glow::BLEND);
-                gl.disable(glow::SCISSOR_TEST);
-                gl.use_program(Some(p.program));
-                if let Some(u) = &p.uniforms.viewport {
-                    gl.uniform_2_f32(Some(u), size.0 as f32, size.1 as f32);
-                }
-                if let Some(u) = &p.uniforms.src {
-                    gl.active_texture(glow::TEXTURE0);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(source));
-                    gl.uniform_1_i32(Some(u), 0);
-                }
-                if let Some(u) = &p.uniforms.scale {
-                    gl.uniform_1_f32(Some(u), scale);
-                }
-                if let Some(u) = &p.uniforms.offset {
-                    gl.uniform_1_f32(Some(u), offset);
-                }
-                if let Some(u) = &p.uniforms.gamut {
-                    // GLSL reads mat3 column-major, so transpose on the way out.
-                    let g = &self.gamut;
-                    let cols = [
-                        g[0][0], g[1][0], g[2][0], g[0][1], g[1][1], g[2][1], g[0][2], g[1][2],
-                        g[2][2],
-                    ];
-                    gl.uniform_matrix_3_f32_slice(Some(u), false, &cols);
-                }
-                gl.bind_vertex_array(Some(p.vao));
-                let quad: [f32; 4] = [0.0, 0.0, size.0 as f32, size.1 as f32];
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&quad), glow::DYNAMIC_DRAW);
-                gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, 1);
-                gl.enable(glow::BLEND);
+
+            device.bind_target(Some(scratch.fbo));
+            device.set_viewport(size.0, size.1);
+            device.set_blend(false);
+            device.set_scissor(None);
+            device.use_program(p.id);
+            if let Some(u) = p.uniforms.viewport {
+                device.set_uniform_vec2(u, [size.0 as f32, size.1 as f32]);
             }
-            from = scratch.0;
+            if let Some(u) = p.uniforms.src {
+                device.bind_texture(0, Some(source));
+                device.set_uniform_i32(u, 0);
+            }
+            if let Some(u) = p.uniforms.scale {
+                device.set_uniform_f32(u, scale);
+            }
+            if let Some(u) = p.uniforms.offset {
+                device.set_uniform_f32(u, offset);
+            }
+            if let Some(u) = p.uniforms.gamut {
+                // GLSL reads mat3 column-major, so transpose on the way out.
+                let g = &self.gamut;
+                let cols = [
+                    g[0][0], g[1][0], g[2][0], g[0][1], g[1][1], g[2][1], g[0][2], g[1][2], g[2][2],
+                ];
+                device.set_uniform_mat3(u, &cols);
+            }
+            let quad: [f32; 4] = [0.0, 0.0, size.0 as f32, size.1 as f32];
+            device.draw_instanced(p.id, as_bytes(&quad), 1)?;
+            device.set_blend(true);
+
+            from = scratch.fbo;
         }
-        unsafe {
-            gl.disable(glow::SCISSOR_TEST);
-            target.bind(gl);
-            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(from));
-            let [x, y, w, h] = band.unwrap_or([0, 0, size.0 as i32, size.1 as i32]);
-            gl.blit_framebuffer(
-                x,
-                y,
-                x + w,
-                y + h,
-                x,
-                y,
-                x + w,
-                y + h,
-                glow::COLOR_BUFFER_BIT,
-                glow::NEAREST,
-            );
-            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
-        }
+
+        device.set_scissor(None);
+        let [x, y, w, h] = band.unwrap_or([0, 0, size.0 as i32, size.1 as i32]);
+        device.blit(from, target.target_id(), [x, y, w, h]);
+
         Ok(())
     }
 
     /// Box-average the supersampled frame into `dest`, one destination pixel per quad pixel.
     fn resolve_frame(
         &self,
-        gl: &glow::Context,
-        dest: glow::Framebuffer,
-        src: glow::Texture,
+        device: &mut dyn Device,
+        dest: TargetId,
+        src: TextureId,
         size: (u32, u32),
         encode: bool,
     ) -> Result<(), GpuError> {
         let p = &self.resolve;
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(dest));
-            gl.viewport(0, 0, size.0 as i32, size.1 as i32);
-            gl.disable(glow::BLEND);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.use_program(Some(p.program));
-            if let Some(u) = &p.uniforms.viewport {
-                gl.uniform_2_f32(Some(u), size.0 as f32, size.1 as f32);
-            }
-            if let Some(u) = &p.uniforms.src {
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(src));
-                gl.uniform_1_i32(Some(u), 0);
-            }
-            if let Some(u) = &p.uniforms.supersample {
-                gl.uniform_1_i32(Some(u), self.supersample as i32);
-            }
-            if let Some(u) = &p.uniforms.encode {
-                gl.uniform_1_i32(Some(u), i32::from(encode));
-            }
-            gl.bind_vertex_array(Some(p.vao));
-            let quad: [f32; 4] = [0.0, 0.0, size.0 as f32, size.1 as f32];
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&quad), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, 1);
-            gl.enable(glow::BLEND);
+
+        device.bind_target(Some(dest));
+        device.set_viewport(size.0, size.1);
+        device.set_blend(false);
+        device.set_scissor(None);
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [size.0 as f32, size.1 as f32]);
         }
+        if let Some(u) = p.uniforms.src {
+            device.bind_texture(0, Some(src));
+            device.set_uniform_i32(u, 0);
+        }
+        if let Some(u) = p.uniforms.supersample {
+            device.set_uniform_i32(u, self.supersample as i32);
+        }
+        if let Some(u) = p.uniforms.encode {
+            device.set_uniform_i32(u, i32::from(encode));
+        }
+        let quad: [f32; 4] = [0.0, 0.0, size.0 as f32, size.1 as f32];
+        device.draw_instanced(p.id, as_bytes(&quad), 1)?;
+        device.set_blend(true);
+
         Ok(())
     }
 
     fn end_layer(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         depth: usize,
         effects: &[Effect],
         viewport: (f32, f32),
@@ -1424,9 +1028,9 @@ impl GpuRenderer {
                 && let Some(cached) = self.cached_targets.get(&key)
             {
                 let tex = cached.target.tex;
-                self.composite_layer(gl, depth, tex, viewport, cleared);
+                self.composite_layer(device, depth, tex, viewport, cleared)?;
             } else if !composite {
-                self.bind_parent(gl, depth, viewport);
+                self.bind_parent(device, depth, viewport);
             }
             return Ok(());
         }
@@ -1451,9 +1055,9 @@ impl GpuRenderer {
             .cloned()
             .map(|e| ui_core::effect::on_grid(e, self.scale))
             .collect();
-        let tex = crate::effect_pass::run(
+        let tex = crate::effect::run(
             &mut self.effect_scratch[depth],
-            gl,
+            device,
             &self.effects,
             &self.boxpass,
             layer_tex,
@@ -1467,32 +1071,28 @@ impl GpuRenderer {
 
         // Keep the finished pixels for the frames this subtree does not change in.
         if let Some(key) = cache {
-            self.store_cache(gl, key, tex, viewport)?;
+            self.store_cache(device, key, tex, viewport)?;
         }
 
         if composite {
-            self.composite_layer(gl, depth, tex, viewport, cleared);
+            self.composite_layer(device, depth, tex, viewport, cleared)?;
         } else {
-            self.bind_parent(gl, depth, viewport);
+            self.bind_parent(device, depth, viewport);
         }
         Ok(())
     }
 
     /// Bind the target a layer at `depth` composites into: the frame at depth 0, else its
     /// outer layer.
-    fn bind_parent(&self, gl: &glow::Context, depth: usize, viewport: (f32, f32)) {
+    fn bind_parent(&self, device: &mut dyn Device, depth: usize, viewport: (f32, f32)) {
         if depth == 0 {
             if let Some(root) = self.root_fbo {
-                unsafe {
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(root));
-                    gl.viewport(0, 0, viewport.0 as i32, viewport.1 as i32);
-                }
+                device.bind_target(Some(root));
+                device.set_viewport(viewport.0 as u32, viewport.1 as u32);
             }
         } else if let Some(parent) = self.layer_targets.get(depth - 1) {
-            unsafe {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(parent.fbo));
-                gl.viewport(0, 0, parent.width as i32, parent.height as i32);
-            }
+            device.bind_target(Some(parent.fbo));
+            device.set_viewport(parent.width, parent.height);
         }
     }
 
@@ -1500,21 +1100,21 @@ impl GpuRenderer {
     /// parent repainted; `None` = all of it), clipped and rounded to the layer.
     fn composite_layer(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         depth: usize,
-        tex: glow::Texture,
+        tex: TextureId,
         viewport: (f32, f32),
         cleared: Option<ui_core::geom::Rect>,
-    ) {
+    ) -> Result<(), GpuError> {
         let full = ui_core::geom::Rect::new(0.0, 0.0, viewport.0, viewport.1);
         let bounds = self.layer_bounds.get(depth).copied().unwrap_or(full);
-        self.bind_parent(gl, depth, viewport);
+        self.bind_parent(device, depth, viewport);
         let cut = bounds.intersection(full).and_then(|b| match cleared {
             Some(c) => b.intersection(c),
             None => Some(b),
         });
         let Some(cut) = cut else {
-            return;
+            return Ok(());
         };
         let scissor = device_scissor(cut, 1.0);
         let corners = self
@@ -1522,12 +1122,11 @@ impl GpuRenderer {
             .get(depth)
             .copied()
             .unwrap_or(ui_core::geom::Corners::all(0.0));
-        unsafe {
-            gl.enable(glow::SCISSOR_TEST);
-            gl.scissor(scissor[0], scissor[1], scissor[2], scissor[3]);
-        }
+
+        device.set_scissor(Some([scissor[0], scissor[1], scissor[2], scissor[3]]));
+
         self.draw_layer_quad(
-            gl,
+            device,
             tex,
             viewport,
             [
@@ -1537,68 +1136,64 @@ impl GpuRenderer {
                 bounds.size.h,
             ],
             corners,
-        );
+        )?;
         self.stats.draw_calls += 1;
+        Ok(())
     }
 
     /// Draw `tex` as one quad with the layer program: a layer composited into its parent, and
     /// the copy that keeps a cached layer's pixels.
     fn draw_layer_quad(
         &self,
-        gl: &glow::Context,
-        tex: glow::Texture,
+        device: &mut dyn Device,
+        tex: TextureId,
         viewport: (f32, f32),
         rect: [f32; 4],
         corners: ui_core::geom::Corners,
-    ) {
-        unsafe {
-            let p = &self.layers;
-            gl.use_program(Some(p.program));
-            if let Some(u) = p.uniforms.viewport {
-                gl.uniform_2_f32(Some(&u), viewport.0, viewport.1);
-            }
-            if let Some(u) = p.uniforms.opacity {
-                gl.uniform_1_f32(Some(&u), 1.0);
-            }
-            // Rounded corners are a property of the layer, not of this pass.
-            if let Some(u) = &p.uniforms.layer_rect {
-                gl.uniform_4_f32(Some(u), rect[0], rect[1], rect[2], rect[3]);
-            }
-            if let Some(u) = &p.uniforms.layer_radius {
-                gl.uniform_4_f32(Some(u), corners.tl, corners.tr, corners.br, corners.bl);
-            }
-            if let Some(u) = &p.uniforms.layer_exp {
-                gl.uniform_1_f32(Some(u), corners.shape.exponent());
-            }
-            if let Some(u) = &p.uniforms.layer_skip_empty {
-                gl.uniform_1_f32(Some(u), 0.0);
-            }
-            if let Some(u) = p.uniforms.layer_tex {
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                gl.uniform_1_i32(Some(&u), 0);
-            }
-            let data = [0.0f32, 0.0, viewport.0, viewport.1];
-            gl.bind_vertex_array(Some(p.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&data), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(glow::TRIANGLES, 0, shader::UNIT_QUAD.len() as i32 / 2, 1);
-            gl.enable(glow::SCISSOR_TEST);
+    ) -> Result<(), GpuError> {
+        let p = &self.layers;
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
+        if let Some(u) = p.uniforms.opacity {
+            device.set_uniform_f32(u, 1.0);
+        }
+        // Rounded corners are a property of the layer, not of this pass.
+        if let Some(u) = p.uniforms.layer_rect {
+            device.set_uniform_vec4(u, [rect[0], rect[1], rect[2], rect[3]]);
+        }
+        if let Some(u) = p.uniforms.layer_radius {
+            device.set_uniform_vec4(u, [corners.tl, corners.tr, corners.br, corners.bl]);
+        }
+        if let Some(u) = p.uniforms.layer_exp {
+            device.set_uniform_f32(u, corners.shape.exponent());
+        }
+        if let Some(u) = p.uniforms.layer_skip_empty {
+            device.set_uniform_f32(u, 0.0);
+        }
+        if let Some(u) = p.uniforms.layer_tex {
+            device.bind_texture(0, Some(tex));
+            device.set_uniform_i32(u, 0);
+        }
+        let data = [0.0f32, 0.0, viewport.0, viewport.1];
+        device.draw_instanced(p.id, as_bytes(&data), 1)?;
+
+        Ok(())
     }
 
     /// Copy a finished layer into its cache target, unmasked: the mask is the layer's, and it
     /// is reapplied whenever the cache is composited.
     fn store_cache(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         key: u64,
-        tex: glow::Texture,
+        tex: TextureId,
         viewport: (f32, f32),
     ) -> Result<(), GpuError> {
         let (w, h) = (viewport.0 as u32, viewport.1 as u32);
         if !self.cached_targets.contains_key(&key) {
-            let target = crate::effect_pass::new_target(gl)?;
+            let target = Target::EMPTY;
             self.cached_targets.insert(
                 key,
                 CachedTarget {
@@ -1616,24 +1211,24 @@ impl GpuRenderer {
             || slot.target.height != h
             || slot.target.format != self.target_format
         {
-            crate::effect_pass::resize_target(gl, &mut slot.target, w, h, self.target_format);
+            crate::target::resize_target(&mut slot.target, device, w, h, self.target_format)?;
         }
         slot.valid = true;
         let fbo = slot.target.fbo;
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.viewport(0, 0, w as i32, h as i32);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-        }
+
+        device.bind_target(Some(fbo));
+        device.set_viewport(w, h);
+        device.set_scissor(None);
+        device.set_clear_color([0.0, 0.0, 0.0, 0.0]);
+        device.clear();
+
         self.draw_layer_quad(
-            gl,
+            device,
             tex,
             viewport,
             [0.0, 0.0, viewport.0, viewport.1],
             ui_core::geom::Corners::all(0.0),
-        );
+        )?;
         self.stats.draw_calls += 1;
         Ok(())
     }
@@ -1648,10 +1243,10 @@ impl GpuRenderer {
     /// The texture a backdrop reads and the target it lands in, for the layer in force.
     fn backdrop_pair(
         &self,
-        frame_tex: glow::Texture,
-        frame_fbo: glow::Framebuffer,
+        frame_tex: TextureId,
+        frame_fbo: TargetId,
         stack: &[u32],
-    ) -> (glow::Texture, glow::Framebuffer) {
+    ) -> (TextureId, TargetId) {
         match stack.len() {
             0 => (frame_tex, frame_fbo),
             n => {
@@ -1683,36 +1278,36 @@ impl GpuRenderer {
     /// The device box a backdrop reads: its own rect grown by the kernel's reach.
     fn backdrop_read(&self, entry: &ui_core::draw::BackdropEntry) -> ui_core::geom::Rect {
         let s = self.scale;
-        let device = self.on_device(entry.rect);
+        let node = self.on_device(entry.rect);
         let effect =
             ui_core::effect::on_grid(ui_core::effect::Effect::box_blur(entry.sigma), self.scale);
         // The kit lens shows a margin beyond its box; a plain blur reads only its kernel.
         let margin = match resolve(entry.material, self.material) {
             Some(ui_core::draw::BackdropMaterial::LiquidGlass(k)) => {
-                (k.capture_size - 1.0).max(0.0) * 0.5 * device.size.w.max(device.size.h)
+                (k.capture_size - 1.0).max(0.0) * 0.5 * node.size.w.max(node.size.h)
             }
             _ => 0.0,
         };
         let reach = effect.kernel.radius as f32 * 3.0 + margin + 2.0 * s;
         ui_core::geom::Rect::new(
-            device.origin.x - reach,
-            device.origin.y - reach,
-            device.size.w + reach * 2.0,
-            device.size.h + reach * 2.0,
+            node.origin.x - reach,
+            node.origin.y - reach,
+            node.size.w + reach * 2.0,
+            node.size.h + reach * 2.0,
         )
     }
 
     fn apply_backdrop(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         size: (u32, u32),
-        dst_fbo: glow::Framebuffer,
-        src_tex: glow::Texture,
+        dst_fbo: TargetId,
+        src_tex: TextureId,
         entry: ui_core::draw::BackdropEntry,
         band: Option<[i32; 4]>,
     ) -> Result<(), GpuError> {
         let full = ui_core::geom::Rect::new(0.0, 0.0, size.0 as f32, size.1 as f32);
-        let device = self.on_device(entry.rect);
+        let node = self.on_device(entry.rect);
         // Only the region this frame cleared may be composited: blending over the frost's
         // own output would apply it twice, and `damage_band` already grew the band over
         // every frost it reaches, so a frost outside it has nothing to redraw.
@@ -1746,9 +1341,9 @@ impl GpuRenderer {
             .unwrap_or(ui_core::geom::Rect::ZERO);
         let filtered = timed!(
             "gpu_blur",
-            crate::effect_pass::run(
+            crate::effect::run(
                 &mut self.backdrop_scratch,
-                gl,
+                device,
                 &self.effects,
                 &self.boxpass,
                 src_tex,
@@ -1766,7 +1361,7 @@ impl GpuRenderer {
         self.stats.frosts += 1;
         timed!(
             "gpu_composite",
-            self.composite_backdrop(gl, size, dst_fbo, device, scissor, entry, filtered)
+            self.composite_backdrop(device, size, dst_fbo, node, scissor, entry, filtered)
         )
     }
 
@@ -1776,10 +1371,10 @@ impl GpuRenderer {
     /// The capture target for exactly `width`×`height`, reusing one of this size.
     fn capture_target(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         width: u32,
         height: u32,
-    ) -> Result<(glow::Framebuffer, glow::Texture), GpuError> {
+    ) -> Result<(TargetId, TextureId), GpuError> {
         let (format, serial) = (self.target_format, self.frame_serial);
         if let Some(slot) = self.capture_targets.iter_mut().find(|slot| {
             slot.target.width == width
@@ -1791,7 +1386,7 @@ impl GpuRenderer {
         }
         let target = if self.capture_targets.len() < CAPTURE_TARGETS {
             self.capture_targets.push(CaptureTarget {
-                target: crate::effect_pass::new_target(gl)?,
+                target: Target::EMPTY,
                 last_used: serial,
             });
             let slot = self.capture_targets.last_mut().expect("just pushed");
@@ -1805,87 +1400,80 @@ impl GpuRenderer {
             slot.last_used = serial;
             &mut slot.target
         };
-        crate::effect_pass::resize_target(gl, target, width, height, format);
+        crate::target::resize_target(target, device, width, height, format)?;
         Ok((target.fbo, target.tex))
     }
 
     fn lens_capture(
         &mut self,
-        gl: &glow::Context,
-        src: glow::Texture,
+        device: &mut dyn Device,
+        src: TextureId,
         viewport: (u32, u32),
-        device: ui_core::geom::Rect,
+        node: ui_core::geom::Rect,
         size: f32,
         scale: f32,
-    ) -> Result<(glow::Texture, ui_core::geom::Rect), GpuError> {
+    ) -> Result<(TextureId, ui_core::geom::Rect), GpuError> {
         let size = size.clamp(0.1, 4.0);
         let scale = scale.clamp(0.02, 4.0);
         let region = ui_core::geom::Rect::new(
-            device.origin.x + device.size.w * (1.0 - size) * 0.5,
-            device.origin.y + device.size.h * (1.0 - size) * 0.5,
-            device.size.w * size,
-            device.size.h * size,
+            node.origin.x + node.size.w * (1.0 - size) * 0.5,
+            node.origin.y + node.size.h * (1.0 - size) * 0.5,
+            node.size.w * size,
+            node.size.h * size,
         );
         let w = (region.size.w * scale).round().max(1.0) as u32;
         let h = (region.size.h * scale).round().max(1.0) as u32;
-        let (fbo, tex) = timed!("gpu_lens_alloc", self.capture_target(gl, w, h))?;
+        let (fbo, tex) = timed!("gpu_lens_alloc", self.capture_target(device, w, h))?;
         let p = &self.capture;
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.viewport(0, 0, w as i32, h as i32);
-            gl.disable(glow::BLEND);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.use_program(Some(p.program));
-            if let Some(u) = &p.uniforms.viewport {
-                gl.uniform_2_f32(Some(u), w as f32, h as f32);
-            }
-            if let Some(u) = &p.uniforms.src {
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(src));
-                gl.uniform_1_i32(Some(u), 0);
-            }
-            if let Some(u) = &p.uniforms.region {
-                gl.uniform_4_f32(
-                    Some(u),
+
+        device.bind_target(Some(fbo));
+        device.set_viewport(w, h);
+        device.set_blend(false);
+        device.set_scissor(None);
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [w as f32, h as f32]);
+        }
+        if let Some(u) = p.uniforms.src {
+            device.bind_texture(0, Some(src));
+            device.set_uniform_i32(u, 0);
+        }
+        if let Some(u) = p.uniforms.region {
+            device.set_uniform_vec4(
+                u,
+                [
                     region.origin.x / viewport.0 as f32,
                     region.origin.y / viewport.1 as f32,
                     region.size.w / viewport.0 as f32,
                     region.size.h / viewport.1 as f32,
-                );
-            }
-            gl.bind_vertex_array(Some(p.vao));
-            let quad: [f32; 4] = [0.0, 0.0, w as f32, h as f32];
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&quad), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, 1);
-            // The rim compresses many capture texels into one pixel, so the capture carries a
-            // chain: the face still reads level 0, where the tap is already exact.
-            // The chain is built with the capture's framebuffer released: GL leaves the result
-            // undefined while the texture is still attached to the bound draw framebuffer.
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            timed!("gpu_lens_mip", {
-                gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_MIN_FILTER,
-                    glow::LINEAR_MIPMAP_LINEAR as i32,
-                );
-                gl.generate_mipmap(glow::TEXTURE_2D);
-            });
+                ],
+            );
         }
+        let quad: [f32; 4] = [0.0, 0.0, w as f32, h as f32];
+        device.draw_instanced(p.id, as_bytes(&quad), 1)?;
+        // The rim compresses many capture texels into one pixel, so the capture carries a
+        // chain: the face still reads level 0, where the tap is already exact.
+        // The chain is built with the capture's framebuffer released: GL leaves the result
+        // undefined while the texture is still attached to the bound draw framebuffer.
+        timed!(
+            "gpu_lens_mip",
+            device.set_sampling(tex, ui_core::draw::Sampling::Smooth, true)
+        );
+
         Ok((tex, region))
     }
 
     /// Write the filtered backdrop back over the node's rect, shaded as the style asks.
+    #[allow(clippy::too_many_arguments)]
     fn composite_backdrop(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         size: (u32, u32),
-        dst_fbo: glow::Framebuffer,
-        device: ui_core::geom::Rect,
+        dst_fbo: TargetId,
+        node: ui_core::geom::Rect,
         scissor: [i32; 4],
         entry: ui_core::draw::BackdropEntry,
-        filtered: glow::Texture,
+        filtered: TextureId,
     ) -> Result<(), GpuError> {
         let s = self.scale;
         // A node may name its own material; the renderer-wide one is the default for nodes
@@ -1898,7 +1486,14 @@ impl GpuRenderer {
         let lens = match material {
             Some(BackdropMaterial::LiquidGlass(k)) => Some(timed!(
                 "gpu_lens",
-                self.lens_capture(gl, filtered, size, device, k.capture_size, k.capture_scale,)
+                self.lens_capture(
+                    device,
+                    filtered,
+                    size,
+                    node,
+                    k.capture_size,
+                    k.capture_scale,
+                )
             )?),
             _ => None,
         };
@@ -1909,157 +1504,141 @@ impl GpuRenderer {
             (Shade::Liquid, Encode::Srgb) => &self.glass_kit,
             (Shade::Liquid, Encode::Linear) => &self.glass_kit_linear,
         };
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(dst_fbo));
-            gl.viewport(0, 0, size.0 as i32, size.1 as i32);
-            gl.enable(glow::SCISSOR_TEST);
-            gl.scissor(scissor[0], scissor[1], scissor[2], scissor[3]);
-            // Premultiplied blend against the frame: corner coverage is below 1 there, and
-            // overwriting would replace opaque pixels with partially transparent ones.
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-            gl.use_program(Some(p.program));
-            if let Some(u) = p.uniforms.viewport {
-                gl.uniform_2_f32(Some(&u), size.0 as f32, size.1 as f32);
-            }
-            if let Some(u) = p.uniforms.opacity {
-                gl.uniform_1_f32(Some(&u), 1.0);
-            }
-            if let Some(u) = &p.uniforms.layer_rect {
-                gl.uniform_4_f32(
-                    Some(u),
-                    device.origin.x,
-                    device.origin.y,
-                    device.size.w,
-                    device.size.h,
-                );
-            }
-            if let Some(u) = &p.uniforms.layer_radius {
-                gl.uniform_4_f32(
-                    Some(u),
+
+        device.bind_target(Some(dst_fbo));
+        device.set_viewport(size.0, size.1);
+        device.set_scissor(Some([scissor[0], scissor[1], scissor[2], scissor[3]]));
+        // Premultiplied blend against the frame: corner coverage is below 1 there, and
+        // overwriting would replace opaque pixels with partially transparent ones.
+        device.set_blend(true);
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [size.0 as f32, size.1 as f32]);
+        }
+        if let Some(u) = p.uniforms.opacity {
+            device.set_uniform_f32(u, 1.0);
+        }
+        if let Some(u) = p.uniforms.layer_rect {
+            device.set_uniform_vec4(u, [node.origin.x, node.origin.y, node.size.w, node.size.h]);
+        }
+        if let Some(u) = p.uniforms.layer_radius {
+            device.set_uniform_vec4(
+                u,
+                [
                     entry.corners.tl * s,
                     entry.corners.tr * s,
                     entry.corners.br * s,
                     entry.corners.bl * s,
-                );
-            }
-            if let Some(u) = &p.uniforms.layer_exp {
-                gl.uniform_1_f32(Some(u), entry.corners.shape.exponent());
-            }
-            if let Some(u) = &p.uniforms.layer_skip_empty {
-                gl.uniform_1_f32(Some(u), 0.0);
-            }
-            if let Some(u) = p.uniforms.layer_tex {
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(filtered));
-                gl.uniform_1_i32(Some(&u), 0);
-            }
-            if let Some(u) = p.uniforms.src {
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(filtered));
-                gl.uniform_1_i32(Some(&u), 0);
-            }
-            match material {
-                None | Some(BackdropMaterial::Plain) => {}
-                Some(BackdropMaterial::Acrylic(a)) => {
-                    if let Some(u) = p.uniforms.tint {
-                        gl.uniform_4_f32(Some(&u), a.tint.r, a.tint.g, a.tint.b, a.tint.a);
-                    }
-                    if let Some(u) = p.uniforms.luminosity {
-                        gl.uniform_4_f32(
-                            Some(&u),
+                ],
+            );
+        }
+        if let Some(u) = p.uniforms.layer_exp {
+            device.set_uniform_f32(u, entry.corners.shape.exponent());
+        }
+        if let Some(u) = p.uniforms.layer_skip_empty {
+            device.set_uniform_f32(u, 0.0);
+        }
+        if let Some(u) = p.uniforms.layer_tex {
+            device.bind_texture(0, Some(filtered));
+            device.set_uniform_i32(u, 0);
+        }
+        if let Some(u) = p.uniforms.src {
+            device.bind_texture(0, Some(filtered));
+            device.set_uniform_i32(u, 0);
+        }
+        match material {
+            None | Some(BackdropMaterial::Plain) => {}
+            Some(BackdropMaterial::Acrylic(a)) => {
+                if let Some(u) = p.uniforms.tint {
+                    device.set_uniform_vec4(u, [a.tint.r, a.tint.g, a.tint.b, a.tint.a]);
+                }
+                if let Some(u) = p.uniforms.luminosity {
+                    device.set_uniform_vec4(
+                        u,
+                        [
                             a.luminosity.r,
                             a.luminosity.g,
                             a.luminosity.b,
                             a.luminosity.a,
-                        );
-                    }
-                    if let Some(u) = p.uniforms.noise {
-                        gl.uniform_1_f32(Some(&u), a.noise);
-                    }
+                        ],
+                    );
                 }
-                Some(BackdropMaterial::LiquidGlass(k)) => {
-                    if let Some(u) = p.uniforms.body {
-                        gl.uniform_4_f32(
-                            Some(&u),
-                            k.body.mix,
-                            k.body.pole,
-                            k.body.chroma,
-                            k.body.tone,
-                        );
-                    }
-                    if let Some(u) = p.uniforms.glass {
-                        gl.uniform_4_f32(Some(&u), k.tint.r, k.tint.g, k.tint.b, k.tint.a);
-                    }
-                    // The glass measures its thickness in dp, as the reference does.
-                    if let Some(u) = p.uniforms.optical {
-                        gl.uniform_4_f32(
-                            Some(&u),
+                if let Some(u) = p.uniforms.noise {
+                    device.set_uniform_f32(u, a.noise);
+                }
+            }
+            Some(BackdropMaterial::LiquidGlass(k)) => {
+                if let Some(u) = p.uniforms.body {
+                    device
+                        .set_uniform_vec4(u, [k.body.mix, k.body.pole, k.body.chroma, k.body.tone]);
+                }
+                if let Some(u) = p.uniforms.glass {
+                    device.set_uniform_vec4(u, [k.tint.r, k.tint.g, k.tint.b, k.tint.a]);
+                }
+                // The glass measures its thickness in dp, as the reference does.
+                if let Some(u) = p.uniforms.optical {
+                    device.set_uniform_vec4(
+                        u,
+                        [
                             k.refractive_index,
                             k.dispersion,
                             k.thickness,
                             k.magnification,
-                        );
-                    }
-                    if let Some(u) = p.uniforms.light {
-                        gl.uniform_4_f32(
-                            Some(&u),
+                        ],
+                    );
+                }
+                if let Some(u) = p.uniforms.light {
+                    device.set_uniform_vec4(
+                        u,
+                        [
                             k.glare_intensity,
                             k.glare_distance,
                             k.glare_sharpness,
                             k.glare_offset,
-                        );
-                    }
-                    if let Some(u) = p.uniforms.kit {
-                        gl.uniform_4_f32(
-                            Some(&u),
+                        ],
+                    );
+                }
+                if let Some(u) = p.uniforms.kit {
+                    device.set_uniform_vec4(
+                        u,
+                        [
                             k.fresnel_intensity,
                             k.fresnel_distance,
                             k.fresnel_sharpness,
                             k.glare_convergence,
-                        );
-                    }
-                    if let Some(u) = p.uniforms.blend {
-                        gl.uniform_4_f32(
-                            Some(&u),
-                            k.blend_count as f32,
-                            k.blend_k * s,
-                            k.glare_bias,
-                            s,
-                        );
-                    }
-                    if let Some((tex, rect)) = lens {
-                        if let Some(u) = p.uniforms.src {
-                            gl.active_texture(glow::TEXTURE0);
-                            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                            gl.uniform_1_i32(Some(&u), 0);
-                        }
-                        if let Some(u) = p.uniforms.capture {
-                            gl.uniform_4_f32(
-                                Some(&u),
-                                rect.origin.x,
-                                rect.origin.y,
-                                rect.size.w,
-                                rect.size.h,
-                            );
-                        }
-                    }
-                    upload_shapes(gl, p, &k.blend, k.blend_count, device, s);
+                        ],
+                    );
                 }
+                if let Some(u) = p.uniforms.blend {
+                    device.set_uniform_vec4(
+                        u,
+                        [k.blend_count as f32, k.blend_k * s, k.glare_bias, s],
+                    );
+                }
+                if let Some((tex, rect)) = lens {
+                    if let Some(u) = p.uniforms.src {
+                        device.bind_texture(0, Some(tex));
+                        device.set_uniform_i32(u, 0);
+                    }
+                    if let Some(u) = p.uniforms.capture {
+                        device.set_uniform_vec4(
+                            u,
+                            [rect.origin.x, rect.origin.y, rect.size.w, rect.size.h],
+                        );
+                    }
+                }
+                upload_shapes(device, p, &k.blend, k.blend_count, node, s);
             }
-            // `a_rect.y` is the top in device space, and the quad runs down from there, so
-            // the instance must cover the whole frame; coverage() then cuts the node's shape.
-            let data = [0.0f32, 0.0, size.0 as f32, size.1 as f32];
-            gl.bind_vertex_array(Some(p.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&data), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(
-                glow::TRIANGLES,
-                0,
-                crate::shader::UNIT_QUAD.len() as i32 / 2,
-                1,
-            );
         }
+        // `a_rect.y` is the top in device space, and the quad runs down from there, so
+        // the instance must cover the whole frame; coverage() then cuts the node's shape.
+        let data = [0.0f32, 0.0, size.0 as f32, size.1 as f32];
+        device.draw_instanced(
+            p.id,
+            as_bytes(&data),
+            (crate::layout::UNIT_QUAD.len() / 2) as u32,
+        )?;
+
         self.stats.draw_calls += 1;
         if material.is_some() {
             self.stats.material_passes += 1;
@@ -2070,7 +1649,7 @@ impl GpuRenderer {
     /// Pop and push layers so the active chain equals `want`.
     fn sync_layers(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         list: &DrawList,
         frame: &FrameTargets<'_>,
         chain: &mut Chain,
@@ -2095,7 +1674,7 @@ impl GpuRenderer {
                 None => frame_cleared_over(frame.band, self.layer_bounds.get(depth).copied()),
             };
             self.end_layer(
-                gl,
+                device,
                 depth,
                 effects,
                 frame.viewport,
@@ -2116,7 +1695,7 @@ impl GpuRenderer {
             let corners = entry.map_or(ui_core::geom::Corners::all(0.0), |l| l.radius);
             let s = self.scale;
             // Record the layer's device-space bounds: effects and compositing stop there.
-            let device = ui_core::geom::Rect::new(
+            let node = ui_core::geom::Rect::new(
                 bounds.origin.x * s,
                 bounds.origin.y * s,
                 bounds.size.w * s,
@@ -2126,7 +1705,7 @@ impl GpuRenderer {
                 self.layer_bounds
                     .resize(depth + 1, ui_core::geom::Rect::new(0.0, 0.0, 0.0, 0.0));
             }
-            self.layer_bounds[depth] = device;
+            self.layer_bounds[depth] = node;
             if self.layer_radius.len() <= depth {
                 self.layer_radius
                     .resize(depth + 1, ui_core::geom::Corners::all(0.0));
@@ -2139,22 +1718,24 @@ impl GpuRenderer {
                 ..corners
             }
             // A layer is clipped to its own bounds, so the same half-side limit applies.
-            .clamp_to(device.size);
+            .clamp_to(node.size);
 
             // A layer beneath a skipped one is skipped too: its parent holds no pixels this
             // frame, so redrawing it would only land in a target nobody composites.
             let parent_clean = chain.clean.last().copied().unwrap_or(false);
             // Asked unconditionally: the lookup also marks the target as used this frame, and
             // a skipped one would otherwise be freed while its canvas is still in the tree.
-            let own_clean =
-                cache.is_some_and(|key| self.cached_is_clean(gl, key, frame.damage, device, w, h));
+            let own_clean = match cache {
+                Some(key) => self.cached_is_clean(device, key, frame.damage, node, w, h)?,
+                None => false,
+            };
             // A layer the band stays clear of has no pixel changed, so neither drawing it nor
             // compositing it could alter what the frame shows: keep its pixels as they are.
             let band_clear = chain.band_clear.last().copied().unwrap_or(false)
-                || (cache.is_none() && band_clear_of(frame.band, device));
+                || (cache.is_none() && band_clear_of(frame.band, node));
             let clean = parent_clean || own_clean || band_clear;
             if !clean {
-                self.begin_layer(gl, depth, w, h)?;
+                self.begin_layer(device, depth, w, h)?;
             }
             chain.clean.push(clean);
             chain.band_clear.push(band_clear);
@@ -2167,17 +1748,15 @@ impl GpuRenderer {
     /// it exists, was finished, and no damage landed inside it.
     fn cached_is_clean(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         key: u64,
         damage: &ui_core::damage::Damage,
         bounds: ui_core::geom::Rect,
         width: u32,
         height: u32,
-    ) -> bool {
+    ) -> Result<bool, GpuError> {
         if !self.cached_targets.contains_key(&key) {
-            let Ok(target) = crate::effect_pass::new_target(gl) else {
-                return false;
-            };
+            let target = Target::EMPTY;
             self.cached_targets.insert(
                 key,
                 CachedTarget {
@@ -2188,144 +1767,128 @@ impl GpuRenderer {
             );
         }
         let Some(slot) = self.cached_targets.get_mut(&key) else {
-            return false;
+            return Ok(false);
         };
         slot.last_used = self.frame_serial;
         if slot.target.width != width
             || slot.target.height != height
             || slot.target.format != self.target_format
         {
-            crate::effect_pass::resize_target(
-                gl,
+            crate::target::resize_target(
                 &mut slot.target,
+                device,
                 width,
                 height,
                 self.target_format,
-            );
+            )?;
             slot.valid = false;
         }
         if !slot.valid {
-            return false;
+            return Ok(false);
         }
-        !damage_reaches(damage, bounds, self.scale)
+        Ok(!damage_reaches(damage, bounds, self.scale))
     }
 
     fn draw_rects(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         viewport: (f32, f32),
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
         let p = &self.rects;
-        unsafe {
-            gl.use_program(Some(p.program));
-            if let Some(u) = p.uniforms.viewport {
-                gl.uniform_2_f32(Some(&u), viewport.0, viewport.1);
-            }
-            set_clip_uniforms(gl, p, clip, self.scale);
-            gl.bind_vertex_array(Some(p.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(data), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(
-                glow::TRIANGLES,
-                0,
-                shader::UNIT_QUAD.len() as i32 / 2,
-                (data.len() / shader::RECT_STRIDE as usize) as i32,
-            );
+
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
-        self.stats.rects += (data.len() / shader::RECT_STRIDE as usize) as u32;
+        set_clip_uniforms(device, p, clip, self.scale);
+        device.draw_instanced(
+            p.id,
+            as_bytes(data),
+            (data.len() / layout::RECT_STRIDE as usize) as u32,
+        )?;
+
+        self.stats.rects += (data.len() / layout::RECT_STRIDE as usize) as u32;
         self.stats.draw_calls += 1;
         Ok(())
     }
 
     fn draw_sectors(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         viewport: (f32, f32),
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
         let p = &self.sectors;
-        unsafe {
-            gl.use_program(Some(p.program));
-            if let Some(u) = p.uniforms.viewport {
-                gl.uniform_2_f32(Some(&u), viewport.0, viewport.1);
-            }
-            set_clip_uniforms(gl, p, clip, self.scale);
-            gl.bind_vertex_array(Some(p.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(data), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(
-                glow::TRIANGLES,
-                0,
-                shader::UNIT_QUAD.len() as i32 / 2,
-                (data.len() / shader::SECTOR_STRIDE as usize) as i32,
-            );
+
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
+        set_clip_uniforms(device, p, clip, self.scale);
+        device.draw_instanced(
+            p.id,
+            as_bytes(data),
+            (data.len() / layout::SECTOR_STRIDE as usize) as u32,
+        )?;
+
         self.stats.draw_calls += 1;
         Ok(())
     }
 
     fn draw_ellipses(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         viewport: (f32, f32),
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
         let p = &self.ellipses;
-        unsafe {
-            gl.use_program(Some(p.program));
-            if let Some(u) = p.uniforms.viewport {
-                gl.uniform_2_f32(Some(&u), viewport.0, viewport.1);
-            }
-            set_clip_uniforms(gl, p, clip, self.scale);
-            gl.bind_vertex_array(Some(p.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(data), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(
-                glow::TRIANGLES,
-                0,
-                shader::UNIT_QUAD.len() as i32 / 2,
-                (data.len() / shader::ELLIPSE_STRIDE as usize) as i32,
-            );
+
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
+        set_clip_uniforms(device, p, clip, self.scale);
+        device.draw_instanced(
+            p.id,
+            as_bytes(data),
+            (data.len() / layout::ELLIPSE_STRIDE as usize) as u32,
+        )?;
+
         self.stats.draw_calls += 1;
         Ok(())
     }
 
     fn draw_lines(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         viewport: (f32, f32),
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
         let p = &self.lines;
-        unsafe {
-            gl.use_program(Some(p.program));
-            if let Some(u) = p.uniforms.viewport {
-                gl.uniform_2_f32(Some(&u), viewport.0, viewport.1);
-            }
-            set_clip_uniforms(gl, p, clip, self.scale);
-            gl.bind_vertex_array(Some(p.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(data), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(
-                glow::TRIANGLES,
-                0,
-                shader::UNIT_QUAD.len() as i32 / 2,
-                (data.len() / shader::LINE_STRIDE as usize) as i32,
-            );
+
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
+        set_clip_uniforms(device, p, clip, self.scale);
+        device.draw_instanced(
+            p.id,
+            as_bytes(data),
+            (data.len() / layout::LINE_STRIDE as usize) as u32,
+        )?;
+
         self.stats.draw_calls += 1;
         Ok(())
     }
 
     fn draw_glyphs(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         viewport: (f32, f32),
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
@@ -2334,46 +1897,39 @@ impl GpuRenderer {
             return Ok(());
         };
         let p = &self.glyphs;
-        unsafe {
-            gl.use_program(Some(p.program));
-            if let Some(u) = p.uniforms.viewport {
-                gl.uniform_2_f32(Some(&u), viewport.0, viewport.1);
-            }
-            if let Some(u) = p.uniforms.atlas_size {
-                gl.uniform_2_f32(Some(&u), self.atlas_size.0 as f32, self.atlas_size.1 as f32);
-            }
-            if let Some(u) = p.uniforms.color_atlas_size {
-                gl.uniform_2_f32(
-                    Some(&u),
+
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [viewport.0, viewport.1]);
+        }
+        if let Some(u) = p.uniforms.atlas_size {
+            device.set_uniform_vec2(u, [self.atlas_size.0 as f32, self.atlas_size.1 as f32]);
+        }
+        if let Some(u) = p.uniforms.color_atlas_size {
+            device.set_uniform_vec2(
+                u,
+                [
                     self.color_atlas_size.0 as f32,
                     self.color_atlas_size.1 as f32,
-                );
-            }
-            if let Some(u) = p.uniforms.atlas {
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
-                gl.uniform_1_i32(Some(&u), 0);
-            }
-            if let Some(u) = p.uniforms.color_atlas {
-                gl.active_texture(glow::TEXTURE1);
-                gl.bind_texture(
-                    glow::TEXTURE_2D,
-                    Some(self.color_atlas_tex.unwrap_or(atlas_tex)),
-                );
-                gl.uniform_1_i32(Some(&u), 1);
-            }
-            set_clip_uniforms(gl, p, clip, self.scale);
-            gl.bind_vertex_array(Some(p.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(data), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(
-                glow::TRIANGLES,
-                0,
-                shader::UNIT_QUAD.len() as i32 / 2,
-                (data.len() / shader::GLYPH_STRIDE as usize) as i32,
+                ],
             );
         }
-        self.stats.glyphs += (data.len() / shader::GLYPH_STRIDE as usize) as u32;
+        if let Some(u) = p.uniforms.atlas {
+            device.bind_texture(0, Some(atlas_tex));
+            device.set_uniform_i32(u, 0);
+        }
+        if let Some(u) = p.uniforms.color_atlas {
+            device.bind_texture(1, Some(self.color_atlas_tex.unwrap_or(atlas_tex)));
+            device.set_uniform_i32(u, 1);
+        }
+        set_clip_uniforms(device, p, clip, self.scale);
+        device.draw_instanced(
+            p.id,
+            as_bytes(data),
+            (data.len() / layout::GLYPH_STRIDE as usize) as u32,
+        )?;
+
+        self.stats.glyphs += (data.len() / layout::GLYPH_STRIDE as usize) as u32;
         self.stats.draw_calls += 1;
         Ok(())
     }
@@ -2383,7 +1939,7 @@ impl GpuRenderer {
     /// The frame and a canvas draw the same kinds; only the target, viewport and band differ.
     fn draw_batch(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         list: &DrawList,
         batch: &ui_core::draw::Batch,
         pass: Pass,
@@ -2401,8 +1957,14 @@ impl GpuRenderer {
                     }
                 }
                 if !data.is_empty() {
-                    set_scissor(gl, batch.clip.map(|c| c.rect), self.scale, viewport, band);
-                    self.draw_shadows(gl, viewport, &data, batch.clip)?;
+                    set_scissor(
+                        device,
+                        batch.clip.map(|c| c.rect),
+                        self.scale,
+                        viewport,
+                        band,
+                    );
+                    self.draw_shadows(device, viewport, &data, batch.clip)?;
                 }
             }
             PrimKind::Image => {
@@ -2439,8 +2001,21 @@ impl GpuRenderer {
                         }
                     }
                     if !data.is_empty() {
-                        set_scissor(gl, batch.clip.map(|c| c.rect), self.scale, viewport, band);
-                        self.draw_images(gl, viewport, &data, img.tex, img.sampling, batch.clip)?;
+                        set_scissor(
+                            device,
+                            batch.clip.map(|c| c.rect),
+                            self.scale,
+                            viewport,
+                            band,
+                        );
+                        self.draw_images(
+                            device,
+                            viewport,
+                            &data,
+                            img.tex,
+                            img.sampling,
+                            batch.clip,
+                        )?;
                     }
                     start = end;
                 }
@@ -2452,8 +2027,14 @@ impl GpuRenderer {
                     }
                 }
                 if !rect_data.is_empty() {
-                    set_scissor(gl, batch.clip.map(|c| c.rect), self.scale, viewport, band);
-                    self.draw_rects(gl, viewport, rect_data, batch.clip)?;
+                    set_scissor(
+                        device,
+                        batch.clip.map(|c| c.rect),
+                        self.scale,
+                        viewport,
+                        band,
+                    );
+                    self.draw_rects(device, viewport, rect_data, batch.clip)?;
                     rect_data.clear();
                 }
             }
@@ -2465,8 +2046,14 @@ impl GpuRenderer {
                     }
                 }
                 if !data.is_empty() {
-                    set_scissor(gl, batch.clip.map(|c| c.rect), self.scale, viewport, band);
-                    self.draw_sectors(gl, viewport, &data, batch.clip)?;
+                    set_scissor(
+                        device,
+                        batch.clip.map(|c| c.rect),
+                        self.scale,
+                        viewport,
+                        band,
+                    );
+                    self.draw_sectors(device, viewport, &data, batch.clip)?;
                 }
             }
             PrimKind::Ellipse => {
@@ -2477,8 +2064,14 @@ impl GpuRenderer {
                     }
                 }
                 if !data.is_empty() {
-                    set_scissor(gl, batch.clip.map(|c| c.rect), self.scale, viewport, band);
-                    self.draw_ellipses(gl, viewport, &data, batch.clip)?;
+                    set_scissor(
+                        device,
+                        batch.clip.map(|c| c.rect),
+                        self.scale,
+                        viewport,
+                        band,
+                    );
+                    self.draw_ellipses(device, viewport, &data, batch.clip)?;
                 }
             }
             PrimKind::Line => {
@@ -2489,8 +2082,14 @@ impl GpuRenderer {
                     }
                 }
                 if !data.is_empty() {
-                    set_scissor(gl, batch.clip.map(|c| c.rect), self.scale, viewport, band);
-                    self.draw_lines(gl, viewport, &data, batch.clip)?;
+                    set_scissor(
+                        device,
+                        batch.clip.map(|c| c.rect),
+                        self.scale,
+                        viewport,
+                        band,
+                    );
+                    self.draw_lines(device, viewport, &data, batch.clip)?;
                 }
             }
             PrimKind::Glyph => {
@@ -2506,8 +2105,14 @@ impl GpuRenderer {
                     }
                 }
                 if !glyph_data.is_empty() {
-                    set_scissor(gl, batch.clip.map(|c| c.rect), self.scale, viewport, band);
-                    self.draw_glyphs(gl, viewport, glyph_data, batch.clip)?;
+                    set_scissor(
+                        device,
+                        batch.clip.map(|c| c.rect),
+                        self.scale,
+                        viewport,
+                        band,
+                    );
+                    self.draw_glyphs(device, viewport, glyph_data, batch.clip)?;
                     glyph_data.clear();
                 }
             }
@@ -2523,7 +2128,7 @@ impl GpuRenderer {
     /// its pixels, and the frame that samples it is what applies zoom.
     fn paint_canvases(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         canvases: &[CanvasUpload<'_>],
     ) -> Result<(), GpuError> {
         self.canvas_images.clear();
@@ -2531,7 +2136,7 @@ impl GpuRenderer {
         let saved_root = self.root_fbo;
         let saved_bounds = std::mem::take(&mut self.layer_bounds);
         let saved_radius = std::mem::take(&mut self.layer_radius);
-        let result = self.paint_canvases_inner(gl, canvases);
+        let result = self.paint_canvases_inner(device, canvases);
         self.scale = saved_scale;
         self.root_fbo = saved_root;
         self.layer_bounds = saved_bounds;
@@ -2544,7 +2149,7 @@ impl GpuRenderer {
 
     fn paint_canvases_inner(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         canvases: &[CanvasUpload<'_>],
     ) -> Result<(), GpuError> {
         for canvas in canvases {
@@ -2557,26 +2162,25 @@ impl GpuRenderer {
                         last_used: 0,
                     });
                     target.last_used = self.frame_serial;
-                    let (fbo, tex) = crate::effect_pass::ensure_target(
+                    let canvas_target = crate::target::ensure_target(
                         &mut target.target,
-                        gl,
+                        device,
                         size.0,
                         size.1,
                         self.target_format,
                     )?;
-                    unsafe {
-                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-                        gl.viewport(0, 0, size.0 as i32, size.1 as i32);
-                        gl.disable(glow::SCISSOR_TEST);
-                        gl.clear_color(0.0, 0.0, 0.0, 0.0);
-                        gl.clear(glow::COLOR_BUFFER_BIT);
-                        gl.enable(glow::BLEND);
-                        gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-                        gl.disable(glow::DEPTH_TEST);
-                    }
+                    let (fbo, tex) = (canvas_target.fbo, canvas_target.tex);
+
+                    device.bind_target(Some(fbo));
+                    device.set_viewport(size.0, size.1);
+                    device.set_scissor(None);
+                    device.set_clear_color([0.0, 0.0, 0.0, 0.0]);
+                    device.clear();
+                    device.set_blend(true);
+
                     self.scale = 1.0;
                     self.root_fbo = Some(fbo);
-                    self.paint_list(gl, list, (size.0 as f32, size.1 as f32))?;
+                    self.paint_list(device, list, (size.0 as f32, size.1 as f32))?;
                     self.canvas_targets.insert(canvas.id, target);
                     FrameImage {
                         tex,
@@ -2619,7 +2223,7 @@ impl GpuRenderer {
     /// Draw a canvas list into the target bound as the root.
     fn paint_list(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         list: &DrawList,
         viewport: (f32, f32),
     ) -> Result<(), GpuError> {
@@ -2628,7 +2232,7 @@ impl GpuRenderer {
                 "a canvas list holds a layer effect, which has no canvas pass",
             )));
         }
-        self.sync_images(gl, list)?;
+        self.sync_images(device, list)?;
         let mut rect_data: Vec<f32> = Vec::new();
         let mut glyph_data: Vec<f32> = Vec::new();
         for batch in list.plan_batches() {
@@ -2641,13 +2245,13 @@ impl GpuRenderer {
                 viewport,
                 band: None,
             };
-            self.draw_batch(gl, list, &batch, pass, &mut rect_data, &mut glyph_data)?;
+            self.draw_batch(device, list, &batch, pass, &mut rect_data, &mut glyph_data)?;
         }
         Ok(())
     }
 
     /// Upload the frame's textures, reusing one GL texture per picture and sampling.
-    fn sync_images(&mut self, gl: &glow::Context, list: &DrawList) -> Result<(), GpuError> {
+    fn sync_images(&mut self, device: &mut dyn Device, list: &DrawList) -> Result<(), GpuError> {
         self.frame_images.clear();
         for entry in &list.images {
             // A canvas is already a texture: the canvas pass rendered it, and its sampling
@@ -2685,9 +2289,15 @@ impl GpuRenderer {
                 other => {
                     let tex = match other {
                         Some(tex) => tex,
-                        None => unsafe { gl.create_texture()? },
+                        None => {
+                            let format = match Encode::of(self.destination) {
+                                Encode::Srgb => TextureFormat::Rgba8,
+                                Encode::Linear => TextureFormat::Rgba16F,
+                            };
+                            device.create_texture(entry.width, entry.height, format)?
+                        }
                     };
-                    upload_image(gl, tex, entry, self.destination)?;
+                    upload_image(device, tex, entry, self.destination)?;
                     // A canvas entry above never reaches this branch, so the picture here
                     // always has pixels.
                     let data = entry.pixels().cloned().unwrap_or_default();
@@ -2720,12 +2330,12 @@ impl GpuRenderer {
     ///
     /// The union spans the main list and every canvas list, so a picture only a canvas
     /// samples survives the frame that never names it.
-    fn evict_images(&mut self, gl: &glow::Context) {
+    fn evict_images(&mut self, device: &mut dyn Device) {
         let live = std::mem::take(&mut self.frame_keys);
         self.image_textures.retain(|key, texture| {
             let keep = live.contains(key);
             if !keep {
-                unsafe { gl.delete_texture(texture.tex) };
+                device.destroy_texture(texture.tex);
             }
             keep
         });
@@ -2733,81 +2343,66 @@ impl GpuRenderer {
 
     fn draw_images(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         viewport: (f32, f32),
         data: &[f32],
-        texture: glow::Texture,
+        texture: TextureId,
         sampling: Option<ui_core::draw::Sampling>,
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
         let p = &self.images;
-        unsafe {
-            gl.use_program(Some(p.program));
-            if let Some(sampling) = sampling {
-                let filter = match sampling {
-                    ui_core::draw::Sampling::Smooth => glow::LINEAR,
-                    ui_core::draw::Sampling::Pixelated => glow::NEAREST,
-                };
-                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
-            }
-            if let Some(u) = p.uniforms.viewport {
-                gl.uniform_2_f32(Some(&u), viewport.0, viewport.1);
-            }
-            if let Some(u) = p.uniforms.image {
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                gl.uniform_1_i32(Some(&u), 0);
-            }
-            set_clip_uniforms(gl, p, clip, self.scale);
-            gl.bind_vertex_array(Some(p.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(data), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(
-                glow::TRIANGLES,
-                0,
-                shader::UNIT_QUAD.len() as i32 / 2,
-                (data.len() / shader::IMAGE_STRIDE as usize) as i32,
-            );
+
+        device.use_program(p.id);
+        if let Some(sampling) = sampling {
+            device.set_sampling(texture, sampling, false);
         }
-        self.stats.images_drawn += (data.len() / shader::IMAGE_STRIDE as usize) as u32;
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [viewport.0, viewport.1]);
+        }
+        if let Some(u) = p.uniforms.image {
+            device.bind_texture(0, Some(texture));
+            device.set_uniform_i32(u, 0);
+        }
+        set_clip_uniforms(device, p, clip, self.scale);
+        device.draw_instanced(
+            p.id,
+            as_bytes(data),
+            (data.len() / layout::IMAGE_STRIDE as usize) as u32,
+        )?;
+
+        self.stats.images_drawn += (data.len() / layout::IMAGE_STRIDE as usize) as u32;
         self.stats.draw_calls += 1;
         Ok(())
     }
 
     fn draw_shadows(
         &mut self,
-        gl: &glow::Context,
+        device: &mut dyn Device,
         viewport: (f32, f32),
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
         let p = &self.shadows;
-        unsafe {
-            gl.use_program(Some(p.program));
-            if let Some(u) = p.uniforms.viewport {
-                gl.uniform_2_f32(Some(&u), viewport.0, viewport.1);
-            }
-            set_clip_uniforms(gl, p, clip, self.scale);
-            gl.bind_vertex_array(Some(p.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(data), glow::DYNAMIC_DRAW);
-            gl.draw_arrays_instanced(
-                glow::TRIANGLES,
-                0,
-                shader::UNIT_QUAD.len() as i32 / 2,
-                (data.len() / shader::SHADOW_STRIDE as usize) as i32,
-            );
+
+        device.use_program(p.id);
+        if let Some(u) = p.uniforms.viewport {
+            device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
-        self.stats.shadows_drawn += (data.len() / shader::SHADOW_STRIDE as usize) as u32;
+        set_clip_uniforms(device, p, clip, self.scale);
+        device.draw_instanced(
+            p.id,
+            as_bytes(data),
+            (data.len() / layout::SHADOW_STRIDE as usize) as u32,
+        )?;
+
+        self.stats.shadows_drawn += (data.len() / layout::SHADOW_STRIDE as usize) as u32;
         self.stats.draw_calls += 1;
         Ok(())
     }
 
     /// Wrap mode of a cached texture for `id`; `None` when it is not resident. The picture
     /// may be resident under either sampling, so the smooth one answers first.
-    pub fn image_wrap(&self, gl: &glow::Context, id: u64) -> Option<(i32, i32)> {
+    pub fn image_wrap(&self, device: &dyn Device, id: u64) -> Option<(Wrap, Wrap)> {
         let t = self
             .image_textures
             .get(&(id, ui_core::draw::Sampling::Smooth))
@@ -2815,41 +2410,22 @@ impl GpuRenderer {
                 self.image_textures
                     .get(&(id, ui_core::draw::Sampling::Pixelated))
             })?;
-        unsafe {
-            gl.bind_texture(glow::TEXTURE_2D, Some(t.tex));
-            let s = gl.get_tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S);
-            let v = gl.get_tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T);
-            gl.bind_texture(glow::TEXTURE_2D, None);
-            Some((s, v))
-        }
+        Some(device.texture_wrap(t.tex))
     }
 
     /// Read layer `depth` back, for diagnosing compositing.
-    pub fn read_layer(&self, gl: &glow::Context, depth: usize) -> Option<(u32, u32, Vec<u8>)> {
+    pub fn read_layer(&self, device: &mut dyn Device, depth: usize) -> Option<(u32, u32, Vec<u8>)> {
         let slot = self.layer_targets.get(depth)?;
         let (w, h) = (slot.width, slot.height);
-        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(slot.fbo));
-            gl.read_pixels(
-                0,
-                0,
-                w as i32,
-                h as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut buf)),
-            );
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
+        let buf = device.read_pixels(slot.fbo, w, h);
         Some((w, h, buf))
     }
 
     /// The persistent frame's raw pixels, for comparing one frame against the next.
-    pub fn frame_pixels(&self, gl: &glow::Context) -> Option<(u32, u32, Vec<u8>)> {
+    pub fn frame_pixels(&self, device: &mut dyn Device) -> Option<(u32, u32, Vec<u8>)> {
         let frame = self.frame.as_ref()?;
         let (w, h) = (frame.width, frame.height);
-        Some((w, h, read_framebuffer_rgba8(gl, frame.fbo, w, h)))
+        Some((w, h, device.read_pixels(frame.fbo, w, h)))
     }
 
     /// Pixels where the persistent frame and `target` disagree, with their bounding box.
@@ -2857,40 +2433,16 @@ impl GpuRenderer {
     /// A presented buffer promises the whole surface (`Damage::Full`), so it must match.
     pub fn diff_frame(
         &self,
-        gl: &glow::Context,
-        target: &dyn GpuSurface,
+        device: &mut dyn Device,
+        target: &dyn RenderTarget,
     ) -> Option<(u64, [u32; 4])> {
         let frame = self.frame.as_ref()?;
         let (w, h) = target.size();
         if (frame.width, frame.height) != (w, h) {
             return None;
         }
-        let bytes = (w as usize) * (h as usize) * 4;
-        let mut want = vec![0u8; bytes];
-        let mut got = vec![0u8; bytes];
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(frame.fbo));
-            gl.read_pixels(
-                0,
-                0,
-                w as i32,
-                h as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut want)),
-            );
-            target.bind(gl);
-            gl.read_pixels(
-                0,
-                0,
-                w as i32,
-                h as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut got)),
-            );
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
+        let want = device.read_pixels(frame.fbo, w, h);
+        let got = device.read_pixels(target.target_id(), w, h);
         let mut count = 0u64;
         let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
         for (i, (a, b)) in want
@@ -2916,8 +2468,8 @@ impl GpuRenderer {
     ///
     /// A dma-buf handed to another process needs the writes completed first;
     /// without this the compositor can sample the buffer before the GPU is done.
-    pub fn finish(&self, gl: &glow::Context) {
-        unsafe { gl.finish() };
+    pub fn finish(&self, device: &mut dyn Device) {
+        device.finish();
     }
 
     /// Convert straight-alpha RGBA8 into the premultiplied BGRA that `ui_paint::Pixels` holds.
@@ -2941,12 +2493,11 @@ impl GpuRenderer {
     /// [`GpuRenderer::capture`] instead.
     pub fn read_pixels(
         &self,
-        gl: &glow::Context,
-        target: &dyn GpuSurface,
+        device: &mut dyn Device,
+        target: &dyn RenderTarget,
     ) -> Result<Vec<u8>, GpuError> {
-        target.bind(gl);
         let (w, h) = target.size();
-        let mut buf = read_bound_rgba8(gl, w, h);
+        let mut buf = device.read_pixels(target.target_id(), w, h);
         un_premultiply(&mut buf);
         Ok(buf)
     }
@@ -2954,8 +2505,7 @@ impl GpuRenderer {
     /// The interface as an SDR picture: straight-alpha RGBA8, resolved from a supersampled
     /// render. Read before the present pass, so a capture does not depend on the display's
     /// transfer function or on the buffer being 8-bit.
-    pub fn capture(&mut self, gl: &glow::Context) -> Option<(u32, u32, Vec<u8>)> {
-        use crate::effect_pass::TargetFormat;
+    pub fn capture(&mut self, device: &mut dyn Device) -> Option<(u32, u32, Vec<u8>)> {
         let (fbo, tex, format, width, height) = {
             let frame = self.frame.as_ref()?;
             (
@@ -2971,169 +2521,30 @@ impl GpuRenderer {
         // An f16 frame cannot be read back as bytes on every driver, and the picture is
         // 8-bit either way: resolve into bytes first, averaging the samples per pixel.
         let fbo = if ss > 1 || format != TargetFormat::Rgba8 {
-            let (scratch_fbo, _) = crate::effect_pass::ensure_target(
+            let scratch = crate::target::ensure_target(
                 &mut self.resolve_scratch,
-                gl,
+                device,
                 w,
                 h,
                 TargetFormat::Rgba8,
             )
             .ok()?;
-            self.resolve_frame(gl, scratch_fbo, tex, (w, h), self.encode == Encode::Linear)
-                .ok()?;
+            let scratch_fbo = scratch.fbo;
+            self.resolve_frame(
+                device,
+                scratch_fbo,
+                tex,
+                (w, h),
+                self.encode == Encode::Linear,
+            )
+            .ok()?;
             scratch_fbo
         } else {
             fbo
         };
-        let mut buf = read_framebuffer_rgba8(gl, fbo, w, h);
+        let mut buf = device.read_pixels(fbo, w, h);
         un_premultiply(&mut buf);
         Some((w, h, buf))
-    }
-
-    /// Free GL objects. Must be called while `ctx` is current.
-    pub fn release(&self, gl: &glow::Context) {
-        unsafe {
-            for p in [
-                &self.rects,
-                &self.sectors,
-                &self.ellipses,
-                &self.lines,
-                &self.glyphs,
-                &self.images,
-                &self.shadows,
-            ] {
-                gl.delete_program(p.program);
-                gl.delete_vertex_array(p.vao);
-                gl.delete_buffer(p.unit_vbo);
-                gl.delete_buffer(p.instance_vbo);
-            }
-            for t in self.image_textures.values() {
-                gl.delete_texture(t.tex);
-            }
-            if let Some(t) = self.atlas_tex {
-                gl.delete_texture(t);
-            }
-            if let Some(t) = self.color_atlas_tex {
-                gl.delete_texture(t);
-            }
-        }
-    }
-}
-
-impl Program {
-    fn new(
-        gl: &glow::Context,
-        is_gles: bool,
-        vertex: &str,
-        fragment: &str,
-        stride: i32,
-        instance_attribs: &[(&str, i32)],
-        required_uniforms: &[&str],
-    ) -> Result<Self, GpuError> {
-        let program = compile_program(gl, vertex, fragment, is_gles)?;
-        unsafe {
-            let vao = gl.create_vertex_array()?;
-            gl.bind_vertex_array(Some(vao));
-
-            let unit_vbo = gl.create_buffer()?;
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(unit_vbo));
-            gl.buffer_data_u8_slice(
-                glow::ARRAY_BUFFER,
-                as_bytes(&shader::UNIT_QUAD),
-                glow::STATIC_DRAW,
-            );
-            let unit_loc = gl.get_attrib_location(program, "a_unit");
-            if let Some(loc) = unit_loc {
-                gl.enable_vertex_attrib_array(loc);
-                gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
-            }
-
-            let instance_vbo = gl.create_buffer()?;
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(instance_vbo));
-            gl.buffer_data_u8_slice(
-                glow::ARRAY_BUFFER,
-                as_bytes(&vec![0.0f32; stride as usize * 64]),
-                glow::DYNAMIC_DRAW,
-            );
-            let mut offset = 0i32;
-            for (name, size) in instance_attribs {
-                if let Some(loc) = gl.get_attrib_location(program, name) {
-                    gl.enable_vertex_attrib_array(loc);
-                    gl.vertex_attrib_pointer_f32(
-                        loc,
-                        *size,
-                        glow::FLOAT,
-                        false,
-                        stride * 4,
-                        offset * 4,
-                    );
-                    gl.vertex_attrib_divisor(loc, 1);
-                }
-                offset += size;
-            }
-
-            // A mistyped uniform name yields `None` and then silently does nothing,
-            // so a required uniform missing here is a startup error, not a warning.
-            for name in required_uniforms {
-                if gl.get_uniform_location(program, name).is_none() {
-                    return Err(GpuError::from(format!(
-                        "shader is missing required uniform `{name}`"
-                    )));
-                }
-            }
-
-            let uniforms = Uniforms {
-                viewport: gl.get_uniform_location(program, "u_viewport"),
-                atlas_size: gl.get_uniform_location(program, "u_atlas_size"),
-                atlas: gl.get_uniform_location(program, "u_atlas"),
-                color_atlas_size: gl.get_uniform_location(program, "u_color_atlas_size"),
-                color_atlas: gl.get_uniform_location(program, "u_color_atlas"),
-                image: gl.get_uniform_location(program, "u_image"),
-                opacity: gl.get_uniform_location(program, "u_opacity"),
-                layer_tex: gl.get_uniform_location(program, "u_layer"),
-                clip_rect: gl.get_uniform_location(program, "u_clip_rect"),
-                clip_radius: gl.get_uniform_location(program, "u_clip_radius"),
-                clip_shape: gl.get_uniform_location(program, "u_clip_shape"),
-                clip_on: gl.get_uniform_location(program, "u_clip_on"),
-                src: gl.get_uniform_location(program, "u_src"),
-                texel: gl.get_uniform_location(program, "u_texel"),
-                dir: gl.get_uniform_location(program, "u_dir"),
-                taps: gl.get_uniform_location(program, "u_taps"),
-                radius: gl.get_uniform_location(program, "u_radius"),
-                supersample: gl.get_uniform_location(program, "u_ss"),
-                encode: gl.get_uniform_location(program, "u_encode"),
-                capture: gl.get_uniform_location(program, "u_capture"),
-                region: gl.get_uniform_location(program, "u_region"),
-                weights: gl.get_uniform_location(program, "u_weights"),
-                color: gl.get_uniform_location(program, "u_color"),
-                scale: gl.get_uniform_location(program, "u_scale"),
-                offset: gl.get_uniform_location(program, "u_offset"),
-                gamut: gl.get_uniform_location(program, "u_gamut"),
-                layer_rect: gl.get_uniform_location(program, "u_rect"),
-                layer_radius: gl.get_uniform_location(program, "u_radius"),
-                layer_exp: gl.get_uniform_location(program, "u_exp"),
-                layer_skip_empty: gl.get_uniform_location(program, "u_skip_empty"),
-                tint: gl.get_uniform_location(program, "u_tint"),
-                luminosity: gl.get_uniform_location(program, "u_luminosity"),
-                noise: gl.get_uniform_location(program, "u_noise"),
-                body: gl.get_uniform_location(program, "u_body"),
-                glass: gl.get_uniform_location(program, "u_glass"),
-                light: gl.get_uniform_location(program, "u_light"),
-                optical: gl.get_uniform_location(program, "u_optical"),
-                blend: gl.get_uniform_location(program, "u_blend"),
-                kit: gl.get_uniform_location(program, "u_kit"),
-                shapes: gl.get_uniform_location(program, "u_shape[0]"),
-                shape_radius: gl.get_uniform_location(program, "u_shape_radius[0]"),
-            };
-            gl.bind_vertex_array(None);
-            Ok(Self {
-                program,
-                vao,
-                unit_vbo,
-                instance_vbo,
-                uniforms,
-            })
-        }
     }
 }
 
@@ -3336,62 +2747,27 @@ fn push_line(out: &mut Vec<f32>, p: &ui_core::draw::LinePrim, scale: f32, encode
 }
 
 fn upload_atlas(
-    gl: &glow::Context,
-    slot: &mut Option<glow::Texture>,
+    device: &mut dyn Device,
+    slot: &mut Option<TextureId>,
     width: u32,
     height: u32,
-    internal: u32,
-    format: u32,
-    kind: u32,
+    format: TextureFormat,
     data: &[u8],
 ) -> Result<(), GpuError> {
-    unsafe {
-        let tex = match *slot {
-            Some(t) => t,
-            None => {
-                let t = gl.create_texture()?;
-                *slot = Some(t);
-                t
-            }
-        };
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            internal as i32,
-            width as i32,
-            height as i32,
-            0,
-            format,
-            kind,
-            glow::PixelUnpackData::Slice(Some(data)),
-        );
-        // LINEAR, not NEAREST: a glyph's destination carries the quarter pixel its vertical
-        // phase did not take, and a 1:1 tile still samples exact texels because fragment
-        // centres land on texel centres. Each tile has a pixel of empty padding, so the blend
-        // at its edge reaches only transparency.
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MIN_FILTER,
-            glow::LINEAR as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MAG_FILTER,
-            glow::LINEAR as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-    }
+    let tex = match *slot {
+        Some(tex) => tex,
+        None => {
+            let tex = device.create_texture(width, height, format)?;
+            *slot = Some(tex);
+            tex
+        }
+    };
+    device.upload_texture(tex, width, height, format, data);
+    // LINEAR, not NEAREST: a glyph's destination carries the quarter pixel its vertical
+    // phase did not take, and a 1:1 tile still samples exact texels because fragment
+    // centres land on texel centres. Each tile has a pixel of empty padding, so the blend
+    // at its edge reaches only transparency.
+    device.set_sampling(tex, ui_core::draw::Sampling::Smooth, false);
     Ok(())
 }
 
@@ -3544,8 +2920,8 @@ fn half_bits(value: f32) -> u16 {
 /// Upload one image, converted for `destination` and premultiplied, with `CLAMP_TO_EDGE`
 /// so a source sub-rect never tiles.
 fn upload_image(
-    gl: &glow::Context,
-    tex: glow::Texture,
+    device: &mut dyn Device,
+    tex: TextureId,
     entry: &ImageEntry,
     destination: ui_core::colour::Destination,
 ) -> Result<(), GpuError> {
@@ -3572,7 +2948,7 @@ fn upload_image(
     // and it happens after the conversion: decode(a*c) is not a*decode(c).
     let premultiplied: Vec<u8> = if placement.is_identity() {
         let mut bytes = data[..needed].to_vec();
-        for texel in bytes.chunks_exact_mut(4) {
+        for texel in bytes.as_chunks_mut::<4>().0 {
             let alpha = texel[3] as u32;
             for channel in &mut texel[..3] {
                 *channel = ((*channel as u32 * alpha + 127) / 255) as u8;
@@ -3610,41 +2986,12 @@ fn upload_image(
             })
             .collect()
     };
-    let (internal, kind, bytes): (u32, u32, &[u8]) = match encode {
-        Encode::Srgb => (glow::RGBA8, glow::UNSIGNED_BYTE, &premultiplied),
-        Encode::Linear => (glow::RGBA16F, glow::HALF_FLOAT, &premultiplied),
+    let format = match encode {
+        Encode::Srgb => TextureFormat::Rgba8,
+        Encode::Linear => TextureFormat::Rgba16F,
     };
-    unsafe {
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            internal as i32,
-            entry.width as i32,
-            entry.height as i32,
-            0,
-            glow::RGBA,
-            kind,
-            glow::PixelUnpackData::Slice(Some(bytes)),
-        );
-        let filter = match entry.sampling {
-            ui_core::draw::Sampling::Smooth => glow::LINEAR,
-            ui_core::draw::Sampling::Pixelated => glow::NEAREST,
-        };
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-    }
+    device.upload_texture(tex, entry.width, entry.height, format, &premultiplied);
+    device.set_sampling(tex, entry.sampling, false);
     Ok(())
 }
 
@@ -3686,73 +3033,47 @@ impl Encode {
 
 /// Apply a clip: scissor bounds the rect cheaply, the shader handles the rounded shape.
 fn set_clip_uniforms(
-    gl: &glow::Context,
+    device: &mut dyn Device,
     program: &Program,
     clip: Option<ui_core::draw::ClipEntry>,
     scale: f32,
 ) {
-    unsafe {
-        // Must run with `program` current: setting a uniform with no program bound is
-        // GL_INVALID_OPERATION, and the error then surfaces at an unrelated call.
-        let rounded = clip.is_some_and(|c| !c.corners.is_zero());
-        if let Some(u) = program.uniforms.clip_on {
-            gl.uniform_1_f32(Some(&u), if rounded { 1.0 } else { 0.0 });
-        }
-        let Some(c) = clip.filter(|_| rounded) else {
-            return;
-        };
-        // The corners follow the uncut box (`shape`); the scissor still bounds `rect`.
-        let clamped = c.corners.clamp_to(c.shape.size);
-        if let Some(u) = program.uniforms.clip_rect {
-            gl.uniform_4_f32(
-                Some(&u),
+    // Must run with `program` current: setting a uniform with no program bound is
+    // GL_INVALID_OPERATION, and the error then surfaces at an unrelated call.
+    let rounded = clip.is_some_and(|c| !c.corners.is_zero());
+    if let Some(u) = program.uniforms.clip_on {
+        device.set_uniform_f32(u, if rounded { 1.0 } else { 0.0 });
+    }
+    let Some(c) = clip.filter(|_| rounded) else {
+        return;
+    };
+    // The corners follow the uncut box (`shape`); the scissor still bounds `rect`.
+    let clamped = c.corners.clamp_to(c.shape.size);
+    if let Some(u) = program.uniforms.clip_rect {
+        device.set_uniform_vec4(
+            u,
+            [
                 c.shape.origin.x * scale,
                 c.shape.origin.y * scale,
                 c.shape.size.w * scale,
                 c.shape.size.h * scale,
-            );
-        }
-        if let Some(u) = program.uniforms.clip_radius {
-            gl.uniform_4_f32(
-                Some(&u),
+            ],
+        );
+    }
+    if let Some(u) = program.uniforms.clip_radius {
+        device.set_uniform_vec4(
+            u,
+            [
                 clamped.tl * scale,
                 clamped.tr * scale,
                 clamped.br * scale,
                 clamped.bl * scale,
-            );
-        }
-        if let Some(u) = program.uniforms.clip_shape {
-            gl.uniform_1_f32(Some(&u), clamped.shape.exponent());
-        }
-    }
-}
-
-/// Read the bound framebuffer as top-down premultiplied RGBA8.
-///
-/// An f16 frame converts down through the same call: the picture is 8-bit anyway, and a
-/// float readback is not universally supported for a float attachment.
-fn read_bound_rgba8(gl: &glow::Context, w: u32, h: u32) -> Vec<u8> {
-    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-    unsafe {
-        gl.read_pixels(
-            0,
-            0,
-            w as i32,
-            h as i32,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelPackData::Slice(Some(&mut buf)),
+            ],
         );
     }
-    buf
-}
-
-/// Bind `fbo`, read it as RGBA8, and leave nothing bound.
-fn read_framebuffer_rgba8(gl: &glow::Context, fbo: glow::Framebuffer, w: u32, h: u32) -> Vec<u8> {
-    unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo)) };
-    let buf = read_bound_rgba8(gl, w, h);
-    unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
-    buf
+    if let Some(u) = program.uniforms.clip_shape {
+        device.set_uniform_f32(u, clamped.shape.exponent());
+    }
 }
 
 /// Undo premultiplication in place, so callers see straight alpha.
@@ -3780,26 +3101,20 @@ pub fn partial_frames() -> (u64, u64) {
 }
 
 fn set_scissor(
-    gl: &glow::Context,
+    device: &mut dyn Device,
     clip: Option<ui_core::geom::Rect>,
     scale: f32,
     viewport: (f32, f32),
     band: Option<[i32; 4]>,
 ) {
     match batch_scissor(clip.map(|r| device_scissor(r, scale)), band) {
-        Scissor::Off => unsafe { gl.disable(glow::SCISSOR_TEST) },
-        Scissor::Empty => unsafe {
-            gl.enable(glow::SCISSOR_TEST);
-            gl.scissor(0, 0, 0, 0);
-        },
+        Scissor::Off => device.set_scissor(None),
+        Scissor::Empty => device.set_scissor(Some([0, 0, 0, 0])),
         Scissor::Box(r) => {
             // No Y flip: this renderer maps device y=0 to GL's bottom, which is the same
             // memory row the compositor reads as the image top (see the vertex shader).
             let _ = viewport;
-            unsafe {
-                gl.enable(glow::SCISSOR_TEST);
-                gl.scissor(r[0], r[1], r[2], r[3]);
-            }
+            device.set_scissor(Some([r[0], r[1], r[2], r[3]]));
         }
     }
 }
@@ -3924,55 +3239,11 @@ pub(crate) fn union_device(a: [i32; 4], b: [i32; 4], size: (u32, u32)) -> [i32; 
     [x0, y0, (x1 - x0).max(0), (y1 - y0).max(0)]
 }
 
-pub(crate) fn as_bytes(data: &[f32]) -> &[u8] {
+/// Reinterpret a float slice as bytes for an instanced upload.
+pub fn as_bytes(data: &[f32]) -> &[u8] {
+    // The byte view only ever feeds a vertex buffer, and the shader reads the layout the
+    // float slice already has, so the reinterpretation is exact.
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
-}
-
-fn compile_program(
-    gl: &glow::Context,
-    vertex: &str,
-    fragment: &str,
-    is_gles: bool,
-) -> Result<glow::Program, GpuError> {
-    let header = if is_gles {
-        "#version 300 es\n"
-    } else {
-        "#version 330\n"
-    };
-    unsafe {
-        let program = gl.create_program()?;
-        let mut shaders = Vec::new();
-        for (kind, src) in [
-            (glow::VERTEX_SHADER, vertex),
-            (glow::FRAGMENT_SHADER, fragment),
-        ] {
-            let shader = gl.create_shader(kind)?;
-            // `AA` is spliced into every program from one definition, so the vertex
-            // expansion and the fragment ramp cannot drift apart.
-            gl.shader_source(
-                shader,
-                &format!("{header}{}", shader::splice(src, shader::AA_GLSL)),
-            );
-            gl.compile_shader(shader);
-            if !gl.get_shader_compile_status(shader) {
-                let log = gl.get_shader_info_log(shader);
-                gl.delete_shader(shader);
-                return Err(GpuError::Gl(format!("shader compile: {log}")));
-            }
-            gl.attach_shader(program, shader);
-            shaders.push(shader);
-        }
-        gl.link_program(program);
-        if !gl.get_program_link_status(program) {
-            let log = gl.get_program_info_log(program);
-            return Err(GpuError::Gl(format!("program link: {log}")));
-        }
-        for shader in shaders {
-            gl.detach_shader(program, shader);
-            gl.delete_shader(shader);
-        }
-        Ok(program)
-    }
 }
 
 #[cfg(test)]

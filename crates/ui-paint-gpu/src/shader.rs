@@ -1,11 +1,5 @@
-//! GLSL sources and the instance layout each program expects.
-
-/// Floats per rounded-rect instance: rect, radius, fill, border, shape, far stop, gradient,
-/// border width, notch. Colour and width are separate slots: one slot cannot carry both.
-pub const RECT_STRIDE: i32 = 39;
-
-/// Largest tap count the effect shader accepts; keep in sync with `u_weights[33]`.
-pub const MAX_TAPS: u32 = 33;
+//! GLSL sources. The instance layouts they read are `ui_gpu_scene::layout`, which is also
+//! what the painter packs against, so the two cannot describe different buffers.
 
 /// The SDF feather, in device pixels: coverage ramps over this width, and every quad reaches
 /// this far past its shape so that no covered pixel centre falls outside it.
@@ -22,21 +16,6 @@ pub const COVERAGE_GLSL: &str = include_str!("shaders/coverage.glsl");
 /// Rounded-box signed distance, shared by the rect and the glass programs.
 pub const SDF_GLSL: &str = include_str!("shaders/sdf.glsl");
 
-/// Floats per glyph instance: dest rect, atlas rect, colour, kind.
-pub const GLYPH_STRIDE: i32 = 13;
-
-/// Floats per image instance: dest rect, radius, uv rect, shape exponent.
-pub const IMAGE_STRIDE: i32 = 13;
-
-/// Unit quad shared by both programs; scaled per instance.
-pub const UNIT_QUAD: [f32; 12] = [
-    0.0, 0.0, 1.0, 0.0, 1.0, 1.0, //
-    0.0, 0.0, 1.0, 1.0, 0.0, 1.0,
-];
-
-/// Floats per shadow instance: rect, radius, colour, blur + dy, shape, surface edge.
-pub const SHADOW_STRIDE: i32 = 21;
-
 pub const SHADOW_VERTEX: &str = include_str!("shaders/shadow.vert.glsl");
 
 /// Flat ±100 px shift for diagnosis: a displaced wash proves the quad is drawn at all.
@@ -50,12 +29,12 @@ pub const GLYPH_VERTEX: &str = include_str!("shaders/glyph.vert.glsl");
 
 pub const GLYPH_FRAGMENT: &str = include_str!("shaders/glyph.frag.glsl");
 
-/// Samples one RGBA8 texture through a rounded rect, stride is `IMAGE_STRIDE`.
+/// Samples one RGBA8 texture through a rounded rect; the instance layout is the key's `ProgramSpec`.
 pub const IMAGE_VERTEX: &str = include_str!("shaders/image.vert.glsl");
 
 pub const IMAGE_FRAGMENT: &str = include_str!("shaders/image.frag.glsl");
 
-/// Instanced quad for compositing a layer texture, stride is `RECT_STRIDE`.
+/// Instanced quad for compositing a layer texture; the instance layout is the key's `ProgramSpec`.
 pub const LAYER_VERTEX: &str = include_str!("shaders/layer.vert.glsl");
 
 pub const LAYER_FRAGMENT: &str = include_str!("shaders/layer.frag.glsl");
@@ -108,9 +87,6 @@ pub fn rect_fragment() -> String {
     with_sdf(&with_clip(RECT_FRAGMENT))
 }
 
-/// Floats per arc instance: centre, geometry, fill, caps.
-pub const SECTOR_STRIDE: i32 = 11;
-
 pub const SECTOR_VERTEX: &str = include_str!("shaders/sector.vert.glsl");
 
 pub const SECTOR_FRAGMENT: &str = include_str!("shaders/sector.frag.glsl");
@@ -119,9 +95,6 @@ pub fn sector_fragment() -> String {
     with_clip(SECTOR_FRAGMENT)
 }
 
-/// Floats per ellipse instance: centre, radii, stroke width, fill, stroke.
-pub const ELLIPSE_STRIDE: i32 = 13;
-
 pub const ELLIPSE_VERTEX: &str = include_str!("shaders/ellipse.vert.glsl");
 
 pub const ELLIPSE_FRAGMENT: &str = include_str!("shaders/ellipse.frag.glsl");
@@ -129,9 +102,6 @@ pub const ELLIPSE_FRAGMENT: &str = include_str!("shaders/ellipse.frag.glsl");
 pub fn ellipse_fragment() -> String {
     with_clip(ELLIPSE_FRAGMENT)
 }
-
-/// Floats per segment instance: from, to, width, fill.
-pub const LINE_STRIDE: i32 = 9;
 
 pub const LINE_VERTEX: &str = include_str!("shaders/line.vert.glsl");
 

@@ -5,8 +5,7 @@
 
 use glow::HasContext;
 
-use crate::GpuError;
-use ui_gpu_egl::GpuSurface;
+use crate::{GpuError, RenderTarget, TargetId};
 
 /// A plain texture + framebuffer pair.
 pub struct OffscreenFbo {
@@ -71,7 +70,7 @@ impl OffscreenFbo {
             );
             let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
             if status != glow::FRAMEBUFFER_COMPLETE {
-                return Err(GpuError::Gl(format!("FBO incomplete: {status:#x}")));
+                return Err(GpuError::Device(format!("FBO incomplete: {status:#x}")));
             }
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             fbo
@@ -101,15 +100,12 @@ impl OffscreenFbo {
     }
 }
 
-impl GpuSurface for OffscreenFbo {
+impl RenderTarget for OffscreenFbo {
     fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
-    fn bind(&self, gl: &glow::Context) {
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
-            gl.viewport(0, 0, self.width as i32, self.height as i32);
-        }
+    fn target_id(&self) -> TargetId {
+        TargetId(u64::from(self.fbo.0.get()))
     }
 }
