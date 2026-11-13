@@ -28,6 +28,7 @@ math-syntax = { path = "../../mathstack/crates/math-syntax" }
 math-font = { path = "../../mathstack/crates/math-font" }
 math-editor = { path = "../../mathstack/crates/math-editor" }
 ui-platform-wayland = { path = "crates/ui-platform-wayland" }
+ui-platform-win32 = { path = "crates/ui-platform-win32" }
 zeno = { version = "0.3", default-features = false, features = ["std", "eval"] }
 # Engine-internal maps and content digests: keys are ours, so SipHash buys nothing.
 rustc-hash = "2"

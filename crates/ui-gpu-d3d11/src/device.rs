@@ -18,13 +18,17 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
-    DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+    DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::core::{Interface, s};
 
 use crate::shader;
+
+/// The one pass that is not the scene's: a finished frame into a swap chain buffer.
+const PRESENT_VERTEX: &str = include_str!("shaders/present.vert.hlsl");
+const PRESENT_FRAGMENT: &str = include_str!("shaders/present.frag.hlsl");
 
 /// Instances the buffer holds before it has to grow.
 const MIN_INSTANCES: u32 = 64;
@@ -121,9 +125,22 @@ struct Target {
     view: ID3D11RenderTargetView,
     width: u32,
     height: u32,
-    format: TargetFormat,
-    /// The id this target's texture is sampled under.
-    sampled: TextureId,
+    /// `None` for a texture the caller owns: the painter draws into it but cannot resize it.
+    format: Option<TargetFormat>,
+    /// The storage format; a swap chain buffer has no `TargetFormat` of its own.
+    dxgi: DXGI_FORMAT,
+    /// The id this target's texture is sampled under, when the texture is sampleable.
+    sampled: Option<TextureId>,
+}
+
+/// The pass that copies a finished frame into the presented buffer.
+///
+/// A swap chain's back buffer is usually `B8G8R8A8`, and a raw copy would leave red and blue
+/// exchanged; drawing through a render target view lets the view's format order the channels.
+struct PresentCopy {
+    vertex: ID3D11VertexShader,
+    pixel: ID3D11PixelShader,
+    sampler: ID3D11SamplerState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -155,6 +172,8 @@ pub struct D3d11Device {
     blend_off: ID3D11BlendState,
     /// A 1x1 default texture and its staging copy, used to wait for the GPU in `finish`.
     sync: Option<(ID3D11Texture2D, ID3D11Texture2D)>,
+    /// Built on the first present; most devices never present through this one.
+    present: Option<PresentCopy>,
     /// A failure inside a `Device` method whose signature has no `Result`.
     pending: Option<String>,
 }
@@ -185,6 +204,7 @@ impl D3d11Device {
             blend_on,
             blend_off,
             sync: None,
+            present: None,
             pending: None,
         };
         unsafe {
@@ -242,14 +262,11 @@ impl D3d11Device {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-        render_target: bool,
     ) -> Result<ID3D11Texture2D, GpuError> {
-        let mut bind = D3D11_BIND_SHADER_RESOURCE.0 as u32;
-        if render_target {
-            bind |= D3D11_BIND_RENDER_TARGET.0 as u32;
-        }
-        // Every texture carries a full chain: `set_sampling` may ask for mips on any of
-        // them, and a resource without the chain makes `GenerateMips` a no-op.
+        // `GENERATE_MIPS` requires both bindings in D3D11, and every texture carries a full
+        // chain: `set_sampling` may ask for mips on any of them, and a resource without the
+        // chain makes `GenerateMips` a no-op.
+        let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width.max(1),
             Height: height.max(1),
@@ -276,7 +293,7 @@ impl D3d11Device {
         height: u32,
         storage: Storage,
     ) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView), GpuError> {
-        let texture = self.texture(width, height, storage.dxgi(), false)?;
+        let texture = self.texture(width, height, storage.dxgi())?;
         let mut srv = None;
         let result = unsafe {
             self.device
@@ -417,6 +434,189 @@ impl D3d11Device {
         self.sync = Some((texture.clone(), staging.clone()));
         Some((texture, staging))
     }
+
+    /// The device itself, for a presenter that has to create its own swap chain.
+    pub fn raw_device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    /// Register a texture the caller owns — a swap chain's back buffer — as a target.
+    ///
+    /// The painter may draw into it and read it back, but never resize it: the owner
+    /// re-points it with [`Self::retarget`] after its own resize.
+    pub fn adopt_target(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> Result<TargetId, GpuError> {
+        let (width, height) = (width.max(1), height.max(1));
+        let view = render_target_view(&self.device, texture)?;
+        let target = TargetId(self.next_target);
+        self.next_target += 1;
+        self.targets.insert(
+            target.0,
+            Target {
+                texture: texture.clone(),
+                view,
+                width,
+                height,
+                format: None,
+                dxgi: format,
+                sampled: None,
+            },
+        );
+        Ok(target)
+    }
+
+    /// Point an adopted target at a replacement texture, keeping the same handle.
+    ///
+    /// A flip-model swap chain hands a different buffer to each frame, and a resize creates
+    /// new ones; the target id survives both so a presenter can keep one field.
+    pub fn retarget(
+        &mut self,
+        target: TargetId,
+        texture: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> Result<(), GpuError> {
+        let (width, height) = (width.max(1), height.max(1));
+        let view = render_target_view(&self.device, texture)?;
+        let Some(entry) = self.targets.get_mut(&target.0) else {
+            return Err(GpuError::Device(format!("no target {}", target.0)));
+        };
+        if entry.format.is_some() {
+            return Err(GpuError::Device(String::from(
+                "retarget names a target the painter allocated",
+            )));
+        }
+        entry.texture = texture.clone();
+        entry.view = view;
+        entry.width = width;
+        entry.height = height;
+        entry.dxgi = format;
+        Ok(())
+    }
+
+    /// Release an adopted target and every reference it holds.
+    ///
+    /// A swap chain cannot resize while a back buffer is still referenced, so its owner
+    /// calls this for each buffer before `ResizeBuffers`.
+    pub fn release_target(&mut self, target: TargetId) {
+        if self.bound == Some(target.0) {
+            self.bind_target(None);
+        }
+        self.targets.remove(&target.0);
+    }
+
+    /// Draw `src` into `dst` through the pipeline, so the destination's own format decides
+    /// channel order. This is how a finished frame reaches a `B8G8R8A8` swap chain buffer.
+    ///
+    /// `dst` is left unbound: the swap chain must hold no reference when it resizes.
+    pub fn present_copy(&mut self, src: TargetId, dst: TargetId) -> Result<(), GpuError> {
+        self.take_pending()?;
+        let (view, width, height) = match self.targets.get(&dst.0) {
+            Some(entry) => (entry.view.clone(), entry.width, entry.height),
+            None => {
+                return Err(GpuError::Device(format!(
+                    "no present target {}",
+                    dst.0
+                )));
+            }
+        };
+        let srv = self
+            .targets
+            .get(&src.0)
+            .and_then(|entry| entry.sampled)
+            .and_then(|id| self.sampled.get(&id.0))
+            .map(|entry| entry.srv.clone())
+            .ok_or_else(|| {
+                GpuError::Device(String::from("the present source is not sampleable"))
+            })?;
+        let program = self.present_program()?;
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        // SAFETY: the view, srv and program objects live in this device, the viewport and
+        // scissor name the target's own extent, and the draw reads no vertex buffer.
+        unsafe {
+            let context = &self.context;
+            context.OMSetRenderTargets(Some(&[Some(view)]), None);
+            context.RSSetViewports(Some(&[viewport]));
+            context.RSSetScissorRects(Some(&[rect]));
+            context.OMSetBlendState(&self.blend_off, None, u32::MAX);
+            context.IASetInputLayout(None::<&ID3D11InputLayout>);
+            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetShader(&program.vertex, None);
+            context.PSSetShader(&program.pixel, None);
+            context.PSSetShaderResources(0, Some(&[Some(srv)]));
+            context.PSSetSamplers(0, Some(&[Some(program.sampler)]));
+            context.Draw(3, 0);
+            context.PSSetShaderResources(0, Some(&[None]));
+            context.OMSetRenderTargets(None, None);
+        }
+        self.bound = None;
+        self.scissor = None;
+        self.apply_scissor();
+        // The painter sets its own blend state per pass, but the copy must not leave the
+        // opaque one armed for a frame that assumes source-over.
+        unsafe { self.context.OMSetBlendState(&self.blend_on, None, u32::MAX) };
+        Ok(())
+    }
+
+    /// Compile the present copy once; every presented frame reuses it.
+    fn present_program(&mut self) -> Result<PresentCopy, GpuError> {
+        if let Some(program) = &self.present {
+            return Ok(PresentCopy {
+                vertex: program.vertex.clone(),
+                pixel: program.pixel.clone(),
+                sampler: program.sampler.clone(),
+            });
+        }
+        let vertex_code = compile("present.vert", PRESENT_VERTEX, s!("main"), s!("vs_5_0"))?;
+        let pixel_code = compile("present.frag", PRESENT_FRAGMENT, s!("main"), s!("ps_5_0"))?;
+        let mut vertex = None;
+        let result = unsafe {
+            self.device
+                .CreateVertexShader(&vertex_code, None, Some(&mut vertex))
+        };
+        let vertex = created(result, vertex, "present vertex shader")?;
+        let mut pixel = None;
+        let result = unsafe {
+            self.device
+                .CreatePixelShader(&pixel_code, None, Some(&mut pixel))
+        };
+        let pixel = created(result, pixel, "present pixel shader")?;
+        // A 1:1 copy: linear filtering is exact at this scale and mip 0 is what it picks.
+        let sampler = self.sampler(SamplerKey {
+            sampling: Sampling::Smooth,
+            mips: true,
+            repeat: 0,
+        })?;
+        self.present = Some(PresentCopy {
+            vertex: vertex.clone(),
+            pixel: pixel.clone(),
+            sampler: sampler.clone(),
+        });
+        Ok(PresentCopy {
+            vertex,
+            pixel,
+            sampler,
+        })
+    }
 }
 
 impl Device for D3d11Device {
@@ -533,7 +733,7 @@ impl Device for D3d11Device {
     ) -> Result<(TargetId, TextureId), GpuError> {
         let (width, height) = (width.max(1), height.max(1));
         let storage = Storage::Target(format);
-        let texture = self.texture(width, height, storage.dxgi(), true)?;
+        let texture = self.texture(width, height, storage.dxgi())?;
         let mut view = None;
         let result = unsafe {
             self.device
@@ -571,8 +771,9 @@ impl Device for D3d11Device {
                 view,
                 width,
                 height,
-                format,
-                sampled,
+                format: Some(format),
+                dxgi: format_of(format),
+                sampled: Some(sampled),
             },
         );
         Ok((target, sampled))
@@ -580,10 +781,10 @@ impl Device for D3d11Device {
 
     fn resize_target(&mut self, target: TargetId, width: u32, height: u32, format: TargetFormat) {
         let (width, height) = (width.max(1), height.max(1));
-        let Some(sampled) = self.targets.get(&target.0).map(|entry| entry.sampled) else {
+        let Some(sampled) = self.targets.get(&target.0).and_then(|entry| entry.sampled) else {
             return;
         };
-        let texture = match self.texture(width, height, format_of(format), true) {
+        let texture = match self.texture(width, height, format_of(format)) {
             Ok(texture) => texture,
             Err(error) => return self.fail(error),
         };
@@ -610,7 +811,8 @@ impl Device for D3d11Device {
             entry.view = view;
             entry.width = width;
             entry.height = height;
-            entry.format = format;
+            entry.format = Some(format);
+            entry.dxgi = format_of(format);
         }
         if let Some(entry) = self.sampled.get_mut(&sampled.0) {
             entry.texture = texture;
@@ -967,6 +1169,17 @@ impl Device for D3d11Device {
     }
 
     fn blit(&mut self, src: TargetId, dst: TargetId, rect: [i32; 4]) {
+        // A raw copy moves bits: it cannot reorder a B8G8R8A8 buffer into an RGBA one.
+        let compatible = match (self.targets.get(&src.0), self.targets.get(&dst.0)) {
+            (Some(source), Some(destination)) => source.dxgi == destination.dxgi,
+            _ => return,
+        };
+        if !compatible {
+            self.fail(GpuError::Device(String::from(
+                "blit needs matching target formats; present a frame with `present_copy`",
+            )));
+            return;
+        }
         let (Some(source), Some(destination)) =
             (self.targets.get(&src.0), self.targets.get(&dst.0))
         else {
@@ -1011,7 +1224,7 @@ impl Device for D3d11Device {
         let Some(entry) = self.targets.get(&target.0) else {
             return empty();
         };
-        let (width, height, format) = (entry.width, entry.height, format_of(entry.format));
+        let (width, height, format) = (entry.width, entry.height, entry.dxgi);
         let source = entry.texture.clone();
         let staging_desc = D3D11_TEXTURE2D_DESC {
             Width: width,
@@ -1052,11 +1265,19 @@ impl Device for D3d11Device {
             }
             let mut out = vec![0u8; width as usize * height as usize * 4];
             let half = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            // A presented buffer is BGRA on almost every Windows machine; the readback
+            // contract is RGBA, so its bytes are reordered on the way out.
+            let bgra = format == DXGI_FORMAT_B8G8R8A8_UNORM;
             for row in 0..height as usize {
                 let row_start = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
                 let span = width as usize * 4;
                 let destination = &mut out[row * span..(row + 1) * span];
-                if half {
+                if bgra {
+                    let texels = std::slice::from_raw_parts(row_start, span);
+                    for (texel, chunk) in texels.chunks(4).zip(destination.as_chunks_mut::<4>().0) {
+                        *chunk = [texel[2], texel[1], texel[0], texel[3]];
+                    }
+                } else if half {
                     let texels =
                         std::slice::from_raw_parts(row_start as *const u16, width as usize * 4);
                     for (texel, chunk) in texels.chunks(4).zip(destination.as_chunks_mut::<4>().0) {
@@ -1124,6 +1345,15 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), GpuError> {
         }
     }
     Err(GpuError::Device(format!("D3D11: {last}")))
+}
+
+fn render_target_view(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+) -> Result<ID3D11RenderTargetView, GpuError> {
+    let mut view = None;
+    let result = unsafe { device.CreateRenderTargetView(texture, None, Some(&mut view)) };
+    created(result, view, "render target view")
 }
 
 fn create_raster(device: &ID3D11Device) -> Result<ID3D11RasterizerState, GpuError> {
