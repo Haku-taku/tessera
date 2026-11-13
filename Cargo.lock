@@ -1872,8 +1872,8 @@ version = "0.1.0"
 dependencies = [
  "image",
  "ui-core",
+ "ui-host",
  "ui-platform",
- "ui-platform-wayland",
 ]
 
 [[package]]

@@ -2,14 +2,13 @@
 name = "ui-demo"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 ui-core = { path = "../ui-core" }
 ui-platform = { path = "../ui-platform" }
+# The window and its loop are the host's; this crate only configures them.
+ui-host = { path = "../ui-host" }
 # The wallpaper is decoded by the host, not the engine: one decoder per format it accepts.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-
-# The bootstrap opens a Wayland window, so it is an empty library wherever Wayland is absent.
-[target.'cfg(unix)'.dependencies]
-ui-platform-wayland = { path = "../ui-platform-wayland", features = ["gpu"] }

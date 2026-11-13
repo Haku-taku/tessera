@@ -1,17 +1,16 @@
-//! The bootstrap every showcase app shares: a Wayland window, a presenter, the fonts the app
-//! names, and a frame loop the compositor paces.
+//! The bootstrap every showcase app shares: a window from `ui-host`, the fonts the app
+//! names, and a frame loop the host paces.
 //!
 //! Knobs: `DEMO_CPU=1`, `DEMO_SECONDS=n`, `DEMO_CLOSE_AFTER=n`, `DEMO_WALLPAPER=path`,
-//! `DEMO_HEARTBEAT=1`.
-
-#![cfg(unix)]
+//! `DEMO_CLICK=x,y;x,y`, `DEMO_DRAG=x1,y1,x2,y2`, `DEMO_TYPE=text`, `DEMO_DUMP=1`,
+//! `DEMO_HEARTBEAT=1`, `EXITDBG=1`.
 
 use std::time::Instant;
 
 use ui_core::draw::ImageEntry;
+use ui_host::{Session, SessionOptions};
 use ui_platform::view::{App, AppLoop};
 use ui_platform::window::SurfaceSpec;
-use ui_platform_wayland::{GpuWindow, GpuWindowConfig, WaylandWindow};
 
 /// The texture id a root refers to for the wallpaper, so the renderer caches one upload.
 pub const WALLPAPER: u64 = 0x7761_6c6c_7061_7065;
@@ -22,12 +21,7 @@ pub const SF_SYMBOLS: &[u8] = include_bytes!("../../assets/fonts/SFSymbols.ttf")
 pub const INTER: &[u8] = include_bytes!("../../assets/fonts/InterVariable.ttf");
 pub const FLUENT_ICONS: &[u8] = include_bytes!("../../assets/fonts/FluentSystemIcons-Regular.ttf");
 
-enum Presenter {
-    Cpu,
-    Gpu(GpuWindow),
-}
-
-/// One showcase app: its window, the faces it draws with, and the photo behind it.
+/// One showcase app: the window it opens, the faces it draws with, and the photo behind it.
 pub struct Demo {
     title: &'static str,
     app_id: &'static str,
@@ -74,35 +68,27 @@ impl Demo {
         if std::env::var_os("EXITDBG").is_some() {
             allow_ptrace();
         }
-        let spec = SurfaceSpec::window(self.app_id, self.title, (self.width, self.height));
-        let mut win = match WaylandWindow::new(spec) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("cannot open a Wayland window: {e}");
-                std::process::exit(1);
-            }
-        };
-        let presenter = if std::env::var_os("DEMO_CPU").is_some() {
-            Presenter::Cpu
-        } else {
-            match GpuWindow::open(&mut win, GpuWindowConfig::default()) {
-                Ok(gpu) => {
-                    println!("gpu presenter: {} ({})", gpu.renderer_name(), gpu.node());
-                    Presenter::Gpu(gpu)
-                }
-                Err(e) => {
-                    eprintln!("GPU presenter unavailable: {e}");
-                    eprintln!("set DEMO_CPU=1 to present through the CPU rasterizer");
-                    std::process::exit(1);
-                }
-            }
-        };
         let mut lp = AppLoop::with_stack(app, self.stack);
         for (family, bytes) in &self.fonts {
             lp.register_font(family, (*bytes).into());
         }
         register_wallpaper(&mut lp, self.wallpaper.as_deref());
-        loop_forever(win, presenter, lp);
+        let opts = SessionOptions {
+            surface: SurfaceSpec::window(self.app_id, self.title, (self.width, self.height)),
+            uncapped: false,
+            cpu_presenter: std::env::var_os("DEMO_CPU").is_some(),
+        };
+        let session = match Session::open(lp, opts) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+        if let Some(name) = session.presenter_name() {
+            println!("gpu presenter: {name}");
+        }
+        loop_forever(session);
     }
 }
 
@@ -185,11 +171,10 @@ fn typed() -> Option<String> {
     std::env::var("DEMO_TYPE").ok().filter(|s| !s.is_empty())
 }
 
-fn loop_forever(mut win: WaylandWindow, mut presenter: Presenter, mut lp: AppLoop<impl App>) -> ! {
+fn loop_forever<A: App>(mut session: Session<A>) -> ! {
     let heartbeat = std::env::var_os("DEMO_HEARTBEAT").is_some();
     let mut dumped = std::env::var_os("DEMO_DUMP").is_none();
     let started = Instant::now();
-    let mut presented: Option<(u32, u32)> = None;
     // One event per frame, so every press lands on a laid-out tree.
     let mut scripted: std::collections::VecDeque<ui_core::Event> = clicks()
         .into_iter()
@@ -223,78 +208,42 @@ fn loop_forever(mut win: WaylandWindow, mut presenter: Presenter, mut lp: AppLoo
         scripted.push_back(ui_core::Event::Text(text));
     }
     let mut frames = 0u32;
-    let mut waited = std::time::Duration::ZERO;
-    let mut waited_n = 0u32;
     let mut beat_at = Instant::now();
     // While a script runs, the scripted pointer *is* the pointer the frame sees: injected
     // events and `WidgetState::local` must agree, or a control reading both sees two.
     let mut scripted_pointer: Option<ui_core::geom::Point> = None;
-    while !win.should_close() && started.elapsed().as_secs_f32() < lifetime() {
-        for ev in win.take_events() {
-            lp.dispatch(ev);
-        }
+    while !session.finished() && started.elapsed().as_secs_f32() < lifetime() {
         if frames >= 1 {
             match scripted.pop_front() {
                 Some(ev) => {
                     if let Some(pos) = ev.pos() {
                         scripted_pointer = Some(pos);
                     }
-                    lp.dispatch(ev);
+                    session.lp_mut().dispatch(ev);
                 }
                 // The script is over; the real pointer takes over again.
                 None => scripted_pointer = None,
             }
         }
         if close_after().is_some_and(|s| started.elapsed().as_secs_f32() >= s) {
-            win.request_close();
+            break;
         }
-        let (lw, lh) = win.logical_size();
-        let resized = presented != Some((lw, lh));
-        lp.set_scale(win.scale());
-        let pointer = scripted_pointer.or_else(|| win.pointer());
-        match &mut presenter {
-            Presenter::Cpu => {
-                let outcome = lp.frame(&mut win, pointer);
-                if outcome.damage.is_none() && !resized && !outcome.animating {
-                    win.wait();
-                } else {
-                    win.wait_for_frame();
-                }
+        session.set_pointer(scripted_pointer);
+        // A turn that does not draw ended in the host's own wait; nothing to count.
+        let tick = match session.tick() {
+            Ok(tick) => tick,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
             }
-            Presenter::Gpu(gpu) => {
-                let outcome = lp.build((lw, lh), pointer);
-                win.set_cursor(outcome.cursor);
-                win.set_ime(lp.ime_state());
-                // An animating frame presents even with no damage: its commit is what paces
-                // the loop, else a press would block in `wait()` until unrelated input.
-                if !outcome.damage.is_none() || resized || outcome.animating || win.ime_pending() {
-                    if let Err(e) = gpu.sync_atlas(&lp.text_pass()) {
-                        eprintln!("atlas upload failed: {e}");
-                        std::process::exit(1);
-                    }
-                    if let Err(e) =
-                        gpu.present(&mut win, (lw, lh), lp.draw_list(), &outcome.damage, &[])
-                    {
-                        eprintln!("present failed: {e}");
-                        std::process::exit(1);
-                    }
-                    let t = Instant::now();
-                    win.wait_for_frame();
-                    waited += t.elapsed();
-                    waited_n += 1;
-                    if heartbeat && t.elapsed().as_millis() >= 50 {
-                        eprintln!("[stall] wait={}ms", t.elapsed().as_millis());
-                    }
-                } else {
-                    win.wait();
-                }
-            }
+        };
+        if !tick.drew {
+            continue;
         }
         if !dumped {
             dumped = true;
-            dump(&lp);
+            dump(session.lp());
         }
-        presented = Some((lw, lh));
         frames += 1;
         if heartbeat && beat_at.elapsed().as_millis() >= 1000 {
             beat_at = Instant::now();
@@ -302,15 +251,14 @@ fn loop_forever(mut win: WaylandWindow, mut presenter: Presenter, mut lp: AppLoo
         }
     }
     let secs = started.elapsed().as_secs_f32();
+    let (waited, waited_n) = session.wait_stats();
     println!(
         "frames {frames} in {secs:.1}s ({:.0} fps), frame wait avg {:.2}ms over {waited_n}",
         frames as f32 / secs.max(1e-3),
         waited.as_secs_f64() * 1000.0 / waited_n.max(1) as f64
     );
-    // Tear down in order: GPU objects while the surface still exists, then the window.
-    drop(presenter);
-    drop(lp);
-    drop(win);
+    // The session drops its own parts in teardown order; the process ends past them.
+    drop(session);
     std::process::exit(0);
 }
 
@@ -346,6 +294,7 @@ fn dump(lp: &AppLoop<impl App>) {
 }
 
 /// Let an outside debugger attach; `yama.ptrace_scope=1` otherwise refuses.
+#[cfg(unix)]
 fn allow_ptrace() {
     unsafe extern "C" {
         fn prctl(option: i32, ...) -> i32;
@@ -356,3 +305,7 @@ fn allow_ptrace() {
         prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
     }
 }
+
+/// Windows has no `ptrace` scope to widen; a debugger attaches on its own.
+#[cfg(not(unix))]
+fn allow_ptrace() {}

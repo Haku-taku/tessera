@@ -38,7 +38,7 @@ const PLATFORM_BOUND: &[(&str, &str)] = &[
     ),
     (
         "ui-demo",
-        "Showcase bootstrap: opens a Wayland window and exits the process",
+        "Showcase bootstrap: opens a window through the host facade and exits the process",
     ),
     (
         "ui-gpu-egl",
