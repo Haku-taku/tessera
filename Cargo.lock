@@ -2010,6 +2010,7 @@ name = "ui-platform"
 version = "0.1.0"
 dependencies = [
  "hotpath",
+ "log",
  "math-core",
  "rustc-hash",
  "ui-core",

@@ -655,10 +655,10 @@ impl Host {
         if let Err(reason) = self.backend.serve_clipboard() {
             // A clipboard the desktop refused is not the desktop going away; the next turn
             // serves it again, and `wait` reports a connection that is really gone.
-            eprintln!("[host] the clipboard was not served: {reason}");
+            log::warn!("ui-platform: the clipboard was not served: {reason}");
         }
         for (id, reason) in &retired {
-            eprintln!("[host] surface {id:?} was retired: {reason}");
+            log::warn!("ui-platform: surface {id:?} was retired: {reason}");
         }
         self.surfaces.retain(|(id, surface)| {
             !retired.iter().any(|(retired, _)| retired == id) && !surface.is_closed()

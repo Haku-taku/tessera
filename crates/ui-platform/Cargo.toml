@@ -7,6 +7,9 @@ license.workspace = true
 description = "Presentation targets and the CPU window/surface app loop."
 
 [dependencies]
+# The facade the engine already reports through; the host's failures reach the application's
+# log this way instead of a stderr a desktop launch does not have.
+log = "0.4"
 rustc-hash.workspace = true
 ui-core = { workspace = true }
 ui-math = { path = "../ui-math" }
