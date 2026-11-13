@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use ui_gpu_scene::{
     Device, GpuError, MAX_TAPS, ProgramId, ProgramKey, Sampling, TargetFormat, TargetId,
@@ -624,19 +625,11 @@ impl D3d11Device {
 impl Device for D3d11Device {
     fn create_program(&mut self, key: ProgramKey) -> Result<ProgramId, GpuError> {
         let spec = key.spec();
+        // The reflection half only: the sources go through the process-wide cache.
         let source = shader::build(key);
-        let vertex_code = compile(
-            &format!("{key:?}.vert"),
-            &source.vertex,
-            s!("main"),
-            s!("vs_5_0"),
-        )?;
-        let pixel_code = compile(
-            &format!("{key:?}.frag"),
-            &source.fragment,
-            s!("main"),
-            s!("ps_5_0"),
-        )?;
+        let (vertex_code, pixel_code) = bytecode(key)
+            .as_ref()
+            .map_err(|message| GpuError::Shader(message.clone()))?;
 
         let mut elements = vec![D3D11_INPUT_ELEMENT_DESC {
             SemanticName: s!("TEXCOORD"),
@@ -664,19 +657,19 @@ impl Device for D3d11Device {
         let mut vertex = None;
         let result = unsafe {
             self.device
-                .CreateVertexShader(&vertex_code, None, Some(&mut vertex))
+                .CreateVertexShader(vertex_code, None, Some(&mut vertex))
         };
         let vertex = created(result, vertex, "vertex shader")?;
         let mut pixel = None;
         let result = unsafe {
             self.device
-                .CreatePixelShader(&pixel_code, None, Some(&mut pixel))
+                .CreatePixelShader(pixel_code, None, Some(&mut pixel))
         };
         let pixel = created(result, pixel, "pixel shader")?;
         let mut layout = None;
         let result = unsafe {
             self.device
-                .CreateInputLayout(&elements, &vertex_code, Some(&mut layout))
+                .CreateInputLayout(&elements, vertex_code, Some(&mut layout))
         };
         let layout = created(result, layout, "input layout")?;
 
@@ -1405,6 +1398,56 @@ fn slot_index(offsets: &[(String, u32)], name: &str) -> Option<usize> {
         None => format!("{name}[0]"),
     };
     offsets.iter().position(|(each, _)| each.as_str() == alternate)
+}
+
+/// The bytecode of one program: vertex first, pixel second.
+type Bytecode = Result<(Vec<u8>, Vec<u8>), String>;
+
+/// The compiled programs of this process, built on first request.
+///
+/// Compiling is what a surface pays to start, and it needs no device: a process compiles each
+/// program once, and every device it makes afterwards only builds its own shader objects.
+fn bytecode(key: ProgramKey) -> &'static Bytecode {
+    static BYTECODE: [OnceLock<Bytecode>; ProgramKey::ALL.len()] =
+        [const { OnceLock::new() }; ProgramKey::ALL.len()];
+    BYTECODE[key.index()].get_or_init(|| compile_program(key))
+}
+
+fn compile_program(key: ProgramKey) -> Bytecode {
+    let source = shader::build(key);
+    let vertex = compile(
+        &format!("{key:?}.vert"),
+        &source.vertex,
+        s!("main"),
+        s!("vs_5_0"),
+    )
+    .map_err(|error| error.to_string())?;
+    let pixel = compile(
+        &format!("{key:?}.frag"),
+        &source.fragment,
+        s!("main"),
+        s!("ps_5_0"),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((vertex, pixel))
+}
+
+/// Compile every program the frame has not asked for yet, on a worker.
+///
+/// Called once the first frame is on screen: starting this alongside that frame only puts the
+/// window's own programs behind the compiler's queue.
+pub fn precompile_remaining() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    std::thread::spawn(|| {
+        for key in ProgramKey::ALL {
+            if let Err(message) = bytecode(key) {
+                eprintln!("shader {key:?}: {message}");
+            }
+        }
+    });
 }
 
 /// Compile one stage, reporting the compiler's log verbatim.

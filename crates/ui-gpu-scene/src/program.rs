@@ -5,7 +5,7 @@ use crate::error::GpuError;
 use crate::layout;
 
 /// One program pair a backend must supply shader sources for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProgramKey {
     Layers,
     Effects,
@@ -26,6 +26,36 @@ pub enum ProgramKey {
     AcrylicLinear,
     GlassKit,
     GlassKitLinear,
+}
+
+impl ProgramKey {
+    /// Every program, in declaration order: what a backend precompiles in the background.
+    pub const ALL: [Self; 19] = [
+        Self::Layers,
+        Self::Effects,
+        Self::Box,
+        Self::OutputSrgb,
+        Self::OutputLinear,
+        Self::OutputScRgb,
+        Self::Resolve,
+        Self::Capture,
+        Self::Rects,
+        Self::Sectors,
+        Self::Ellipses,
+        Self::Lines,
+        Self::Glyphs,
+        Self::Shadows,
+        Self::Images,
+        Self::Acrylic,
+        Self::AcrylicLinear,
+        Self::GlassKit,
+        Self::GlassKitLinear,
+    ];
+
+    /// A dense slot for a per-program table in a backend.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// What the painter and the backend must agree on for one program.
@@ -224,12 +254,14 @@ impl ProgramKey {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Program {
     pub(crate) id: ProgramId,
     pub(crate) uniforms: Uniforms,
 }
 
 /// Where each uniform the painter sets lives in this program; `None` if it is absent.
+#[derive(Clone, Copy)]
 pub(crate) struct Uniforms {
     pub(crate) viewport: Option<UniformSlot>,
     pub(crate) atlas_size: Option<UniformSlot>,

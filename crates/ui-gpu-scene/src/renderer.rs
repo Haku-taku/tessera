@@ -265,32 +265,10 @@ struct CanvasTarget {
 }
 
 pub struct GpuRenderer {
-    rects: Program,
-    /// Stroked circular arcs, shaped analytically in the fragment.
-    sectors: Program,
-    /// Filled and stroked ellipses, shaped analytically in the fragment.
-    ellipses: Program,
-    /// Stroked segments, shaped analytically in the fragment.
-    lines: Program,
-    glyphs: Program,
-    /// Rounded-rect texture sampling, one draw per run of primitives sharing a texture.
-    images: Program,
-    /// Analytic soft shadows; no blur pass, so a shadow costs one draw.
-    shadows: Program,
-    layers: Program,
-    /// Full-screen pass shared by every effect in the chain.
-    effects: Program,
-    /// Output transform into PQ, used only when HDR is declared: encoded and linear
-    /// variants of the same source, picked by the working domain.
-    output_srgb: Program,
-    output_linear: Program,
-    /// The same pass ending in scRGB instead of PQ.
-    output_scrgb: Program,
-    /// Box average from the supersampled frame down to the presented buffer.
-    resolve: Program,
+    /// Built the first time a frame needs each one: a surface that never draws glass must not
+    /// pay for compiling it.
+    programs: HashMap<ProgramKey, Program>,
     resolve_scratch: Option<Target>,
-    /// Resample one region of the frame into a lens's own capture.
-    capture: Program,
     capture_targets: Vec<CaptureTarget>,
     /// Rendering resolution multiplier: every internal target is `ss²` times the surface.
     supersample: u32,
@@ -319,15 +297,6 @@ pub struct GpuRenderer {
     /// Ping-pong scratch per nesting depth. These hold no meaningful content between
     /// frames: each frame recomputes every stage from the live scene.
     effect_scratch: Vec<crate::effect::Scratch>,
-    /// Sliding-window box pass, used for blurs whose radius exceeds the kernel array.
-    boxpass: Program,
-    /// Acrylic composite over the blurred backdrop.
-    acrylic: Program,
-    /// The same in the linear domain, where the encoded-space maths needs a crossing.
-    acrylic_linear: Program,
-    /// LiquidGlassKit's material: the captured face and the thin-prism rim.
-    glass_kit: Program,
-    glass_kit_linear: Program,
     /// Style-level backdrop material; `None` keeps the plain blur blit.
     material: Option<BackdropMaterial>,
     /// Scratch for backdrop blurs; kept apart from the layer scratch so a frost and a
@@ -364,49 +333,12 @@ pub struct GpuRenderer {
 }
 
 impl GpuRenderer {
-    /// Build every program the painter draws with.
-    pub fn new(device: &mut dyn Device) -> Result<Self, GpuError> {
-        let layers = new_program(device, ProgramKey::Layers)?;
-        let sectors = new_program(device, ProgramKey::Sectors)?;
-        let ellipses = new_program(device, ProgramKey::Ellipses)?;
-        let lines = new_program(device, ProgramKey::Lines)?;
-        let glyphs = new_program(device, ProgramKey::Glyphs)?;
-        let images = new_program(device, ProgramKey::Images)?;
-        let shadows = new_program(device, ProgramKey::Shadows)?;
-        let rects = new_program(device, ProgramKey::Rects)?;
-        let effects = new_program(device, ProgramKey::Effects)?;
-        let boxpass = new_program(device, ProgramKey::Box)?;
-        let acrylic = new_program(device, ProgramKey::Acrylic)?;
-        let acrylic_linear = new_program(device, ProgramKey::AcrylicLinear)?;
-        let glass_kit = new_program(device, ProgramKey::GlassKit)?;
-        let glass_kit_linear = new_program(device, ProgramKey::GlassKitLinear)?;
-        let output_srgb = new_program(device, ProgramKey::OutputSrgb)?;
-        let output_linear = new_program(device, ProgramKey::OutputLinear)?;
-        let output_scrgb = new_program(device, ProgramKey::OutputScRgb)?;
-        let resolve = new_program(device, ProgramKey::Resolve)?;
-        let capture = new_program(device, ProgramKey::Capture)?;
+    /// A painter with no program yet: each is built the first time a frame draws with it.
+    pub fn new(_device: &mut dyn Device) -> Result<Self, GpuError> {
         Ok(Self {
-            rects,
-            sectors,
-            ellipses,
-            lines,
-            glyphs,
-            images,
-            shadows,
-            layers,
-            effects,
-            boxpass,
-            acrylic,
-            acrylic_linear,
-            glass_kit,
-            glass_kit_linear,
+            programs: HashMap::new(),
             material: None,
-            output_srgb,
-            output_linear,
-            output_scrgb,
-            resolve,
             resolve_scratch: None,
-            capture,
             capture_targets: Vec::new(),
             supersample: 1,
             layer_bounds: Vec::new(),
@@ -437,6 +369,19 @@ impl GpuRenderer {
             scale: 1.0,
             stats: RenderStats::default(),
         })
+    }
+
+    /// The program `key`, built on first use.
+    ///
+    /// Building all of them up front costs every surface the same, and a screenshot overlay
+    /// pays for glass it will never draw.
+    fn program(&mut self, device: &mut dyn Device, key: ProgramKey) -> Result<Program, GpuError> {
+        if let Some(program) = self.programs.get(&key) {
+            return Ok(*program);
+        }
+        let program = new_program(device, key)?;
+        self.programs.insert(key, program);
+        Ok(program)
     }
 
     /// Every frame now repaints the whole surface, so a presenter must treat the damage
@@ -944,13 +889,14 @@ impl GpuRenderer {
                 size.1,
                 self.target_format,
             )?;
-            let p = match self.linear_encoding {
-                ui_core::colour::LinearEncoding::ScRgb => &self.output_scrgb,
+            let key = match self.linear_encoding {
+                ui_core::colour::LinearEncoding::ScRgb => ProgramKey::OutputScRgb,
                 ui_core::colour::LinearEncoding::Pq => match self.encode {
-                    Encode::Srgb => &self.output_srgb,
-                    Encode::Linear => &self.output_linear,
+                    Encode::Srgb => ProgramKey::OutputSrgb,
+                    Encode::Linear => ProgramKey::OutputLinear,
                 },
             };
+            let p = self.program(device, key)?;
 
             device.bind_target(Some(scratch.fbo));
             device.set_viewport(size.0, size.1);
@@ -994,14 +940,14 @@ impl GpuRenderer {
 
     /// Box-average the supersampled frame into `dest`, one destination pixel per quad pixel.
     fn resolve_frame(
-        &self,
+        &mut self,
         device: &mut dyn Device,
         dest: TargetId,
         src: TextureId,
         size: (u32, u32),
         encode: bool,
     ) -> Result<(), GpuError> {
-        let p = &self.resolve;
+        let p = self.program(device, ProgramKey::Resolve)?;
 
         device.bind_target(Some(dest));
         device.set_viewport(size.0, size.1);
@@ -1079,11 +1025,13 @@ impl GpuRenderer {
             .cloned()
             .map(|e| ui_core::effect::on_grid(e, self.scale))
             .collect();
+        let effects_program = self.program(device, ProgramKey::Effects)?;
+        let box_program = self.program(device, ProgramKey::Box)?;
         let tex = crate::effect::run(
             &mut self.effect_scratch[depth],
             device,
-            &self.effects,
-            &self.boxpass,
+            &effects_program,
+            &box_program,
             layer_tex,
             layer_w,
             layer_h,
@@ -1168,14 +1116,14 @@ impl GpuRenderer {
     /// Draw `tex` as one quad with the layer program: a layer composited into its parent, and
     /// the copy that keeps a cached layer's pixels.
     fn draw_layer_quad(
-        &self,
+        &mut self,
         device: &mut dyn Device,
         tex: TextureId,
         viewport: (f32, f32),
         rect: [f32; 4],
         corners: ui_core::geom::Corners,
     ) -> Result<(), GpuError> {
-        let p = &self.layers;
+        let p = self.program(device, ProgramKey::Layers)?;
         device.use_program(p.id);
         if let Some(u) = p.uniforms.viewport {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
@@ -1363,13 +1311,15 @@ impl GpuRenderer {
             .backdrop_read(&entry)
             .intersection(full)
             .unwrap_or(ui_core::geom::Rect::ZERO);
+        let effects_program = self.program(device, ProgramKey::Effects)?;
+        let box_program = self.program(device, ProgramKey::Box)?;
         let filtered = timed!(
             "gpu_blur",
             crate::effect::run(
                 &mut self.backdrop_scratch,
                 device,
-                &self.effects,
-                &self.boxpass,
+                &effects_program,
+                &box_program,
                 src_tex,
                 size.0,
                 size.1,
@@ -1448,7 +1398,7 @@ impl GpuRenderer {
         let w = (region.size.w * scale).round().max(1.0) as u32;
         let h = (region.size.h * scale).round().max(1.0) as u32;
         let (fbo, tex) = timed!("gpu_lens_alloc", self.capture_target(device, w, h))?;
-        let p = &self.capture;
+        let p = self.program(device, ProgramKey::Capture)?;
 
         device.bind_target(Some(fbo));
         device.set_viewport(w, h);
@@ -1521,13 +1471,14 @@ impl GpuRenderer {
             )?),
             _ => None,
         };
-        let p = match (shade, self.encode) {
-            (Shade::Plain, _) => &self.layers,
-            (Shade::Acrylic, Encode::Srgb) => &self.acrylic,
-            (Shade::Acrylic, Encode::Linear) => &self.acrylic_linear,
-            (Shade::Liquid, Encode::Srgb) => &self.glass_kit,
-            (Shade::Liquid, Encode::Linear) => &self.glass_kit_linear,
+        let key = match (shade, self.encode) {
+            (Shade::Plain, _) => ProgramKey::Layers,
+            (Shade::Acrylic, Encode::Srgb) => ProgramKey::Acrylic,
+            (Shade::Acrylic, Encode::Linear) => ProgramKey::AcrylicLinear,
+            (Shade::Liquid, Encode::Srgb) => ProgramKey::GlassKit,
+            (Shade::Liquid, Encode::Linear) => ProgramKey::GlassKitLinear,
         };
+        let p = self.program(device, key)?;
 
         device.bind_target(Some(dst_fbo));
         device.set_viewport(size.0, size.1);
@@ -1651,7 +1602,7 @@ impl GpuRenderer {
                         );
                     }
                 }
-                upload_shapes(device, p, &k.blend, k.blend_count, node, s);
+                upload_shapes(device, &p, &k.blend, k.blend_count, node, s);
             }
         }
         // `a_rect.y` is the top in device space, and the quad runs down from there, so
@@ -1820,13 +1771,13 @@ impl GpuRenderer {
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
-        let p = &self.rects;
+        let p = self.program(device, ProgramKey::Rects)?;
 
         device.use_program(p.id);
         if let Some(u) = p.uniforms.viewport {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
-        set_clip_uniforms(device, p, clip, self.scale);
+        set_clip_uniforms(device, &p, clip, self.scale);
         device.draw_instanced(
             p.id,
             as_bytes(data),
@@ -1845,13 +1796,13 @@ impl GpuRenderer {
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
-        let p = &self.sectors;
+        let p = self.program(device, ProgramKey::Sectors)?;
 
         device.use_program(p.id);
         if let Some(u) = p.uniforms.viewport {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
-        set_clip_uniforms(device, p, clip, self.scale);
+        set_clip_uniforms(device, &p, clip, self.scale);
         device.draw_instanced(
             p.id,
             as_bytes(data),
@@ -1869,13 +1820,13 @@ impl GpuRenderer {
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
-        let p = &self.ellipses;
+        let p = self.program(device, ProgramKey::Ellipses)?;
 
         device.use_program(p.id);
         if let Some(u) = p.uniforms.viewport {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
-        set_clip_uniforms(device, p, clip, self.scale);
+        set_clip_uniforms(device, &p, clip, self.scale);
         device.draw_instanced(
             p.id,
             as_bytes(data),
@@ -1893,13 +1844,13 @@ impl GpuRenderer {
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
-        let p = &self.lines;
+        let p = self.program(device, ProgramKey::Lines)?;
 
         device.use_program(p.id);
         if let Some(u) = p.uniforms.viewport {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
-        set_clip_uniforms(device, p, clip, self.scale);
+        set_clip_uniforms(device, &p, clip, self.scale);
         device.draw_instanced(
             p.id,
             as_bytes(data),
@@ -1920,7 +1871,7 @@ impl GpuRenderer {
         let Some(atlas_tex) = self.atlas_tex else {
             return Ok(());
         };
-        let p = &self.glyphs;
+        let p = self.program(device, ProgramKey::Glyphs)?;
 
         device.use_program(p.id);
         if let Some(u) = p.uniforms.viewport {
@@ -1946,7 +1897,7 @@ impl GpuRenderer {
             device.bind_texture(1, Some(self.color_atlas_tex.unwrap_or(atlas_tex)));
             device.set_uniform_i32(u, 1);
         }
-        set_clip_uniforms(device, p, clip, self.scale);
+        set_clip_uniforms(device, &p, clip, self.scale);
         device.draw_instanced(
             p.id,
             as_bytes(data),
@@ -2374,7 +2325,7 @@ impl GpuRenderer {
         sampling: Option<ui_core::draw::Sampling>,
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
-        let p = &self.images;
+        let p = self.program(device, ProgramKey::Images)?;
 
         device.use_program(p.id);
         if let Some(sampling) = sampling {
@@ -2387,7 +2338,7 @@ impl GpuRenderer {
             device.bind_texture(0, Some(texture));
             device.set_uniform_i32(u, 0);
         }
-        set_clip_uniforms(device, p, clip, self.scale);
+        set_clip_uniforms(device, &p, clip, self.scale);
         device.draw_instanced(
             p.id,
             as_bytes(data),
@@ -2406,13 +2357,13 @@ impl GpuRenderer {
         data: &[f32],
         clip: Option<ui_core::draw::ClipEntry>,
     ) -> Result<(), GpuError> {
-        let p = &self.shadows;
+        let p = self.program(device, ProgramKey::Shadows)?;
 
         device.use_program(p.id);
         if let Some(u) = p.uniforms.viewport {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
-        set_clip_uniforms(device, p, clip, self.scale);
+        set_clip_uniforms(device, &p, clip, self.scale);
         device.draw_instanced(
             p.id,
             as_bytes(data),
@@ -2984,42 +2935,44 @@ fn upload_image(
         // Tables only pay off on a whole texture, and only after the conversion is known
         // to be needed.
         let placement = placement.tabulated();
-        let convert = |texel: &[u8]| {
+        // One buffer for the whole picture: a per-texel allocation costs more than the
+        // conversion of a megapixel frame.
+        let texels = needed / texel_bytes;
+        let mut out: Vec<u8> = Vec::with_capacity(texels * match encode {
+            Encode::Srgb => 4,
+            Encode::Linear => 8,
+        });
+        let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let mut convert = |texel: &[u8]| {
             let [r, g, b, alpha] = placement.texel(texel);
-            let mut out = Vec::with_capacity(4);
             match encode {
-                Encode::Srgb => {
-                    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    out.extend_from_slice(&[
-                        byte(r * alpha),
-                        byte(g * alpha),
-                        byte(b * alpha),
-                        byte(alpha),
-                    ]);
-                }
+                Encode::Srgb => out.extend_from_slice(&[
+                    byte(r * alpha),
+                    byte(g * alpha),
+                    byte(b * alpha),
+                    byte(alpha),
+                ]),
                 Encode::Linear => {
                     for value in [r * alpha, g * alpha, b * alpha, alpha] {
                         out.extend_from_slice(&half_bits(value).to_le_bytes());
                     }
                 }
             }
-            out
         };
         // The packing decides the chunk size, and a storage has one of two.
         match texel_bytes {
-            8 => data[..needed]
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .flat_map(|texel| convert(texel))
-                .collect(),
-            _ => data[..needed]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .flat_map(|texel| convert(texel))
-                .collect(),
+            8 => {
+                for texel in data[..needed].as_chunks::<8>().0 {
+                    convert(texel);
+                }
+            }
+            _ => {
+                for texel in data[..needed].as_chunks::<4>().0 {
+                    convert(texel);
+                }
+            }
         }
+        out
     };
     let format = match encode {
         Encode::Srgb => TextureFormat::Rgba8,

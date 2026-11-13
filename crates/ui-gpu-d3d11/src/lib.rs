@@ -11,4 +11,4 @@
 mod device;
 pub mod shader;
 
-pub use device::D3d11Device;
+pub use device::{D3d11Device, precompile_remaining};

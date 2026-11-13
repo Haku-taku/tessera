@@ -70,7 +70,7 @@ pub struct Win32Presenter {
 }
 
 impl Win32Presenter {
-    /// Build the device, compile every program, and open a swap chain on `window`.
+    /// Build the device and open a swap chain on `window`.
     pub fn new(window: &Win32Window) -> Result<Self, WindowError> {
         let size = window.client_size();
         if size.0 == 0 || size.1 == 0 {
@@ -300,6 +300,11 @@ impl SceneTarget for Win32Presenter {
         unsafe { self.chain.Present(1, DXGI_PRESENT(0)) }
             .ok()
             .map_err(|error| format!("Present: {error}"))?;
+        if self.presented == 0 {
+            // The window is on screen; the programs it did not draw compile from here, so the
+            // one that first draws glass does not wait for it.
+            ui_gpu_d3d11::precompile_remaining();
+        }
         self.presented += 1;
         Ok(PresentStats {
             draw_calls: stats.draw_calls,
