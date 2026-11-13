@@ -23,6 +23,10 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
     DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+    DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+};
 use windows::core::{Interface, s};
 
 use crate::shader;
@@ -441,6 +445,25 @@ impl D3d11Device {
     /// The device itself, for a presenter that has to create its own swap chain.
     pub fn raw_device(&self) -> &ID3D11Device {
         &self.device
+    }
+
+    /// Why DXGI stopped the device, `None` while it is usable.
+    ///
+    /// A removed or reset device fails every later call the same way, so a caller that sees
+    /// a GPU error asks this to tell "this call was refused" from "everything is gone".
+    pub fn removal_reason(&self) -> Option<String> {
+        let code = match unsafe { self.device.GetDeviceRemovedReason() } {
+            Ok(()) => return None,
+            Err(error) => error.code(),
+        };
+        let reason = match code {
+            DXGI_ERROR_DEVICE_HUNG => "the driver stopped responding",
+            DXGI_ERROR_DEVICE_REMOVED => "the adapter was removed",
+            DXGI_ERROR_DEVICE_RESET => "the device was reset",
+            DXGI_ERROR_DRIVER_INTERNAL_ERROR => "the driver failed internally",
+            _ => "the device was removed",
+        };
+        Some(format!("{reason} ({:#x})", code.0))
     }
 
     /// Register a texture the caller owns — a swap chain's back buffer — as a target.

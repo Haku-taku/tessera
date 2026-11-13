@@ -154,6 +154,14 @@ impl Win32Presenter {
         &mut self.renderer
     }
 
+    /// Why the device behind this surface went away, `None` while it still draws.
+    ///
+    /// Every later call on a removed device fails the same way, so a surface that sees a
+    /// GPU error asks this to tell a refused call from a device that has to be rebuilt.
+    pub fn device_loss(&self) -> Option<String> {
+        self.device.removal_reason()
+    }
+
     /// Drain the GPU: every command submitted so far has finished when this returns.
     pub fn finish(&mut self) {
         self.device.finish();

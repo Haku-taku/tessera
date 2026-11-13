@@ -619,8 +619,13 @@ impl Host {
     }
 
     /// One non-blocking pass: step every surface, hand over its copies, serve the clipboard.
+    ///
+    /// A surface that fails is retired and the loop carries on. One lost swap chain must not
+    /// take the tray, the hotkeys and every other window with it — only [`Backend::wait`]
+    /// still ends the process, because with no wait left there is nothing to run.
     fn turn(&mut self) -> Result<(), String> {
         let mut copies = Vec::new();
+        let mut retired = Vec::new();
         self.stats.turns += 1;
         // A job finished between turns: its result is app state, and only a build reads it.
         let completed = self.jobs.completed();
@@ -633,17 +638,31 @@ impl Host {
         // Before anything answers a command: a status reply or a pin placement must not use
         // yesterday's outputs.
         self.outputs = self.backend.outputs();
-        for (_, surface) in &mut self.surfaces {
-            if surface.step()?.drew {
-                self.stats.frames += 1;
+        for (id, surface) in &mut self.surfaces {
+            match surface.step() {
+                Ok(step) => {
+                    if step.drew {
+                        self.stats.frames += 1;
+                    }
+                    copies.extend(surface.take_copies());
+                }
+                Err(reason) => retired.push((*id, reason)),
             }
-            copies.extend(surface.take_copies());
         }
         for copy in copies {
             self.backend.set_clipboard_copy(copy);
         }
-        self.backend.serve_clipboard()?;
-        self.surfaces.retain(|(_, surface)| !surface.is_closed());
+        if let Err(reason) = self.backend.serve_clipboard() {
+            // A clipboard the desktop refused is not the desktop going away; the next turn
+            // serves it again, and `wait` reports a connection that is really gone.
+            eprintln!("[host] the clipboard was not served: {reason}");
+        }
+        for (id, reason) in &retired {
+            eprintln!("[host] surface {id:?} was retired: {reason}");
+        }
+        self.surfaces.retain(|(id, surface)| {
+            !retired.iter().any(|(retired, _)| retired == id) && !surface.is_closed()
+        });
         self.serve_hotkeys();
         self.serve_tray();
         self.serve_channel();

@@ -25,13 +25,14 @@ impl App for Blank {
     }
 }
 
-/// One scripted step: draw, publish a copy, or close.
+/// One scripted step: draw, publish a copy, close, or fail.
 #[derive(Clone)]
 enum Act {
     Idle,
     Draw,
     Copy(&'static str, u32),
     Close,
+    Fail(&'static str),
 }
 
 struct Scripted {
@@ -65,6 +66,7 @@ impl SurfaceHandle for Scripted {
                 serial,
             }),
             Act::Close => self.closed = true,
+            Act::Fail(reason) => return Err(reason.to_string()),
         }
         Ok(SurfaceStep::default())
     }
@@ -271,6 +273,30 @@ fn every_surface_steps_once_per_wait_until_it_closes() {
     assert_eq!(log.borrow().waits.len(), 2, "the last turn closes the loop");
     assert_eq!(log.borrow().flushes, 3, "queued work leaves every turn");
     assert_eq!(log.borrow().served, 3, "the clipboard is served every turn");
+}
+
+/// A surface that cannot draw is dropped on its own, and the rest of the loop keeps running:
+/// one lost swap chain must not take the tray, the hotkeys and every other window with it.
+#[test]
+fn a_failing_surface_is_retired_while_the_others_draw_on() {
+    let (failing, _) = scripted(&[Act::Fail("the device was lost")]);
+    let (survivor, survivor_steps) = scripted(&[Act::Draw, Act::Idle, Act::Close]);
+    let (mut host, log) = host(vec![failing, survivor], usize::MAX);
+    host.open(spec("failing"), Blank, OpenOptions::default())
+        .expect("the surface that fails");
+    host.open(spec("survivor"), Blank, OpenOptions::default())
+        .expect("the surface that keeps drawing");
+
+    host.run_until(None)
+        .expect("a failed surface does not end the loop");
+
+    assert_eq!(survivor_steps.get(), 3, "the survivor kept its own turns");
+    assert_eq!(host.surface_count(), 0, "the failed surface was dropped");
+    assert_eq!(
+        log.borrow().served,
+        3,
+        "the loop turned on past the failure"
+    );
 }
 
 /// A surface opened during a turn draws before the loop blocks again.

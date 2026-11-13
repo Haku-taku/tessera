@@ -19,7 +19,8 @@ use crate::window::Win32Window;
 /// Dropped in declaration order, which is the order teardown needs: the presenter's GPU
 /// objects while the window still exists, then the loop, then the window.
 pub struct Session<A: App> {
-    presenter: Win32Presenter,
+    /// Absent only while a lost device is being replaced; no returned call observes it.
+    presenter: Option<Win32Presenter>,
     driver: Driver,
     lp: AppLoop<A>,
     win: Win32Window,
@@ -27,6 +28,8 @@ pub struct Session<A: App> {
     pointer: Option<Point>,
     /// The app asked for this surface to close.
     closed: bool,
+    /// Supersampling the app asked for, which a rebuilt renderer starts with again.
+    supersample: u32,
 }
 
 impl<A: App> Session<A> {
@@ -41,12 +44,13 @@ impl<A: App> Session<A> {
             .map_err(|error| format!("cannot open a Win32 window: {error}"))?;
         let presenter = Win32Presenter::new(&win).map_err(|error| error.to_string())?;
         Ok(Self {
-            presenter,
+            presenter: Some(presenter),
             driver: Driver::new().uncapped(opts.uncapped),
             lp,
             win,
             pointer: None,
             closed: false,
+            supersample: 1,
         })
     }
 
@@ -72,8 +76,12 @@ impl<A: App> Session<A> {
     }
 
     /// The scene renderer behind the swap chain, for knobs such as supersampling.
-    pub fn renderer_mut(&mut self) -> &mut ui_gpu_scene::GpuRenderer {
-        self.presenter.renderer_mut()
+    ///
+    /// `None` only while a lost device is being replaced, which no call in between can see.
+    pub fn renderer_mut(&mut self) -> Option<&mut ui_gpu_scene::GpuRenderer> {
+        self.presenter
+            .as_mut()
+            .map(|presenter| presenter.renderer_mut())
     }
 
     /// All three at once, for host code that needs the engine and the window together.
@@ -84,7 +92,7 @@ impl<A: App> Session<A> {
         &mut Win32Window,
         Option<&mut Win32Presenter>,
     ) {
-        (&mut self.lp, &mut self.win, Some(&mut self.presenter))
+        (&mut self.lp, &mut self.win, self.presenter.as_mut())
     }
 
     /// The renderer in use, for the app's own report.
@@ -121,17 +129,25 @@ impl<A: App> Session<A> {
 
     /// Frames presented since the last call: the rate the compositor actually took.
     pub fn take_frame_callbacks(&mut self) -> u32 {
-        self.presenter.take_presented()
+        self.presenter
+            .as_mut()
+            .map_or(0, Win32Presenter::take_presented)
     }
 
     /// Write the last composited frame as a PPM.
     pub fn dump_frame_ppm(&mut self, path: &std::path::Path) -> Result<(), String> {
-        self.presenter.dump_frame_ppm(path)
+        let presenter = self
+            .presenter
+            .as_mut()
+            .ok_or("the surface has no presenter to read back from")?;
+        presenter.dump_frame_ppm(path)
     }
 
     /// Drain the GPU; how long this takes is the backlog teardown would otherwise inherit.
     pub fn finish(&mut self) {
-        self.presenter.finish();
+        if let Some(presenter) = &mut self.presenter {
+            presenter.finish();
+        }
     }
 
     /// One non-blocking turn: take the thread's messages, then draw if a frame is due.
@@ -179,6 +195,41 @@ impl<A: App> Session<A> {
     }
 
     fn draw(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
+        let failed = match self.draw_frame(pointer) {
+            Ok(tick) => return Ok(tick),
+            Err(failed) => failed,
+        };
+        // A driver update or a lost adapter takes the device and chain with it; the surface
+        // rebuilds them and draws again rather than closing the window.
+        let Some(reason) = self
+            .presenter
+            .as_ref()
+            .and_then(Win32Presenter::device_loss)
+        else {
+            return Err(failed);
+        };
+        self.rebuild_presenter(&reason)?;
+        self.draw_frame(pointer)
+            .map_err(|error| format!("{failed}; rebuilt the device ({reason}): {error}"))
+    }
+
+    /// Replace the device and swap chain with a fresh stack.
+    ///
+    /// Two things ask for it: a device DXGI no longer answers for, and a display change that
+    /// can leave the chain in a colour space its new output does not present.
+    fn rebuild_presenter(&mut self, reason: &str) -> Result<(), String> {
+        // A window holds one flip chain at a time, so the old stack goes before the new one
+        // is built; this is the only moment the surface has no presenter.
+        self.presenter = None;
+        let mut presenter = Win32Presenter::new(&self.win).map_err(|error| {
+            format!("the presenter could not be rebuilt after {reason}: {error}")
+        })?;
+        presenter.renderer_mut().set_supersample(self.supersample);
+        self.presenter = Some(presenter);
+        Ok(())
+    }
+
+    fn draw_frame(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
         // A scripted pointer wins over the window's, which the driver just read.
         let pointer = self.pointer.take().or(pointer);
         let size = self.win.client_size();
@@ -186,13 +237,20 @@ impl<A: App> Session<A> {
             // Minimized: there is no client area to draw into, and the turn ends in a wait.
             return Ok(Tick::default());
         }
-        self.presenter
+        if self.win.take_display_change() {
+            self.rebuild_presenter("the display changed")?;
+        }
+        let presenter = self
+            .presenter
+            .as_mut()
+            .ok_or("the surface has no presenter")?;
+        presenter
             .resize(size, self.win.scale())
             .map_err(|error| error.to_string())?;
         let framed = {
             let mut target = Target {
                 win: &mut self.win,
-                presenter: &mut self.presenter,
+                presenter,
             };
             self.lp.frame_scene(&mut target, pointer)?
         };
@@ -288,7 +346,10 @@ impl<A: App> HostSession<A> for Session<A> {
     }
 
     fn set_supersample(&mut self, factor: u32) {
-        self.presenter.renderer_mut().set_supersample(factor);
+        self.supersample = factor;
+        if let Some(presenter) = &mut self.presenter {
+            presenter.renderer_mut().set_supersample(factor);
+        }
     }
 
     fn frame_callbacks(&mut self) -> u32 {

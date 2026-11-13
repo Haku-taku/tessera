@@ -43,8 +43,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PeekMessageW, QS_ALLINPUT, RegisterClassExW, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
+    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -82,6 +83,8 @@ struct WindowState {
     tracking_leave: bool,
     /// Focus, extent or scale changed without an `Event`; a frame is still owed.
     silent_change: bool,
+    /// The display mode or topology changed: what the output presents has to be re-read.
+    display_changed: bool,
     /// Physical pixels per logical unit, in whole DPI.
     dpi: u32,
     /// The system light/dark preference changed since the last poll.
@@ -369,6 +372,11 @@ impl Win32Window {
     /// Whether focus, extent or scale changed without an `Event`.
     pub fn take_silent_change(&mut self) -> bool {
         std::mem::take(&mut self.state.borrow_mut().silent_change)
+    }
+
+    /// Whether the display's mode or topology changed since the last call.
+    pub fn take_display_change(&mut self) -> bool {
+        std::mem::take(&mut self.state.borrow_mut().display_changed)
     }
 
     /// Whether the system light/dark preference changed since the last call.
@@ -780,6 +788,15 @@ unsafe fn handle(
         WM_SIZE => {
             state.borrow_mut().silent_change = true;
             None
+        }
+        WM_DISPLAYCHANGE => {
+            // Resolution, a monitor's connection or its HDR state: the swap chain's format
+            // and colour space were decided from the output this window was on, so the frame
+            // that follows has to decide them again.
+            let mut window = state.borrow_mut();
+            window.display_changed = true;
+            window.silent_change = true;
+            Some(LRESULT(0))
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
             state.borrow_mut().silent_change = true;
