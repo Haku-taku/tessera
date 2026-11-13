@@ -128,6 +128,11 @@ impl Backend for WaylandBackend {
         for image in options.images {
             lp.register_image(image);
         }
+        for face in options.fonts {
+            if !lp.register_font(&face.name, face.data) {
+                return Err(format!("the font {} could not be registered", face.name));
+            }
+        }
         for (chord, id) in options.shortcuts {
             lp.bind_shortcut(chord, id);
         }

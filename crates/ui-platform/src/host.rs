@@ -68,6 +68,15 @@ pub trait SurfaceHandle {
     fn take_copies(&mut self) -> Vec<ClipboardCopy>;
 }
 
+/// One font the surface draws with: bytes under the family name that resolves to them.
+///
+/// The engine ships no font, and an icon face a control names by family is usually not
+/// installed on the machine either, so whoever distributes the app supplies the bytes.
+pub struct FontFace {
+    pub name: String,
+    pub data: Arc<[u8]>,
+}
+
 /// What to bring up with a surface.
 #[derive(Default)]
 pub struct OpenOptions {
@@ -79,6 +88,9 @@ pub struct OpenOptions {
     /// frame: a key the surface exists for (an overlay's Escape) is not known to the app's
     /// build, which has no way to register one.
     pub shortcuts: Vec<(KeyChord, ShortcutId)>,
+    /// Families registered before the first frame, so a build that draws an icon by name
+    /// finds its glyph.
+    pub fonts: Vec<FontFace>,
 }
 
 /// What an application message may ask of the loop.
