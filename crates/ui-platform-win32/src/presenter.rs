@@ -11,14 +11,19 @@ use ui_platform::present::{CanvasFrame, PresentStats, SceneTarget};
 use ui_platform::text_pass::TextPass;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_UNSPECIFIED, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT,
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_ALPHA_MODE_UNSPECIFIED,
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH,
     DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1, IDXGISwapChain3,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1,
+    IDXGISwapChain3,
 };
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::core::Interface as _;
@@ -44,6 +49,8 @@ pub struct Win32Presenter {
     format: DXGI_FORMAT,
     /// Set when the chain carries PQ in BT.2020 rather than an 8-bit SDR surface.
     hdr: Option<HdrOutput>,
+    /// Held for the life of the surface: composed frames stop showing when it drops.
+    _composition: Option<Composition>,
     /// The back buffer as a target; released before the chain resizes.
     buffer: TargetId,
     /// The persistent target the painter draws into.
@@ -73,17 +80,23 @@ impl Win32Presenter {
             .map_err(|error| WindowError::Gpu(format!("D3D11 device: {error}")))?;
         let mut renderer = GpuRenderer::new(&mut device)
             .map_err(|error| WindowError::Gpu(format!("renderer: {error}")))?;
-        let (chain, format, hdr) = open_chain(device.raw_device(), window.hwnd(), size)?;
+        let opened = open_chain(
+            device.raw_device(),
+            window.visual_hwnd(),
+            size,
+            window.composited(),
+        )?;
         // Before the frame target exists: its format follows the destination.
-        if let Some(output) = hdr {
+        if let Some(output) = opened.hdr {
             aim_at_hdr(&mut renderer, output);
         }
         let mut this = Self {
             device,
             renderer,
-            chain,
-            format,
-            hdr,
+            chain: opened.chain,
+            format: opened.format,
+            hdr: opened.hdr,
+            _composition: opened.composition,
             buffer: TargetId(0),
             frame: TargetId(0),
             size,
@@ -304,6 +317,24 @@ impl RenderTarget for Frame {
     }
 }
 
+/// A window's chain, and the compositor when the surface's alpha is meant to be seen.
+struct Chain {
+    chain: IDXGISwapChain1,
+    format: DXGI_FORMAT,
+    hdr: Option<HdrOutput>,
+    composition: Option<Composition>,
+}
+
+/// The DirectComposition stack a transparent surface presents through.
+///
+/// An HWND swap chain is shown opaque: whatever the frame leaves transparent is black on the
+/// desktop. A layer has to be composed with `DXGI_ALPHA_MODE_PREMULTIPLIED` instead, which
+/// DXGI only offers off a window of its own, hence the visual holding the chain.
+struct Composition {
+    _device: IDCompositionDevice,
+    _target: IDCompositionTarget,
+}
+
 /// The chain the window presents through, plus the HDR it declares.
 ///
 /// Only one chain exists at a time: the format is decided from the output before a chain is
@@ -312,21 +343,32 @@ fn open_chain(
     device: &ID3D11Device,
     hwnd: HWND,
     size: (u32, u32),
-) -> Result<(IDXGISwapChain1, DXGI_FORMAT, Option<HdrOutput>), WindowError> {
+    composited: bool,
+) -> Result<Chain, WindowError> {
     let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
         .map_err(|error| WindowError::Gpu(format!("CreateDXGIFactory2: {error}")))?;
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     if let Some(output) = crate::outputs::hdr_output(&factory, monitor) {
         let format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        let chain = create_chain(&factory, device, hwnd, size, format)?;
+        let (chain, composition) = create_chain(&factory, device, hwnd, size, format, composited)?;
         if declare_hdr(&chain) {
-            return Ok((chain, format, Some(output)));
+            return Ok(Chain {
+                chain,
+                format,
+                hdr: Some(output),
+                composition,
+            });
         }
         drop(chain);
     }
     let format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    let chain = create_chain(&factory, device, hwnd, size, format)?;
-    Ok((chain, format, None))
+    let (chain, composition) = create_chain(&factory, device, hwnd, size, format, composited)?;
+    Ok(Chain {
+        chain,
+        format,
+        hdr: None,
+        composition,
+    })
 }
 
 /// Declare the chain PQ in BT.2020; false when the output will not present that.
@@ -360,14 +402,15 @@ fn aim_at_hdr(renderer: &mut GpuRenderer, output: HdrOutput) {
     ));
 }
 
-/// A flip-model chain at `format`.
+/// A flip-model chain at `format`, composed when the surface's alpha is meant to be seen.
 fn create_chain(
     factory: &IDXGIFactory2,
     device: &ID3D11Device,
     hwnd: HWND,
     size: (u32, u32),
     format: DXGI_FORMAT,
-) -> Result<IDXGISwapChain1, WindowError> {
+    composited: bool,
+) -> Result<(IDXGISwapChain1, Option<Composition>), WindowError> {
     let descriptor = DXGI_SWAP_CHAIN_DESC1 {
         Width: size.0,
         Height: size.1,
@@ -381,13 +424,55 @@ fn create_chain(
         BufferCount: BUFFERS,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
+        AlphaMode: if composited {
+            DXGI_ALPHA_MODE_PREMULTIPLIED
+        } else {
+            DXGI_ALPHA_MODE_UNSPECIFIED
+        },
         Flags: 0,
     };
+    if composited {
+        let chain = unsafe {
+            factory.CreateSwapChainForComposition(device, &descriptor, None::<&IDXGIOutput>)
+        }
+        .map_err(|error| WindowError::Gpu(format!("CreateSwapChainForComposition: {error}")))?;
+        let composition = compose(device, hwnd, &chain)?;
+        return Ok((chain, Some(composition)));
+    }
     let chain =
         unsafe { factory.CreateSwapChainForHwnd(device, hwnd, &descriptor, None, None::<&IDXGIOutput>) }
             .map_err(|error| WindowError::Gpu(format!("CreateSwapChainForHwnd: {error}")))?;
-    Ok(chain)
+    Ok((chain, None))
+}
+
+/// Put `chain` on screen through a composition visual rooted in `hwnd`.
+///
+/// The window keeps its place in the stacking order and its messages; only the pixels come
+/// from the visual, which is why the window is created without a redirection surface.
+fn compose(
+    device: &ID3D11Device,
+    hwnd: HWND,
+    chain: &IDXGISwapChain1,
+) -> Result<Composition, WindowError> {
+    let dxgi: IDXGIDevice = device
+        .cast()
+        .map_err(|error| WindowError::Gpu(format!("IDXGIDevice: {error}")))?;
+    let composer: IDCompositionDevice = unsafe { DCompositionCreateDevice(&dxgi) }
+        .map_err(|error| WindowError::Gpu(format!("DCompositionCreateDevice: {error}")))?;
+    let visual: IDCompositionVisual = unsafe { composer.CreateVisual() }
+        .map_err(|error| WindowError::Gpu(format!("CreateVisual: {error}")))?;
+    let target = unsafe { composer.CreateTargetForHwnd(hwnd, true) }
+        .map_err(|error| WindowError::Gpu(format!("CreateTargetForHwnd: {error}")))?;
+    unsafe { visual.SetContent(chain) }
+        .map_err(|error| WindowError::Gpu(format!("SetContent: {error}")))?;
+    unsafe { target.SetRoot(&visual) }
+        .map_err(|error| WindowError::Gpu(format!("SetRoot: {error}")))?;
+    unsafe { composer.Commit() }
+        .map_err(|error| WindowError::Gpu(format!("Commit: {error}")))?;
+    Ok(Composition {
+        _device: composer,
+        _target: target,
+    })
 }
 
 /// Write a PPM: the one image format a probe can read back without a decoder.

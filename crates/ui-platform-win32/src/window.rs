@@ -15,9 +15,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
-    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, HBRUSH,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
-    MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT, ScreenToClient,
+    CombineRgn, CreateRectRgn, DEVMODEW, DeleteObject, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
+    GetMonitorInfoW, HBRUSH, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, MonitorFromRect,
+    MonitorFromWindow, PAINTSTRUCT, RGN_OR, ScreenToClient, SetWindowRgn,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -27,21 +28,26 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
+use windows::Win32::UI::Shell::{
+    ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE,
+    APPBARDATA, SHAppBarMessage,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT,
-    IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
-    IDC_SIZENWSE, IDC_SIZEWE, IsWindow, LoadCursorW, MA_ACTIVATE, MA_NOACTIVATE, MSG,
-    MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
-    QS_ALLINPUT, RegisterClassExW, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SetCursor, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
+    HTCLIENT, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IsWindow, LoadCursorW, MA_ACTIVATE,
+    MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE,
+    PeekMessageW, QS_ALLINPUT, RegisterClassExW, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -51,6 +57,13 @@ use crate::{WindowError, input};
 /// `WM_MOUSELEAVE` lives with the common controls, whose whole API surface is not worth a
 /// feature flag for one constant.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// The strip an auto-hidden taskbar needs left free, in physical pixels.
+///
+/// The shell will not reveal a hidden taskbar while a window covers the monitor edge it hides
+/// against, so every toolkit that fills the screen — Chromium, Windows Terminal — keeps this
+/// much of that edge for the desktop.
+const AUTO_HIDE_STRIP: i32 = 2;
 
 /// What the window procedure has collected since the loop last looked.
 ///
@@ -83,14 +96,24 @@ struct WindowState {
     /// The areas the last frame's tree consumes, surface-local logical units; `None` until a
     /// frame publishes one, which leaves the whole surface consuming input.
     input: Option<Vec<Rect>>,
+    /// The window that held the foreground when the pointer arrived on a consumed area.
+    previous: Option<HWND>,
 }
 
 /// A window the window manager places, decorates and stacks.
 ///
 /// Dropping it destroys the window, so a presenter that draws into it must be dropped first.
 pub struct Win32Window {
+    /// The window that takes messages: focus, the input shape, the IME and the clipboard.
     hwnd: HWND,
+    /// The window the swap chain presents through. A layer draws in a second window, held
+    /// above this one and skipped by every hit test, so that what is painted and what is
+    /// clicked can be shaped differently.
+    visual: HWND,
     state: Rc<RefCell<WindowState>>,
+    /// The surface reaches the desktop through a compositor, so the frame's own alpha
+    /// decides what is seen: a layer, not a decorated window.
+    composited: bool,
 }
 
 impl Win32Window {
@@ -150,6 +173,35 @@ impl Win32Window {
                 return Err(WindowError::Win32(format!("CreateWindowExW: {error}")));
             }
         };
+        // A layer's pixels are a second window: owned, so it stays above and dies with this
+        // one, and styled to be invisible to the hit test, which this window answers.
+        let visual = if opening.keyboard.is_some() {
+            unsafe {
+                CreateWindowExW(
+                    opening.ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                    PCWSTR::from_raw(class.as_ptr()),
+                    PCWSTR::from_raw(title.as_ptr()),
+                    WS_POPUP,
+                    opening.x,
+                    opening.y,
+                    opening.width,
+                    opening.height,
+                    Some(hwnd),
+                    None,
+                    Some(instance),
+                    None,
+                )
+            }
+        } else {
+            Ok(hwnd)
+        };
+        let visual = match visual {
+            Ok(visual) => visual,
+            Err(error) => {
+                let _ = unsafe { DestroyWindow(hwnd) };
+                return Err(WindowError::Win32(format!("CreateWindowExW: {error}")));
+            }
+        };
         // The return value says whether the window was previously visible, which is not
         // an outcome this backend has a use for.
         unsafe {
@@ -161,18 +213,36 @@ impl Win32Window {
                 SW_SHOW
             };
             let _ = ShowWindow(hwnd, command);
+            if visual != hwnd {
+                let _ = ShowWindow(visual, SW_SHOWNOACTIVATE);
+            }
             if opening.keyboard == Some(KeyboardMode::Exclusive) {
                 // A hotkey press is what usually makes this succeed; the shell may refuse,
                 // and the click still activates the surface through `WM_MOUSEACTIVATE`.
                 let _ = SetForegroundWindow(hwnd);
             }
         }
-        Ok(Self { hwnd, state })
+        Ok(Self {
+            hwnd,
+            visual,
+            state,
+            composited: opening.composited,
+        })
     }
 
     /// The window handle a swap chain presents through.
     pub fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    /// The window the frame is composed into.
+    pub fn visual_hwnd(&self) -> HWND {
+        self.visual
+    }
+
+    /// Whether the frame is composed over the desktop rather than shown opaque.
+    pub fn composited(&self) -> bool {
+        self.composited
     }
 
     /// Whether the window still exists; closing it destroys it and ends the loop.
@@ -356,6 +426,9 @@ impl Win32Window {
             return;
         }
         state.input = Some(areas.to_vec());
+        let scale = state.dpi.max(96) as f32 / 96.0;
+        drop(state);
+        shape(self.hwnd, areas, scale);
     }
 
     /// Apply this frame's input-method state: open or close the context, and keep the IME's
@@ -426,6 +499,8 @@ struct Opening {
     dpi: u32,
     /// A layer's keyboard request; `None` for a window the manager places.
     keyboard: Option<KeyboardMode>,
+    /// Whether the desktop should see through the frame where it is transparent.
+    composited: bool,
 }
 
 /// An overlapped window at the manager's default position, sized for `size` logical pixels.
@@ -457,6 +532,7 @@ fn opening_window(size: (u32, u32)) -> Result<Opening, WindowError> {
         ex_style: WINDOW_EX_STYLE(0),
         dpi,
         keyboard: None,
+        composited: false,
     })
 }
 
@@ -481,7 +557,7 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
         .map_err(|error| WindowError::Win32(format!("GetDpiForMonitor: {error}")))?;
     let scale = dpi_x.max(96) as f32 / 96.0;
     let rect = info.rcMonitor;
-    let (x, width) = Span {
+    let (mut x, mut width) = Span {
         start: rect.left,
         end: rect.right,
         near: layer.anchor.left,
@@ -490,7 +566,7 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
         far_margin: layer.margin.right,
     }
     .place(layer.size.map(|size| size.0), scale);
-    let (y, height) = Span {
+    let (mut y, mut height) = Span {
         start: rect.top,
         end: rect.bottom,
         near: layer.anchor.top,
@@ -499,6 +575,29 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
         far_margin: layer.margin.bottom,
     }
     .place(layer.size.map(|size| size.1), scale);
+    // A surface that reaches the edge an auto-hidden taskbar hides against leaves that strip
+    // to the desktop: covering it is what makes the taskbar unreachable by the mouse.
+    if let Some(edge) = auto_hide_edge(monitor) {
+        match edge {
+            ABE_TOP if y <= rect.top => {
+                let strip = AUTO_HIDE_STRIP.min(height - 1);
+                y += strip;
+                height -= strip;
+            }
+            ABE_BOTTOM if y + height >= rect.bottom => {
+                height -= AUTO_HIDE_STRIP.min(height - 1);
+            }
+            ABE_LEFT if x <= rect.left => {
+                let strip = AUTO_HIDE_STRIP.min(width - 1);
+                x += strip;
+                width -= strip;
+            }
+            ABE_RIGHT if x + width >= rect.right => {
+                width -= AUTO_HIDE_STRIP.min(width - 1);
+            }
+            _ => {}
+        }
+    }
     let mut ex_style = WS_EX_TOOLWINDOW;
     // Only the upper layers have a topmost counterpart. A lower one degrades to an ordinary
     // window: Win32 has no supported way to sit beneath other applications' windows.
@@ -508,6 +607,9 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
     if layer.keyboard == KeyboardMode::None {
         ex_style |= WS_EX_NOACTIVATE;
     }
+    // A composition swap chain needs a window the shell does not draw into, or the redirection
+    // surface stays black behind the frame.
+    ex_style |= WS_EX_NOREDIRECTIONBITMAP;
     Ok(Opening {
         x,
         y,
@@ -517,7 +619,28 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
         ex_style,
         dpi: dpi_x.max(96),
         keyboard: Some(layer.keyboard),
+        composited: true,
     })
+}
+
+/// The monitor edge an auto-hidden taskbar hides against, when it hides on `monitor`.
+fn auto_hide_edge(monitor: HMONITOR) -> Option<u32> {
+    let mut state = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        ..APPBARDATA::default()
+    };
+    // SAFETY: both calls fill a struct this function owns, sized as the shell requires.
+    if unsafe { SHAppBarMessage(ABM_GETSTATE, &mut state) } as u32 & ABS_AUTOHIDE == 0 {
+        return None;
+    }
+    let mut position = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        ..APPBARDATA::default()
+    };
+    unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut position) };
+    // Only the monitor the taskbar hides on needs an edge kept reachable.
+    (unsafe { MonitorFromRect(&position.rc, MONITOR_DEFAULTTONULL) } == monitor)
+        .then_some(position.uEdge)
 }
 
 /// One axis of the monitor's rectangle, with what the spec asks of it on that axis.
@@ -661,10 +784,15 @@ unsafe fn handle(
             window.dpi = ((wparam.0 as u32) >> 16).max(96);
             window.silent_change = true;
             let layer = window.keyboard.is_some();
+            let scale = window.dpi as f32 / 96.0;
+            let areas = window.input.clone();
             drop(window);
             if layer {
-                // A layer's rectangle comes from its spec, and the manager's suggested one
-                // would move it off that placement.
+                // The areas are logical, so a new scale is a new shape; the rectangle itself
+                // comes from the spec, and the manager's suggested one would move it off.
+                if let Some(areas) = areas {
+                    shape(hwnd, &areas, scale);
+                }
                 return Some(LRESULT(0));
             }
             // The suggested rectangle keeps the client area the same logical size.
@@ -683,30 +811,20 @@ unsafe fn handle(
             Some(LRESULT(0))
         }
         WM_NCHITTEST => {
-            // Only a layer answers; a window the manager placed keeps the default hit test.
+            // A layer's window is shaped to what it consumes, so a hit test that arrives here
+            // is one the surface wants; the default answer is what the shape leaves.
             state.borrow().keyboard?;
-            let consumed = consumes_at(state, hwnd, packed_point(lparam));
-            Some(LRESULT(if consumed {
-                HTCLIENT as isize
-            } else {
-                HTTRANSPARENT as isize
-            }))
+            Some(LRESULT(HTCLIENT as isize))
         }
         WM_MOUSEACTIVATE => {
-            let keyboard = state.borrow().keyboard;
-            let command = match keyboard {
+            let command = match state.borrow().keyboard {
                 // A window the manager places activates the ordinary way.
                 None => return None,
                 Some(KeyboardMode::None) => MA_NOACTIVATE,
-                Some(KeyboardMode::Exclusive) => MA_ACTIVATE,
                 // Windows has no focus-follows-pointer contract, so `FollowPointer` is the
                 // same rule as `OnDemand`: a click on a consumed area focuses the surface.
-                Some(KeyboardMode::OnDemand | KeyboardMode::FollowPointer) => {
-                    let mut point = POINT::default();
-                    // The cursor is where the click landed; the message carries no position.
-                    let inside = unsafe { GetCursorPos(&mut point) }.is_ok()
-                        && consumes_at(state, hwnd, point);
-                    if inside { MA_ACTIVATE } else { MA_NOACTIVATE }
+                Some(KeyboardMode::Exclusive | KeyboardMode::OnDemand | KeyboardMode::FollowPointer) => {
+                    MA_ACTIVATE
                 }
             };
             Some(LRESULT(command as isize))
@@ -718,7 +836,11 @@ unsafe fn handle(
             window.events.push(Event::PointerMoved { pos });
             let arm = !window.tracking_leave;
             window.tracking_leave = true;
+            let following = window.keyboard == Some(KeyboardMode::FollowPointer);
             drop(window);
+            if following {
+                remember_foreground(state, hwnd);
+            }
             if arm {
                 let mut track = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -736,6 +858,8 @@ unsafe fn handle(
             window.pointer = None;
             window.tracking_leave = false;
             window.events.push(Event::PointerLeft);
+            drop(window);
+            hand_back_keyboard(state, hwnd);
             Some(LRESULT(0))
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
@@ -762,8 +886,17 @@ unsafe fn handle(
         }
         WM_MOUSEWHEEL => {
             let notches = ((wparam.0 as u32) >> 16) as u16 as i16 as f32 / 120.0;
-            let pointer = state.borrow().pointer;
-            let pos = pointer.unwrap_or_else(|| logical(state, lparam));
+            // Unlike the button messages this one names a screen position, and a window that
+            // let the pointer through never saw a move to fall back on.
+            let mut point = packed_point(lparam);
+            let pos = if unsafe { ScreenToClient(hwnd, &mut point) }.as_bool() {
+                logical_point(state, point)
+            } else {
+                match state.borrow().pointer {
+                    Some(pointer) => pointer,
+                    None => return Some(LRESULT(0)),
+                }
+            };
             // A positive delta is a notch away from the user, which scrolls content up.
             state
                 .borrow_mut()
@@ -884,26 +1017,78 @@ fn packed_point(lparam: LPARAM) -> POINT {
 
 /// A message's client position in logical units.
 fn logical(state: &RefCell<WindowState>, lparam: LPARAM) -> Point {
-    let point = packed_point(lparam);
+    logical_point(state, packed_point(lparam))
+}
+
+/// A client position in logical units.
+fn logical_point(state: &RefCell<WindowState>, point: POINT) -> Point {
     let scale = state.borrow().dpi.max(96) as f32 / 96.0;
     Point::new(point.x as f32 / scale, point.y as f32 / scale)
 }
 
-/// Whether a screen position lands on an area the last frame's tree consumes.
-fn consumes_at(state: &RefCell<WindowState>, hwnd: HWND, mut point: POINT) -> bool {
-    let window = state.borrow();
-    let Some(areas) = window.input.as_ref() else {
-        // Nothing published yet: the whole surface is the engine's, which is the default.
-        return true;
-    };
-    // A refused conversion leaves the point in screen coordinates; the whole surface is the
-    // better answer for a window that no longer maps where the message says.
-    if !unsafe { ScreenToClient(hwnd, &mut point) }.as_bool() {
-        return true;
+/// Give the window the shape of the areas it consumes, in window coordinates.
+///
+/// The system owns the region once the call succeeds; a refused one is still ours to free.
+fn shape(hwnd: HWND, areas: &[Rect], scale: f32) {
+    let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
+    if region.0.is_null() {
+        return;
     }
-    let scale = window.dpi.max(96) as f32 / 96.0;
-    let pos = Point::new(point.x as f32 / scale, point.y as f32 / scale);
-    areas.iter().any(|area| area.contains(pos))
+    for area in areas {
+        let from = |value: f32, round: fn(f32) -> f32| round(value * scale) as i32;
+        let (left, top) = (from(area.origin.x, f32::floor), from(area.origin.y, f32::floor));
+        let right = from(area.origin.x + area.size.w, f32::ceil).max(left + 1);
+        let bottom = from(area.origin.y + area.size.h, f32::ceil).max(top + 1);
+        let piece = unsafe { CreateRectRgn(left, top, right, bottom) };
+        if piece.0.is_null() {
+            continue;
+        }
+        unsafe {
+            CombineRgn(Some(region), Some(region), Some(piece), RGN_OR);
+            let _ = DeleteObject(HGDIOBJ(piece.0));
+        }
+    }
+    if unsafe { SetWindowRgn(hwnd, Some(region), false) } == 0 {
+        let _ = unsafe { DeleteObject(HGDIOBJ(region.0)) };
+    }
+}
+
+/// Give the keyboard back to whichever window had it before a click took it.
+///
+/// The shell only lets a process move the foreground while it holds it, which is why this
+/// happens at the moment the pointer leaves and only from that state.
+fn hand_back_keyboard(state: &RefCell<WindowState>, hwnd: HWND) {
+    let previous = {
+        let mut window = state.borrow_mut();
+        if window.keyboard != Some(KeyboardMode::FollowPointer) {
+            return;
+        }
+        window.previous.take()
+    };
+    let Some(previous) = previous else {
+        return;
+    };
+    // A click elsewhere already moved the foreground; there is nothing left to hand back.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground != hwnd || !unsafe { IsWindow(Some(previous)) }.as_bool() {
+        return;
+    }
+    unsafe {
+        let _ = SetForegroundWindow(previous);
+    }
+}
+
+/// Note which window holds the keyboard as the pointer arrives on what this surface consumes.
+///
+/// It has to be taken on movement rather than on the click: by the time `WM_MOUSEACTIVATE`
+/// runs, the activation has already cleared the foreground, and `GetForegroundWindow` answers
+/// null — the window to hand back to would be lost.
+fn remember_foreground(state: &RefCell<WindowState>, hwnd: HWND) {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_invalid() || foreground == hwnd {
+        return;
+    }
+    state.borrow_mut().previous = Some(foreground);
 }
 
 fn button(message: u32) -> ui_core::PointerButton {

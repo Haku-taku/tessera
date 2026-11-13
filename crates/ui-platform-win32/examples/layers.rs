@@ -1,10 +1,10 @@
 //! What a layer surface becomes on Win32: a popup on the primary monitor, placed by the
-//! spec's rectangle, held at the spec's level, and transparent outside its input region.
+//! spec's rectangle, held at the spec's level, and shaped to its input region.
 //!
 //! Run: `cargo run -p ui-platform-win32 --example layers`
 //!
 //! `WindowFromPoint` is the hit test the desktop itself performs, so the click-through check
-//! goes through the same `WM_NCHITTEST` a moving cursor would.
+//! goes through the same routing a moving cursor would.
 
 #[cfg(windows)]
 fn main() {
@@ -19,6 +19,33 @@ fn main() {
     eprintln!("the Win32 backend is Windows only");
 }
 
+/// The strip an auto-hidden taskbar keeps for itself, in physical pixels.
+#[cfg(windows)]
+const AUTO_HIDE_STRIP: i32 = 2;
+
+/// The monitor edge an auto-hidden taskbar hides against, when it hides on `monitor`.
+#[cfg(windows)]
+fn taskbar_edge(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> Option<u32> {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
+    use windows::Win32::UI::Shell::{
+        ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage,
+    };
+    let mut state = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        ..APPBARDATA::default()
+    };
+    if unsafe { SHAppBarMessage(ABM_GETSTATE, &mut state) } as u32 & ABS_AUTOHIDE == 0 {
+        return None;
+    }
+    let mut position = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        ..APPBARDATA::default()
+    };
+    unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut position) };
+    (unsafe { MonitorFromRect(&position.rc, MONITOR_DEFAULTTONULL) } == monitor)
+        .then_some(position.uEdge)
+}
+
 #[cfg(windows)]
 fn windows_main() -> Result<(), String> {
     use ui_core::geom::{Insets, Rect};
@@ -29,10 +56,15 @@ fn windows_main() -> Result<(), String> {
         GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
     };
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    use windows::Win32::UI::Shell::{ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, mouse_event,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, MA_ACTIVATE, MA_NOACTIVATE, SWP_NOACTIVATE,
-        SWP_NOZORDER, SendMessageW, SetWindowPos, WM_MOUSEACTIVATE, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WindowFromPoint,
+        GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, MA_ACTIVATE,
+        MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursorPos, SetWindowPos,
+        WM_MOUSEACTIVATE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT, WindowFromPoint,
     };
 
     let expect = |pattern: &str, found: bool| {
@@ -43,7 +75,7 @@ fn windows_main() -> Result<(), String> {
 
     // A window the manager places, opened first: it is what makes the process per-monitor
     // DPI aware before the monitor is read, and it gives click-through somewhere to land.
-    let window = Win32Window::new(SurfaceSpec::window(
+    let mut window = Win32Window::new(SurfaceSpec::window(
         "crabsnap-win32-layers",
         "crabsnap — layers probe",
         (360, 240),
@@ -139,6 +171,12 @@ fn windows_main() -> Result<(), String> {
         "the rest of the layer is click-through",
         outside == window.hwnd(),
     );
+    let visual = unsafe { GetWindowLongPtrW(toolbar.visual_hwnd(), GWL_EXSTYLE) } as u32;
+    let transparent = WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0;
+    ok &= expect(
+        "the painted window is the one the hit test passes over",
+        toolbar.visual_hwnd() != hwnd && visual & transparent == transparent,
+    );
 
     let activation = unsafe {
         SendMessageW(
@@ -152,6 +190,24 @@ fn windows_main() -> Result<(), String> {
         "a keyboard None click does not activate",
         activation.0 == MA_NOACTIVATE as isize,
     );
+
+    // The pointer's visit: the shape decides where it is heard, and the leave a shaped
+    // window cannot report has to come from the backend's own watch.
+    let cursor = |x: f32, y: f32| {
+        let point = screen(x, y);
+        unsafe { SetCursorPos(point.x, point.y) }
+            .map_err(|error| format!("SetCursorPos: {error}"))
+    };
+    cursor(60.0, 30.0)?;
+    let moved = drain(&mut toolbar, 300)
+        .iter()
+        .any(|event| matches!(event, ui_core::Event::PointerMoved { .. }));
+    ok &= expect("a move inside the shape reaches the surface", moved);
+    cursor(250.0, 150.0)?;
+    let left = drain(&mut toolbar, 400)
+        .iter()
+        .any(|event| matches!(event, ui_core::Event::PointerLeft));
+    ok &= expect("leaving the shape is reported as a leave", left);
 
     // A window the manager places keeps its decoration and its ordinary stacking.
     let ex_style = unsafe { GetWindowLongPtrW(window.hwnd(), GWL_EXSTYLE) } as u32;
@@ -186,12 +242,21 @@ fn windows_main() -> Result<(), String> {
     let mut overlay = RECT::default();
     unsafe { GetWindowRect(exclusive.hwnd(), &mut overlay) }
         .map_err(|error| format!("GetWindowRect: {error}"))?;
+    // The shell hides an auto-hidden taskbar behind a strip of the monitor edge and will not
+    // reveal it again while a window covers that strip, so a surface that fills the monitor
+    // has to leave exactly that much to the desktop.
+    let (mut left, mut top) = (monitor_rect.left, monitor_rect.top);
+    let (mut right, mut bottom) = (monitor_rect.right, monitor_rect.bottom);
+    match taskbar_edge(monitor) {
+        Some(ABE_TOP) => top += AUTO_HIDE_STRIP,
+        Some(ABE_BOTTOM) => bottom -= AUTO_HIDE_STRIP,
+        Some(ABE_LEFT) => left += AUTO_HIDE_STRIP,
+        Some(ABE_RIGHT) => right -= AUTO_HIDE_STRIP,
+        _ => {}
+    }
     ok &= expect(
-        "an all-edge anchor takes the whole monitor",
-        overlay.left == monitor_rect.left
-            && overlay.top == monitor_rect.top
-            && overlay.right == monitor_rect.right
-            && overlay.bottom == monitor_rect.bottom,
+        "an all-edge anchor takes the monitor, less the auto-hide strip",
+        (overlay.left, overlay.top, overlay.right, overlay.bottom) == (left, top, right, bottom),
     );
     let ex_style = unsafe { GetWindowLongPtrW(exclusive.hwnd(), GWL_EXSTYLE) } as u32;
     ok &= expect(
@@ -210,6 +275,80 @@ fn windows_main() -> Result<(), String> {
         "a click on an exclusive layer activates it",
         activation.0 == MA_ACTIVATE as isize,
     );
+    // It covers the monitor and claims all of it; the next probe clicks through to other
+    // windows, so it has to go first.
+    drop(exclusive);
+
+    // The one thing a pointer-following surface cannot get from the engine: a still pointer
+    // builds no frame, so the hand-back has to happen where the window sees the leave.
+    let mut following = Win32Window::new(SurfaceSpec::layer(
+        "crabsnap-win32-layers",
+        "probe.follow",
+        LayerSpec {
+            level: Layer::Overlay,
+            anchor: Anchor {
+                top: true,
+                bottom: false,
+                left: true,
+                right: false,
+            },
+            size: Some((240, 160)),
+            margin: Insets::new(600.0, 400.0, 0.0, 0.0),
+            exclusive: ExclusiveZone::Ignore,
+            keyboard: KeyboardMode::FollowPointer,
+        },
+    ))
+    .map_err(|error| error.to_string())?;
+    let mut patch = RECT::default();
+    unsafe { GetWindowRect(following.hwnd(), &mut patch) }
+        .map_err(|error| format!("GetWindowRect: {error}"))?;
+    // Everything it claims: this probe is about the leave, not the shape.
+    following.set_input_region(&[Rect::new(0.0, 0.0, 240.0, 160.0)]);
+    let mut managed = RECT::default();
+    unsafe { GetWindowRect(window.hwnd(), &mut managed) }
+        .map_err(|error| format!("GetWindowRect: {error}"))?;
+    let foreground = || unsafe { GetForegroundWindow() };
+    let click = |at: POINT| -> Result<(), String> {
+        unsafe { SetCursorPos(at.x, at.y) }
+            .map_err(|error| format!("SetCursorPos: {error}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        unsafe {
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        Ok(())
+    };
+    let middle = |rect: RECT| POINT {
+        x: (rect.left + rect.right) / 2,
+        y: (rect.top + rect.bottom) / 2,
+    };
+    // A click is queued, and the activation it asks for happens when the queue is dispatched;
+    // the pump between a click and its answer is what gives the message procedure its turn.
+    click(middle(managed))?;
+    drain(&mut window, 200);
+    ok &= expect(
+        "a click on the manager's window focuses it",
+        foreground() == window.hwnd(),
+    );
+    click(middle(patch))?;
+    drain(&mut window, 200);
+    ok &= expect(
+        "a pointer-following layer takes the keyboard on a click",
+        foreground() == following.hwnd(),
+    );
+    // A point of the manager's window the layer does not cover.
+    let away = POINT {
+        x: managed.left + at(40.0),
+        y: managed.top + at(40.0),
+    };
+    unsafe { SetCursorPos(away.x, away.y) }
+        .map_err(|error| format!("SetCursorPos: {error}"))?;
+    drain(&mut window, 400);
+    ok &= expect(
+        "leaving it hands the keyboard back",
+        foreground() == window.hwnd(),
+    );
 
     if !ok {
         return Err(String::from("one or more probes failed"));
@@ -222,4 +361,16 @@ fn windows_main() -> Result<(), String> {
         rect.bottom - rect.top,
     );
     Ok(())
+}
+
+/// Pump `window` for `millis` and collect everything it produced.
+#[cfg(windows)]
+fn drain(window: &mut ui_platform_win32::Win32Window, millis: u64) -> Vec<ui_core::Event> {
+    let start = std::time::Instant::now();
+    let mut events = Vec::new();
+    while start.elapsed().as_millis() < u128::from(millis) {
+        events.extend(window.take_events());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    events
 }

@@ -362,7 +362,9 @@ impl D3d11Device {
             ComparisonFunc: D3D11_COMPARISON_NEVER,
             BorderColor: [0.0; 4],
             MinLOD: 0.0,
-            MaxLOD: f32::MAX,
+            // Every texture here carries a full chain, but only a caller that asked for mips
+            // writes the lower levels; sampling further would read a level nobody generated.
+            MaxLOD: if key.mips { f32::MAX } else { 0.0 },
         };
         let mut state = None;
         let result = unsafe { self.device.CreateSamplerState(&desc, Some(&mut state)) };
