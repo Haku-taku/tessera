@@ -9,7 +9,9 @@ use ui_core::geom::{Point, Rect};
 use ui_core::{CursorShape, Event};
 use ui_platform::driver::FrameHost;
 use ui_platform::present::ImeState;
-use ui_platform::window::{KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec};
+use ui_platform::window::{
+    AutoHide, KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec,
+};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
@@ -576,8 +578,12 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
     }
     .place(layer.size.map(|size| size.1), scale);
     // A surface that reaches the edge an auto-hidden taskbar hides against leaves that strip
-    // to the desktop: covering it is what makes the taskbar unreachable by the mouse.
-    if let Some(edge) = auto_hide_edge(monitor) {
+    // to the desktop: covering it is what makes the taskbar unreachable by the mouse. A
+    // surface whose picture is the screen asks for the edge instead; two rows short would
+    // squeeze its whole picture, and a pointer would name a pixel it is not over.
+    if layer.auto_hide == AutoHide::Yield
+        && let Some(edge) = auto_hide_edge(monitor)
+    {
         match edge {
             ABE_TOP if y <= rect.top => {
                 let strip = AUTO_HIDE_STRIP.min(height - 1);

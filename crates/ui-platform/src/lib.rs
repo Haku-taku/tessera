@@ -41,4 +41,6 @@ pub use text_pass::TextPass;
 pub use theme::{FixedTheme, ThemePreference, ThemeWatcher};
 pub use transfer::{Selection, SelectionReader};
 pub use view::{App, AppLoop, FrameInfo, run_app};
-pub use window::{Anchor, ExclusiveZone, KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec};
+pub use window::{
+    Anchor, AutoHide, ExclusiveZone, KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec,
+};

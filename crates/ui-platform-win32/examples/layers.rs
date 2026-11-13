@@ -49,7 +49,9 @@ fn taskbar_edge(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> Option<u32>
 #[cfg(windows)]
 fn windows_main() -> Result<(), String> {
     use ui_core::geom::{Insets, Rect};
-    use ui_platform::window::{Anchor, ExclusiveZone, KeyboardMode, Layer, LayerSpec, SurfaceSpec};
+    use ui_platform::window::{
+        Anchor, AutoHide, ExclusiveZone, KeyboardMode, Layer, LayerSpec, SurfaceSpec,
+    };
     use ui_platform_win32::Win32Window;
     use windows::Win32::Foundation::{LPARAM, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
@@ -126,6 +128,7 @@ fn windows_main() -> Result<(), String> {
             margin: Insets::new(40.0, 24.0, 0.0, 0.0),
             exclusive: ExclusiveZone::Ignore,
             keyboard: KeyboardMode::None,
+            auto_hide: AutoHide::Yield,
         },
     ))
     .map_err(|error| error.to_string())?;
@@ -157,6 +160,33 @@ fn windows_main() -> Result<(), String> {
         "a borderless popup's client area is its whole rect",
         toolbar.logical_size() == (320, 180),
     );
+
+    // A surface whose picture is the screen asks for the whole monitor: two rows short would
+    // squeeze that picture, and a pointer would name a pixel it is not over.
+    let covering = Win32Window::new(SurfaceSpec::layer(
+        "crabsnap-win32-layers",
+        "probe.covering",
+        LayerSpec {
+            auto_hide: AutoHide::Cover,
+            ..LayerSpec::default()
+        },
+    ))
+    .map_err(|error| error.to_string())?;
+    let mut whole = RECT::default();
+    unsafe { GetWindowRect(covering.hwnd(), &mut whole) }
+        .map_err(|error| format!("GetWindowRect: {error}"))?;
+    ok &= expect(
+        "a surface that covers the edge takes the whole monitor",
+        (whole.left, whole.top, whole.right, whole.bottom)
+            == (
+                monitor_rect.left,
+                monitor_rect.top,
+                monitor_rect.right,
+                monitor_rect.bottom,
+            ),
+    );
+    // It is topmost over the whole monitor, so it goes before the hit tests below.
+    drop(covering);
 
     // One interactive patch; everything else on the layer must let the desktop through.
     toolbar.set_input_region(&[Rect::new(10.0, 10.0, 100.0, 40.0)]);
@@ -296,6 +326,7 @@ fn windows_main() -> Result<(), String> {
             margin: Insets::new(600.0, 400.0, 0.0, 0.0),
             exclusive: ExclusiveZone::Ignore,
             keyboard: KeyboardMode::FollowPointer,
+            auto_hide: AutoHide::Yield,
         },
     ))
     .map_err(|error| error.to_string())?;

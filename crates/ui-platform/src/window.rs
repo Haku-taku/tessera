@@ -85,6 +85,23 @@ pub struct LayerSpec {
     pub margin: Insets,
     pub exclusive: ExclusiveZone,
     pub keyboard: KeyboardMode,
+    pub auto_hide: AutoHide,
+}
+
+/// What a layer surface does about the strip an auto-hidden shell bar keeps for itself.
+///
+/// A bar that hides when the pointer leaves is revealed by the pointer reaching the screen
+/// edge, and the shell stops revealing it while a window covers that edge. A platform may
+/// therefore stop a layer surface short of the strip. A surface whose picture is the screen
+/// cannot give those rows up without drawing everything above them a little off where the
+/// user points, so it covers the edge instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AutoHide {
+    /// Stop short of the edge: the strip stays the shell's, and its bar stays reachable.
+    #[default]
+    Yield,
+    /// Cover the edge: the surface is exactly the output its anchors name.
+    Cover,
 }
 
 impl Default for LayerSpec {
@@ -96,6 +113,7 @@ impl Default for LayerSpec {
             margin: Insets::ZERO,
             exclusive: ExclusiveZone::Ignore,
             keyboard: KeyboardMode::None,
+            auto_hide: AutoHide::Yield,
         }
     }
 }
