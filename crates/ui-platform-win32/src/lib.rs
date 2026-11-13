@@ -17,7 +17,8 @@ mod theme;
 mod window;
 
 pub use presenter::Win32Presenter;
-pub use session::{Session, SessionOptions, Tick};
+pub use session::Session;
+pub use ui_platform::session::{HostSession, SessionOptions, Tick};
 pub use theme::Win32ThemeWatcher;
 pub use window::Win32Window;
 

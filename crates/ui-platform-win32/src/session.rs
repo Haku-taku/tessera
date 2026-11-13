@@ -7,43 +7,12 @@ use ui_core::draw::DrawList;
 use ui_core::geom::Point;
 use ui_platform::driver::{Driver, Turn};
 use ui_platform::present::{CanvasFrame, PresentStats, SceneTarget};
+use ui_platform::session::{HostSession, SessionOptions, Tick};
 use ui_platform::text_pass::TextPass;
-use ui_platform::view::{App, AppLoop, FrameOutcome};
-use ui_platform::window::SurfaceSpec;
+use ui_platform::view::{App, AppLoop};
 
 use crate::presenter::Win32Presenter;
 use crate::window::Win32Window;
-
-/// What an app asks for when it hands the engine a loop.
-pub struct SessionOptions {
-    /// The window to open.
-    pub surface: SurfaceSpec,
-    /// Draw on every turn instead of one frame per composition (a stress knob).
-    pub uncapped: bool,
-    /// Ask for the CPU presenter. The Win32 backend has none, so this is refused rather
-    /// than silently ignored.
-    pub cpu_presenter: bool,
-}
-
-/// One turn's result: whether it drew, and what the target did.
-pub struct Tick {
-    pub drew: bool,
-    pub outcome: Option<FrameOutcome>,
-    pub presented: Option<PresentStats>,
-    /// The pointer the frame was built with, for the host's own diagnostics.
-    pub pointer: Option<Point>,
-}
-
-impl Tick {
-    fn idle() -> Self {
-        Self {
-            drew: false,
-            outcome: None,
-            presented: None,
-            pointer: None,
-        }
-    }
-}
 
 /// Window, presenter and driver, owned together so an app never orders them itself.
 ///
@@ -95,6 +64,11 @@ impl<A: App> Session<A> {
 
     pub fn window_mut(&mut self) -> &mut Win32Window {
         &mut self.win
+    }
+
+    /// Physical pixels per logical unit.
+    pub fn scale(&self) -> f32 {
+        self.win.scale()
     }
 
     /// The scene renderer behind the swap chain, for knobs such as supersampling.
@@ -159,11 +133,11 @@ impl<A: App> Session<A> {
     /// The single-surface form: scripted probes and tests drive one session themselves.
     pub fn tick(&mut self) -> Result<Tick, String> {
         if self.finished() {
-            return Ok(Tick::idle());
+            return Ok(Tick::default());
         }
         let pointer = match self.driver.step(&mut self.lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
-            Turn::Idle | Turn::Waiting => return Ok(Tick::idle()),
+            Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
         };
         let tick = self.draw(pointer)?;
         self.driver.pace(&mut self.win);
@@ -176,7 +150,7 @@ impl<A: App> Session<A> {
         let size = self.win.client_size();
         if size.0 == 0 || size.1 == 0 {
             // Minimized: there is no client area to draw into, and the turn ends in a wait.
-            return Ok(Tick::idle());
+            return Ok(Tick::default());
         }
         self.presenter
             .resize(size, self.win.scale())
@@ -206,6 +180,128 @@ impl<A: App> Session<A> {
             pointer,
         })
     }
+}
+
+/// The Win32 answer to the surface an app is written against; see [`HostSession`].
+impl<A: App> HostSession<A> for Session<A> {
+    fn open(lp: AppLoop<A>, options: SessionOptions) -> Result<Self, String> {
+        Session::open(lp, options)
+    }
+
+    fn tick(&mut self) -> Result<Tick, String> {
+        Session::tick(self)
+    }
+
+    fn finished(&self) -> bool {
+        Session::finished(self)
+    }
+
+    fn lp(&self) -> &AppLoop<A> {
+        &self.lp
+    }
+
+    fn lp_mut(&mut self) -> &mut AppLoop<A> {
+        &mut self.lp
+    }
+
+    fn set_pointer(&mut self, pointer: Option<Point>) {
+        Session::set_pointer(self, pointer);
+    }
+
+    fn events(&self) -> &[ui_core::Event] {
+        Session::events(self)
+    }
+
+    fn presenter_name(&self) -> Option<String> {
+        Session::presenter_name(self)
+    }
+
+    fn last_wait(&self) -> Duration {
+        Session::last_wait(self)
+    }
+
+    fn wait_stats(&self) -> (Duration, u32) {
+        Session::wait_stats(self)
+    }
+
+    fn cpu_seconds(&self) -> Option<f64> {
+        process_cpu_seconds()
+    }
+
+    fn logical_size(&self) -> (u32, u32) {
+        self.win.logical_size()
+    }
+
+    fn scale(&self) -> f32 {
+        Session::scale(self)
+    }
+
+    fn request_close(&mut self) {
+        self.win.request_close();
+    }
+
+    fn write_clipboard(&mut self, content: ui_core::clipboard::ClipboardContent) -> bool {
+        self.win.write_clipboard(content)
+    }
+
+    fn request_paste(&mut self) -> bool {
+        self.win.request_paste()
+    }
+
+    fn gpu_present(&self) -> bool {
+        // Every frame reaches the screen through D3D11; there is no CPU presenter here.
+        true
+    }
+
+    fn set_supersample(&mut self, factor: u32) {
+        self.presenter.renderer_mut().set_supersample(factor);
+    }
+
+    fn frame_callbacks(&mut self) -> u32 {
+        Session::take_frame_callbacks(self)
+    }
+
+    fn refresh_hz(&self) -> Option<f32> {
+        self.win.refresh_hz()
+    }
+
+    fn dmabuf_stats(&self) -> Option<(usize, u32)> {
+        // A flip-model swap chain holds no dma-buf.
+        None
+    }
+
+    fn dump_frame(&mut self, path: &std::path::Path) -> Result<(), String> {
+        Session::dump_frame_ppm(self, path)
+    }
+
+    fn finish(&mut self) {
+        Session::finish(self);
+    }
+}
+
+/// This process's CPU time from the kernel's process clock, which counts both halves.
+fn process_cpu_seconds() -> Option<f64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    fn ticks(time: FILETIME) -> u64 {
+        (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+    }
+    let (mut created, mut exited) = (FILETIME::default(), FILETIME::default());
+    let (mut kernel, mut user) = (FILETIME::default(), FILETIME::default());
+    // SAFETY: the handle is this process and every out-parameter outlives the call.
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+        .ok()?;
+    }
+    // A FILETIME counts 100 ns intervals.
+    Some((ticks(kernel) + ticks(user)) as f64 / 1e7)
 }
 
 /// The presenter and the window as one scene target: the frame goes to the swap chain, and

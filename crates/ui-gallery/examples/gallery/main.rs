@@ -556,7 +556,14 @@ fn main() {
     run(session);
 }
 
-fn run(mut session: Session<Gallery>) {
+/// Write the last presented frame into the temp directory; the path is the one printed.
+fn dump_frame_now<H: HostSession<Gallery>>(session: &mut H) -> Option<std::path::PathBuf> {
+    let path = std::env::temp_dir().join("gallery_frame.ppm");
+    session.dump_frame(&path).ok()?;
+    Some(path)
+}
+
+fn run<H: HostSession<Gallery>>(mut session: H) {
     watch_for_stalls();
     watch_for_perf();
     // `GALLERY_PRESS` taps twice a second for the whole run, so it is read before setup.
@@ -566,13 +573,13 @@ fn run(mut session: Session<Gallery>) {
     // The text rows' words and chords are fixed for the run, so they go in once.
     sync_text_menu_labels(session.lp_mut());
     if std::env::var("GALLERY_SELFTEST").is_ok() {
-        let (lw, lh) = session.window().logical_size();
+        let (lw, lh) = session.logical_size();
         selftest(session.lp_mut(), (lw.max(WIN_W), lh.max(WIN_H)));
     }
     // One laid-out frame first: the splat starts from hit testing, and before layout a
     // press hits nothing.
     if let Some(at) = tap {
-        let (lw, lh) = session.window().logical_size();
+        let (lw, lh) = session.logical_size();
         session
             .lp_mut()
             .dispatch(ui_core::Event::PointerMoved { pos: at });
@@ -581,7 +588,7 @@ fn run(mut session: Session<Gallery>) {
     // Press, drag out, release: the control keeps pointer focus with the pointer elsewhere.
     // A screenshot after it settles shows whether any state layer outlived the press.
     if let Some(at) = clicked_once() {
-        let (lw, lh) = session.window().logical_size();
+        let (lw, lh) = session.logical_size();
         let size = (lw.max(WIN_W), lh.max(WIN_H));
         let button = ui_core::PointerButton::Primary;
         let out = Point::new(at.x + 300.0, at.y);
@@ -605,7 +612,7 @@ fn run(mut session: Session<Gallery>) {
     // Press, leave, keep holding: the ink is still alive while the state layer has gone,
     // which is when a clip that followed the painted box used to lose its curve.
     if let Some((at, out)) = held_and_left() {
-        let (lw, lh) = session.window().logical_size();
+        let (lw, lh) = session.logical_size();
         let size = (lw.max(WIN_W), lh.max(WIN_H));
         let button = ui_core::PointerButton::Primary;
         session
@@ -624,7 +631,7 @@ fn run(mut session: Session<Gallery>) {
     }
     // A plain click: focus and caret placement without the drag `GALLERY_CLICK` performs.
     if let Some(at) = focus_once() {
-        let (lw, lh) = session.window().logical_size();
+        let (lw, lh) = session.logical_size();
         let size = (lw.max(WIN_W), lh.max(WIN_H));
         let button = ui_core::PointerButton::Primary;
         session
@@ -652,7 +659,7 @@ fn run(mut session: Session<Gallery>) {
     // A scripted wheel notch: the one gesture a screenshot cannot produce by hand. It runs
     // before the drag so a drag can target content the wheel scrolled into view.
     if let Some((at, delta)) = wheel_once() {
-        let (lw, lh) = session.window().logical_size();
+        let (lw, lh) = session.logical_size();
         let size = (lw.max(WIN_W), lh.max(WIN_H));
         session
             .lp_mut()
@@ -665,7 +672,7 @@ fn run(mut session: Session<Gallery>) {
     let mut sequence: Vec<(Point, Point)> = drag_once().into_iter().collect();
     sequence.extend(drags());
     for (from, to) in sequence {
-        let (lw, lh) = session.window().logical_size();
+        let (lw, lh) = session.logical_size();
         let size = (lw.max(WIN_W), lh.max(WIN_H));
         let button = ui_core::PointerButton::Primary;
         session
@@ -691,7 +698,7 @@ fn run(mut session: Session<Gallery>) {
     }
     // A scripted right click: the engine's own menu is drawn from its own state.
     if let Some(at) = right_once() {
-        let (lw, lh) = session.window().logical_size();
+        let (lw, lh) = session.logical_size();
         let size = (lw.max(WIN_W), lh.max(WIN_H));
         session
             .lp_mut()
@@ -721,7 +728,7 @@ fn run(mut session: Session<Gallery>) {
     // rasterizes on it, or glyphs would only be magnified from a 1× atlas.
     let ss = supersample();
     session.lp_mut().set_supersample(ss);
-    set_supersample(&mut session, ss);
+    session.set_supersample(ss);
     // A pinned capture density reaches every glass material through the tuning table.
     if let Some(v) = capture_scale() {
         ui_widgets_glass::tuning::set(ui_widgets_glass::tuning::Knob::CaptureScale, Some(v));
@@ -751,7 +758,7 @@ fn run(mut session: Session<Gallery>) {
         })
         .unwrap_or_default();
     let mut beat_at = Instant::now();
-    let mut beat_cpu = cpu_seconds();
+    let mut beat_cpu = session.cpu_seconds();
     // Kept for the exit line: frame rate follows the compositor, so CPU per frame is the
     // only number two builds can be compared on.
     let cpu_start = beat_cpu;
@@ -775,7 +782,7 @@ fn run(mut session: Session<Gallery>) {
     let key = key_once();
     let mut key_done = false;
     // The presenter never changes mid-run; the report below reads it once per turn.
-    let gpu_present = gpu_present(&mut session);
+    let gpu_present = session.gpu_present();
 
     while !session.finished()
         && !STOP.load(std::sync::atomic::Ordering::Relaxed)
@@ -809,7 +816,7 @@ fn run(mut session: Session<Gallery>) {
         if heartbeat && beat_at.elapsed().as_millis() >= 1000 {
             // CPU share of one core over the last second: idle and busy runs differ here.
             let wall = beat_at.elapsed().as_secs_f64();
-            let cpu = cpu_seconds();
+            let cpu = session.cpu_seconds();
             // A host that cannot report CPU time leaves the field out rather than printing 0.
             let share = cpu.zip(beat_cpu).map_or_else(
                 || String::from("n/a"),
@@ -831,8 +838,8 @@ fn run(mut session: Session<Gallery>) {
             } else {
                 String::new()
             };
-            let cbs = frame_callbacks(&mut session);
-            let hz = refresh_hz(&session);
+            let cbs = session.frame_callbacks();
+            let hz = session.refresh_hz();
             eprintln!(
                 "[hb] t={} turns={} builds={} cbs={} cpu={share} commit={beat_commit} (dirty={beat_damage} anim={beat_anim} draws={beat_draws} band={band:.1}%{heap}) idle={beat_idle} refresh={:?}",
                 epoch_ms(),
@@ -956,7 +963,7 @@ fn run(mut session: Session<Gallery>) {
         // `GALLERY_CLOSE_AFTER=n` closes the window itself after n seconds, so an exit test
         // needs no hand on the mouse; compare it against a real close.
         if close_after().is_some_and(|secs| started.elapsed().as_secs_f32() >= secs) {
-            session.window_mut().request_close();
+            session.request_close();
         }
         route_clipboard(&mut session);
         if let Some(chords) = &key {
@@ -978,11 +985,11 @@ fn run(mut session: Session<Gallery>) {
             // Retried: the seat announces its offer a few frames after the window maps.
             if !clipboard_done && started.elapsed().as_secs_f32() > 0.3 {
                 let ok = if let Some(text) = spec.strip_prefix("copy:") {
-                    session.window_mut().write_clipboard(
-                        ui_core::clipboard::ClipboardContent::Text(text.to_string()),
-                    )
+                    session.write_clipboard(ui_core::clipboard::ClipboardContent::Text(
+                        text.to_string(),
+                    ))
                 } else if spec == "paste" {
-                    session.window_mut().request_paste()
+                    session.request_paste()
                 } else {
                     true
                 };
@@ -1080,8 +1087,8 @@ fn run(mut session: Session<Gallery>) {
                     );
                 }
                 beat_draws += stats.draw_calls;
-                let (lw, lh) = session.window().logical_size();
-                let s = session.window().scale().max(f32::EPSILON);
+                let (lw, lh) = session.logical_size();
+                let s = session.scale().max(f32::EPSILON);
                 let full = (lw as f32 * s) * (lh as f32 * s);
                 let band = stats.band.map_or(full, |b| (b[2] * b[3]) as f32);
                 beat_band += (band / full.max(1.0)) as f64;
@@ -1123,7 +1130,7 @@ fn run(mut session: Session<Gallery>) {
     let (partial, full) = partial_frames();
     // Frame rate follows the compositor, so CPU per frame is the only number two builds can
     // be compared on; a host that cannot report it prints the draw counts alone.
-    match (cpu_start, cpu_seconds()) {
+    match (cpu_start, session.cpu_seconds()) {
         (Some(start), Some(end)) => {
             let cpu = end - start;
             println!(
@@ -1134,7 +1141,7 @@ fn run(mut session: Session<Gallery>) {
         _ => println!("redraw: partial={partial} full={full}"),
     }
     // In-flight dma-bufs at exit: a growing count means the compositor is not releasing them.
-    if let Some((inflight, released)) = dmabuf_stats(&session) {
+    if let Some((inflight, released)) = session.dmabuf_stats() {
         println!("dmabuf: {inflight} inflight, {released} released");
     }
     // Teardown order is the session's: GPU objects while the surface still exists, then the
@@ -1145,7 +1152,7 @@ fn run(mut session: Session<Gallery>) {
     // the compositor would otherwise inherit.
     if std::env::var_os("EXIT_FINISH").is_some() {
         ui_platform::exit_probe::stage("gpu: finish");
-        finish(&mut session);
+        session.finish();
         ui_platform::exit_probe::stage("gpu: finished");
     }
     drop(session);

@@ -33,7 +33,8 @@ pub use input::{InputState, KeyEvent};
 pub use link::WaylandLink;
 #[cfg(feature = "global-hotkeys")]
 pub use portal_hotkeys::PortalHotkeys;
-pub use session::{Session, SessionOptions, Tick};
+pub use session::Session;
+pub use ui_platform::session::{HostSession, SessionOptions, Tick};
 pub use shm::ShmBuffer;
 pub use theme::PortalThemeWatcher;
 #[cfg(feature = "gpu")]

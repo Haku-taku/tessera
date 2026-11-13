@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use ui_core::draw::ImageEntry;
-use ui_host::{Session, SessionOptions};
+use ui_host::{HostSession, Session, SessionOptions};
 use ui_platform::view::{App, AppLoop};
 use ui_platform::window::SurfaceSpec;
 
@@ -171,7 +171,7 @@ fn typed() -> Option<String> {
     std::env::var("DEMO_TYPE").ok().filter(|s| !s.is_empty())
 }
 
-fn loop_forever<A: App>(mut session: Session<A>) -> ! {
+fn loop_forever<A: App, H: HostSession<A>>(mut session: H) -> ! {
     let heartbeat = std::env::var_os("DEMO_HEARTBEAT").is_some();
     let mut dumped = std::env::var_os("DEMO_DUMP").is_none();
     let started = Instant::now();

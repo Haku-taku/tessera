@@ -8,26 +8,16 @@ use ui_core::timed;
 use ui_platform::clipboard::{ClipboardCommand, ClipboardCopy, ClipboardKind};
 use ui_platform::driver::{Driver, Turn};
 use ui_platform::host::{SurfaceHandle, SurfaceStep};
-use ui_platform::present::PresentStats;
 #[cfg(feature = "gpu")]
-use ui_platform::present::SceneTarget;
+use ui_platform::present::{PresentStats, SceneTarget};
+use ui_platform::session::{HostSession, SessionOptions, Tick};
 #[cfg(feature = "gpu")]
 use ui_platform::text_pass::TextPass;
-use ui_platform::view::{App, AppLoop, FrameOutcome};
+use ui_platform::view::{App, AppLoop};
 
 #[cfg(feature = "gpu")]
 use crate::gpu_window::{GpuWindow, GpuWindowConfig};
 use crate::window::WaylandWindow;
-
-/// What the host asks for when it hands the engine a loop.
-pub struct SessionOptions {
-    /// The surface to open: a window the window manager places, or a layer the engine does.
-    pub surface: ui_platform::window::SurfaceSpec,
-    /// Draw on every turn instead of one frame per compositor callback (a stress knob).
-    pub uncapped: bool,
-    /// Present through the CPU rasterizer even when a GPU is available.
-    pub cpu_presenter: bool,
-}
 
 /// The GPU presenter as the engine's scene target.
 #[cfg(feature = "gpu")]
@@ -96,26 +86,6 @@ impl SceneTarget for GpuTarget<'_> {
 
     fn commit_pending(&self) -> bool {
         self.win.ime_pending() || self.win.input_pending()
-    }
-}
-
-/// One turn's result: whether it drew, and what the target did.
-pub struct Tick {
-    pub drew: bool,
-    pub outcome: Option<FrameOutcome>,
-    pub presented: Option<PresentStats>,
-    /// The pointer the frame was built with, for the host's own diagnostics.
-    pub pointer: Option<Point>,
-}
-
-impl Tick {
-    fn idle() -> Self {
-        Self {
-            drew: false,
-            outcome: None,
-            presented: None,
-            pointer: None,
-        }
     }
 }
 
@@ -270,11 +240,11 @@ impl<A: App> Session<A> {
             .map_err(|error| format!("wayland: {error}"))?;
         self.win.service_paste();
         if self.take_close() {
-            return Ok(Tick::idle());
+            return Ok(Tick::default());
         }
         let pointer = match self.driver.decide(&mut self.lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
-            Turn::Idle | Turn::Waiting => return Ok(Tick::idle()),
+            Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
         };
         self.draw(pointer)
     }
@@ -284,11 +254,11 @@ impl<A: App> Session<A> {
     /// The single-surface form: scripted probes and tests drive one session themselves.
     pub fn tick(&mut self) -> Result<Tick, String> {
         if self.take_close() {
-            return Ok(Tick::idle());
+            return Ok(Tick::default());
         }
         let pointer = match self.driver.step(&mut self.lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
-            Turn::Idle | Turn::Waiting => return Ok(Tick::idle()),
+            Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
         };
         let tick = self.draw(pointer)?;
         self.driver.pace(&mut self.win);
@@ -347,6 +317,145 @@ impl<A: App> Session<A> {
             presented: framed.presented,
             pointer,
         })
+    }
+}
+
+/// The Wayland answer to the surface an app is written against; see [`HostSession`].
+impl<A: App> HostSession<A> for Session<A> {
+    fn open(lp: AppLoop<A>, options: SessionOptions) -> Result<Self, String> {
+        Session::open(lp, options)
+    }
+
+    fn tick(&mut self) -> Result<Tick, String> {
+        Session::tick(self)
+    }
+
+    fn finished(&self) -> bool {
+        Session::finished(self)
+    }
+
+    fn lp(&self) -> &AppLoop<A> {
+        &self.lp
+    }
+
+    fn lp_mut(&mut self) -> &mut AppLoop<A> {
+        &mut self.lp
+    }
+
+    fn set_pointer(&mut self, pointer: Option<Point>) {
+        Session::set_pointer(self, pointer);
+    }
+
+    fn events(&self) -> &[ui_core::Event] {
+        Session::events(self)
+    }
+
+    fn presenter_name(&self) -> Option<String> {
+        Session::presenter_name(self)
+    }
+
+    fn last_wait(&self) -> Duration {
+        Session::last_wait(self)
+    }
+
+    fn wait_stats(&self) -> (Duration, u32) {
+        Session::wait_stats(self)
+    }
+
+    fn cpu_seconds(&self) -> Option<f64> {
+        // Both halves of the process's tick counters; `/proc/self/stat` is the only clock
+        // every Unix kernel offers without a syscall wrapper.
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let fields: Vec<&str> = stat.split_whitespace().collect();
+        let ticks: f64 = fields.get(13).and_then(|s| s.parse().ok())?
+            + fields.get(14).and_then(|s| s.parse().ok())?;
+        Some(ticks / 100.0)
+    }
+
+    fn logical_size(&self) -> (u32, u32) {
+        self.win.logical_size()
+    }
+
+    fn scale(&self) -> f32 {
+        self.win.scale()
+    }
+
+    fn request_close(&mut self) {
+        self.win.request_close();
+    }
+
+    fn write_clipboard(&mut self, content: ui_core::clipboard::ClipboardContent) -> bool {
+        self.win.write_clipboard(content)
+    }
+
+    fn request_paste(&mut self) -> bool {
+        self.win.request_paste()
+    }
+
+    fn gpu_present(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
+        }
+    }
+
+    fn set_supersample(&mut self, factor: u32) {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.renderer_mut().set_supersample(factor);
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = factor;
+        }
+    }
+
+    fn frame_callbacks(&mut self) -> u32 {
+        self.win.take_frame_callbacks()
+    }
+
+    fn refresh_hz(&self) -> Option<f32> {
+        self.win.refresh_hz()
+    }
+
+    fn dmabuf_stats(&self) -> Option<(usize, u32)> {
+        Some((self.win.dmabuf_inflight(), self.win.dmabuf_releases()))
+    }
+
+    fn dump_frame(&mut self, path: &std::path::Path) -> Result<(), String> {
+        #[cfg(feature = "gpu")]
+        {
+            fn stem(path: &std::path::Path) -> String {
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("frame")
+                    .to_string()
+            }
+            // The layer dump goes beside the frame: one path names both pictures.
+            let layer = path.with_file_name(format!("{}_layer.ppm", stem(path)));
+            let Some(gpu) = self.gpu.as_mut() else {
+                return Err(String::from("this session presents through the CPU rasterizer"));
+            };
+            gpu.dump_ppm(path, &layer)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = path;
+            Err(String::from("this build has no GPU presenter"))
+        }
+    }
+
+    fn finish(&mut self) {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.finish();
+        }
     }
 }
 

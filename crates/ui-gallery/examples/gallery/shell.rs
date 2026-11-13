@@ -883,126 +883,16 @@ pub(crate) fn appearance_of(dark: bool) -> ui_design::Appearance {
     }
 }
 
-// The host seam: what the gallery asks of its host beyond the session itself.
+// The host seam: the session the app is handed, and the one measurement that belongs to the
+// process rather than to its window.
 //
-// The window backend is named in `ui-host`, so nothing here mentions one. What remains is a
-// capability question per target — a host that cannot do something says so, and the report
-// leaves the number out instead of printing a zero.
+// The backend is named in `ui-host`, so nothing here mentions one, and what a host can and
+// cannot answer is asked through `HostSession` — a host without a number says so instead of
+// the report printing a zero.
 
-pub(crate) use ui_host::{Session, SessionOptions};
+pub(crate) use ui_host::{HostSession, Session, SessionOptions, ThemeWatch};
 
-pub(crate) use host::*;
-
-#[cfg(unix)]
-mod host {
-    use super::Session;
-    use crate::app::Gallery;
-
-    /// XDG portal, so the desktop's colour scheme reaches the app.
-    pub(crate) type ThemeWatch = ui_host::ThemeWatch;
-
-    /// Frames drawn wholly and partly, for the exit line.
-    pub(crate) fn partial_frames() -> (u64, u64) {
-        ui_gpu_scene::partial_frames()
-    }
-
-    pub(crate) fn set_supersample(session: &mut Session<Gallery>, factor: u32) {
-        if let Some(gpu) = session.gpu_mut() {
-            gpu.renderer_mut().set_supersample(factor);
-        }
-    }
-
-    pub(crate) fn gpu_present(session: &mut Session<Gallery>) -> bool {
-        session.gpu_mut().is_some()
-    }
-
-    pub(crate) fn frame_callbacks(session: &mut Session<Gallery>) -> u32 {
-        session.window_mut().take_frame_callbacks()
-    }
-
-    pub(crate) fn refresh_hz(session: &Session<Gallery>) -> Option<f32> {
-        session.window().refresh_hz()
-    }
-
-    pub(crate) fn dmabuf_stats(session: &Session<Gallery>) -> Option<(usize, u32)> {
-        Some((
-            session.window().dmabuf_inflight(),
-            session.window().dmabuf_releases(),
-        ))
-    }
-
-    /// This process's CPU time, from `/proc`.
-    pub(crate) fn cpu_seconds() -> Option<f64> {
-        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-        let fields: Vec<&str> = stat.split_whitespace().collect();
-        let ticks: f64 = fields.get(13).and_then(|s| s.parse().ok())?
-            + fields.get(14).and_then(|s| s.parse().ok())?;
-        Some(ticks / 100.0)
-    }
-
-    /// Write the renderer's frame and its top layer; the path is the one printed.
-    pub(crate) fn dump_frame_now(session: &mut Session<Gallery>) -> Option<std::path::PathBuf> {
-        let frame = std::path::Path::new("/tmp/gallery_frame.ppm");
-        let layer = std::path::Path::new("/tmp/gallery_layer.ppm");
-        let gpu = session.gpu_mut()?;
-        let _ = gpu.dump_ppm(frame, layer);
-        Some(frame.to_path_buf())
-    }
-
-    pub(crate) fn finish(session: &mut Session<Gallery>) {
-        if let Some(gpu) = session.gpu_mut() {
-            gpu.finish();
-        }
-    }
-}
-
-#[cfg(windows)]
-mod host {
-    use super::Session;
-    use crate::app::Gallery;
-
-    /// The registry value Windows keeps the app colour scheme in.
-    pub(crate) type ThemeWatch = ui_host::ThemeWatch;
-
-    pub(crate) fn partial_frames() -> (u64, u64) {
-        ui_gpu_scene::partial_frames()
-    }
-
-    pub(crate) fn set_supersample(session: &mut Session<Gallery>, factor: u32) {
-        session.renderer_mut().set_supersample(factor);
-    }
-
-    /// There is no CPU presenter: every frame reaches the screen through D3D11.
-    pub(crate) fn gpu_present(_: &mut Session<Gallery>) -> bool {
-        true
-    }
-
-    pub(crate) fn frame_callbacks(session: &mut Session<Gallery>) -> u32 {
-        session.take_frame_callbacks()
-    }
-
-    pub(crate) fn refresh_hz(session: &Session<Gallery>) -> Option<f32> {
-        session.window().refresh_hz()
-    }
-
-    /// A flip-model swap chain holds no dma-buf.
-    pub(crate) fn dmabuf_stats(_: &Session<Gallery>) -> Option<(usize, u32)> {
-        None
-    }
-
-    /// CPU time would need process counters this host does not read yet.
-    pub(crate) fn cpu_seconds() -> Option<f64> {
-        None
-    }
-
-    /// Write the last composited frame; the path is the one printed.
-    pub(crate) fn dump_frame_now(session: &mut Session<Gallery>) -> Option<std::path::PathBuf> {
-        let path = std::env::temp_dir().join("gallery_frame.ppm");
-        session.dump_frame_ppm(&path).ok()?;
-        Some(path)
-    }
-
-    pub(crate) fn finish(session: &mut Session<Gallery>) {
-        session.finish();
-    }
+/// Frames drawn wholly and partly, for the exit line.
+pub(crate) fn partial_frames() -> (u64, u64) {
+    ui_gpu_scene::partial_frames()
 }

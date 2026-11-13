@@ -14,6 +14,7 @@ use ui_platform::host::{Backend, OpenOptions, SurfaceHandle};
 use ui_platform::hotkeys::{GlobalHotkeys, NoGlobalHotkeys};
 use ui_platform::ipc::Channel;
 use ui_platform::output::OutputInfo;
+use ui_platform::session::SessionOptions;
 use ui_platform::transfer::SelectionReader;
 use ui_platform::view::{App, AppLoop};
 use ui_platform::window::SurfaceSpec;
@@ -21,7 +22,7 @@ use ui_platform::window::SurfaceSpec;
 use crate::clipboard_host::ClipboardHost;
 use crate::ipc::{ServerState, UnixChannel};
 use crate::link::WaylandLink;
-use crate::session::{Session, SessionOptions};
+use crate::session::Session;
 use crate::window::WindowError;
 
 /// Surfaces and services on one compositor connection.

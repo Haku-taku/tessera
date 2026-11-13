@@ -546,19 +546,18 @@ pub(crate) fn columns_ok(lp: &AppLoop<Gallery>, page: Page) -> Option<Vec<Rect>>
 }
 
 /// Hand the engine's clipboard requests to the seat: the platform half of the split.
-pub(crate) fn route_clipboard(session: &mut Session<Gallery>) {
+pub(crate) fn route_clipboard<H: HostSession<Gallery>>(session: &mut H) {
     use ui_platform::clipboard::{ClipboardCommand, ClipboardKind};
-    let (lp, win, _) = session.split();
-    for cmd in lp.take_clipboard_commands() {
+    for cmd in session.lp_mut().take_clipboard_commands() {
         match cmd {
             ClipboardCommand::Copy { content, kind } => {
                 if kind == ClipboardKind::Selection {
-                    win.write_clipboard(content);
+                    session.write_clipboard(content);
                 }
             }
             ClipboardCommand::RequestPaste { kind } => {
                 if kind == ClipboardKind::Selection {
-                    win.request_paste();
+                    session.request_paste();
                 }
             }
         }
