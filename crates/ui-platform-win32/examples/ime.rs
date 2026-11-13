@@ -26,9 +26,9 @@ fn windows_main() -> Result<(), String> {
     use ui_platform::present::ImeState;
     use ui_platform::window::SurfaceSpec;
     use ui_platform_win32::Win32Window;
-    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Foundation::{POINT, RECT};
     use windows::Win32::UI::Input::Ime::{
-        CANDIDATEFORM, COMPOSITIONFORM, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR,
+        CANDIDATEFORM, CFS_EXCLUDE, COMPOSITIONFORM, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR,
         ImmGetCandidateWindow, ImmGetCompositionStringW, ImmGetCompositionWindow, ImmGetContext,
         ImmGetOpenStatus, ImmReleaseContext, ImmSetCompositionStringW, SCS_SETSTR,
     };
@@ -88,15 +88,19 @@ fn windows_main() -> Result<(), String> {
     unsafe { ImmGetCandidateWindow(context, 0, &mut candidate) }
         .ok()
         .map_err(|error| format!("ImmGetCandidateWindow: {error}"))?;
-    let bottom = expected.y + (caret.size.h * scale).round() as i32;
-    let mut below = POINT {
-        x: expected.x,
-        y: bottom,
+    // Window coordinates, like the composition window's: a screen point here lands one
+    // window offset down and right of the caret, which is how the list was first seen.
+    let caret_rect = RECT {
+        left: expected.x,
+        top: expected.y,
+        right: expected.x + (caret.size.w * scale).round() as i32,
+        bottom: expected.y + (caret.size.h * scale).round() as i32,
     };
-    let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut below) };
     ok &= expect(
-        "the candidate list hangs below the caret, in screen coordinates",
-        candidate.ptCurrentPos == below,
+        "the candidate list avoids the caret's own rectangle, in window coordinates",
+        candidate.dwStyle == CFS_EXCLUDE
+            && candidate.ptCurrentPos == expected
+            && candidate.rcArea == caret_rect,
     );
 
     // Inject a composition string and let the window procedure read it back. The text holds
