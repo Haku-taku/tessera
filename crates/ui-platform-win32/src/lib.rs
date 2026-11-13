@@ -4,12 +4,14 @@
 //! without user32 and dxgi, and there is nothing for a non-Windows build to fall back to, so
 //! the workspace builds an empty library there.
 //!
-//! What it does not do yet: non-text clipboard formats. Keys, the pointer, the wheel, text
-//! and the input method's composition reach the engine as its own events.
+//! What it does not do yet: HDR, and a clipboard read that carries more than text. Keys, the
+//! pointer, the wheel, text and the input method's composition reach the engine as its own
+//! events.
 
 #![cfg(windows)]
 
 mod backend;
+mod clipboard;
 mod hotkeys;
 mod ime;
 mod input;

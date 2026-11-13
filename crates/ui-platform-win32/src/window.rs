@@ -11,8 +11,7 @@ use ui_platform::driver::FrameHost;
 use ui_platform::present::ImeState;
 use ui_platform::window::{KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec};
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, GlobalFree, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
-    RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
@@ -20,15 +19,7 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
     MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT, ScreenToClient,
 };
-use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-    SetClipboardData,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
-};
-use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor,
     GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
@@ -408,21 +399,14 @@ impl Win32Window {
         .is_ok()
     }
 
-    /// Put text on the clipboard; false when the content is not text this backend carries.
+    /// Put `content` on the clipboard; false when Windows has no format for the payload.
     pub fn write_clipboard(&mut self, content: ClipboardContent) -> bool {
-        write_clipboard_text(Some(self.hwnd), content)
+        crate::clipboard::write(Some(self.hwnd), &content)
     }
 
     /// Read the clipboard into a paste event; false when it holds no text.
     pub fn request_paste(&mut self) -> bool {
-        let Some(text) = (unsafe {
-            if OpenClipboard(Some(self.hwnd)).is_err() {
-                return false;
-            }
-            let text = read_clipboard_text();
-            let _ = CloseClipboard();
-            text
-        }) else {
+        let Some(text) = crate::clipboard::read_text(Some(self.hwnd)) else {
             return false;
         };
         self.state.borrow_mut().events.push(Event::Paste(text));
@@ -947,63 +931,6 @@ fn load_cursor(shape: CursorShape) -> windows::Win32::UI::WindowsAndMessaging::H
     unsafe { LoadCursorW(None, name) }.unwrap_or_default()
 }
 
-/// Replace the clipboard contents with `wide`, a NUL-terminated UTF-16 string.
-unsafe fn store_clipboard_text(wide: &[u16]) -> bool {
-    unsafe {
-        if EmptyClipboard().is_err() {
-            return false;
-        }
-        let bytes = std::mem::size_of_val(wide);
-        let Ok(handle) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
-            return false;
-        };
-        let target = GlobalLock(handle);
-        if target.is_null() {
-            let _ = GlobalFree(Some(handle));
-            return false;
-        }
-        std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), target.cast::<u8>(), bytes);
-        let _ = GlobalUnlock(handle);
-        match SetClipboardData(
-            CF_UNICODETEXT.0 as u32,
-            Some(windows::Win32::Foundation::HANDLE(handle.0)),
-        ) {
-            // On success the clipboard owns the block and frees it itself.
-            Ok(_) => true,
-            Err(_) => {
-                let _ = GlobalFree(Some(handle));
-                false
-            }
-        }
-    }
-}
-
-/// The clipboard's text, when it holds any.
-unsafe fn read_clipboard_text() -> Option<String> {
-    unsafe {
-        if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_err() {
-            return None;
-        }
-        let handle = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
-        let pointer = GlobalLock(windows::Win32::Foundation::HGLOBAL(handle.0));
-        if pointer.is_null() {
-            return None;
-        }
-        let text = pointer.cast::<u16>();
-        // Bounded by the block the clipboard handed over: nothing guarantees a terminator
-        // inside it, and scanning past the end is the bug this bound exists to prevent.
-        let capacity = GlobalSize(windows::Win32::Foundation::HGLOBAL(handle.0)) / 2;
-        let mut length = 0usize;
-        while length < capacity && *text.add(length) != 0 {
-            length += 1;
-        }
-        let slice = std::slice::from_raw_parts(text, length);
-        let text = String::from_utf16_lossy(slice);
-        let _ = GlobalUnlock(windows::Win32::Foundation::HGLOBAL(handle.0));
-        Some(text)
-    }
-}
-
 fn register_class(class: &[u16], instance: HINSTANCE) -> Result<(), WindowError> {
     let descriptor = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -1068,29 +995,12 @@ pub(crate) fn wait_for_composition() {
     }
 }
 
-/// Put text on the system clipboard with no window of its own.
+/// Put `content` on the system clipboard with no window of its own.
 ///
 /// A process-wide copy has no window to own the selection, and on Windows the clipboard
 /// belongs to the task when opened without one.
 pub fn set_system_clipboard(content: ClipboardContent) -> bool {
-    write_clipboard_text(None, content)
-}
-
-/// Open the clipboard, store `content`, and close it again.
-fn write_clipboard_text(owner: Option<HWND>, content: ClipboardContent) -> bool {
-    let ClipboardContent::Text(text) = content else {
-        return false;
-    };
-    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        if OpenClipboard(owner).is_err() {
-            return false;
-        }
-        let stored = store_clipboard_text(&wide);
-        // Closing is the copy's real commit; a failure leaves the old clipboard intact.
-        let _ = CloseClipboard();
-        stored
-    }
+    crate::clipboard::write(None, &content)
 }
 
 fn wide(value: &str) -> Vec<u16> {
