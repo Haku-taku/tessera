@@ -1,0 +1,25 @@
+[package]
+name = "ui-gpu-d3d11"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "D3D11 paint backend: the device the neutral scene draws through on Windows."
+
+[dependencies]
+ui-gpu-scene = { workspace = true }
+
+[dev-dependencies]
+ui-core = { workspace = true }
+
+# The crate is empty off Windows, so the workspace still builds on Linux: a D3D11 device
+# cannot exist without COM and DXGI, and there is nothing to fall back to.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }

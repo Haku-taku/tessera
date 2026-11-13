@@ -15,7 +15,7 @@ mod target;
 pub use device::{Device, ProgramId, TargetId, TextureId, UniformSlot};
 pub use error::GpuError;
 pub use format::{TargetFormat, TextureFormat, Wrap};
-pub use layout::UNIT_QUAD;
+pub use layout::{MAX_TAPS, UNIT_QUAD};
 pub use program::{ProgramKey, ProgramSpec};
 pub use renderer::{AtlasUpload, CanvasUpload, GpuRenderer, RenderStats, as_bytes, partial_frames};
 pub use target::RenderTarget;

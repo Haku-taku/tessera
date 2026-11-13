@@ -44,6 +44,10 @@ const PLATFORM_BOUND: &[(&str, &str)] = &[
         "ui-gpu-egl",
         "EGL device + gbm + dma-buf: unix fds, libc, libgbm",
     ),
+    (
+        "ui-gpu-d3d11",
+        "D3D11 device: COM, DXGI and d3dcompiler are Win32 APIs, and the crate is empty off Windows",
+    ),
 ];
 
 /// APIs that pin a crate to one OS.
