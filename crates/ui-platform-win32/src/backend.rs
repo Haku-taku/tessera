@@ -29,7 +29,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, QS_ALLINPUT,
 };
-use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::core::{BOOL, PCWSTR};
 
 use crate::hotkeys::Win32Hotkeys;
 use crate::session::Session;
@@ -147,7 +147,7 @@ impl Backend for Win32Backend {
     }
 
     fn system_languages(&self) -> Vec<String> {
-        preferred_ui_languages().unwrap_or_default()
+        crate::locale::system_languages()
     }
 
     fn waker(&mut self) -> Option<Arc<dyn Waker>> {
@@ -352,32 +352,3 @@ fn display_mode(info: &MONITORINFOEXW) -> (u32, bool) {
     (refresh, rotated)
 }
 
-/// The languages the user's own profile prefers, most preferred first.
-fn preferred_ui_languages() -> Option<Vec<String>> {
-    use windows::Win32::Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};
-    let mut count = 0u32;
-    let mut units = 0u32;
-    // The first call asks for the buffer's size; both numbers come back together.
-    unsafe { GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, None, &mut units) }.ok()?;
-    if count == 0 || units == 0 {
-        return None;
-    }
-    let mut buffer = vec![0u16; units as usize];
-    // SAFETY: the buffer is the size the first call asked for, and it outlives this call.
-    unsafe {
-        GetUserPreferredUILanguages(
-            MUI_LANGUAGE_NAME,
-            &mut count,
-            Some(PWSTR(buffer.as_mut_ptr())),
-            &mut units,
-        )
-    }
-    .ok()?;
-    Some(
-        buffer
-            .split(|&unit| unit == 0)
-            .filter(|tag| !tag.is_empty())
-            .map(String::from_utf16_lossy)
-            .collect(),
-    )
-}
