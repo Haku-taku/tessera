@@ -7,9 +7,9 @@
 //! The swap chain follows its output into HDR when Windows is composing there, and stays
 //! 8-bit sRGB otherwise. A screen capture duplicates one output or runs a capture session over
 //! it, and returns the sRGB codes a window drew, even where Windows composes the desktop in
-//! linear light. What it
-//! does not do yet: a clipboard read that carries more than text. Keys, the pointer, the
-//! wheel, text and the input method's composition reach the engine as its own events.
+//! linear light. A clipboard copy is written in every format its content has, and a read
+//! turns those formats back into text, a file list or a PNG. Keys, the pointer, the wheel,
+//! text and the input method's composition reach the engine as its own events.
 
 #![cfg(windows)]
 

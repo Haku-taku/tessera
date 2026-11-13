@@ -16,6 +16,7 @@ use ui_platform::ipc::Channel;
 use ui_platform::jobs::Waker;
 use ui_platform::output::OutputInfo;
 use ui_platform::session::{HostSession, SessionOptions};
+use ui_platform::transfer::SelectionReader;
 use ui_platform::tray::{Icon, TrayEvent, TrayHandle, TrayId};
 use ui_platform::view::{App, AppLoop};
 use ui_platform::window::SurfaceSpec;
@@ -31,6 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, PCWSTR};
 
+use crate::clipboard::ClipboardReader;
 use crate::hotkeys::Win32Hotkeys;
 use crate::session::Session;
 use crate::tray::{TrayQueue, Win32TrayIcon};
@@ -46,6 +48,8 @@ pub struct Win32Backend {
     hotkeys: Option<Win32Hotkeys>,
     /// What the tray icons' windows reported; the loop drains it each turn.
     tray_events: TrayQueue,
+    /// The system clipboard, read in place: a copy is already complete when it lands.
+    reader: ClipboardReader,
 }
 
 /// The loop's wake channel from the other side: an event any worker can set.
@@ -81,6 +85,7 @@ impl Win32Backend {
             wake,
             hotkeys: None,
             tray_events: Rc::new(RefCell::new(Vec::new())),
+            reader: ClipboardReader::default(),
         }
     }
 }
@@ -133,6 +138,10 @@ impl Backend for Win32Backend {
     /// Nothing to answer: the data is already on the clipboard, not held on request.
     fn serve_clipboard(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn selection_reader(&mut self) -> Option<&mut (dyn SelectionReader + 'static)> {
+        Some(&mut self.reader)
     }
 
     fn outputs(&mut self) -> Vec<OutputInfo> {

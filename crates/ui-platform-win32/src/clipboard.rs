@@ -1,20 +1,24 @@
-//! The system clipboard: the Windows formats each engine content kind becomes.
+//! The system clipboard: the Windows formats each engine content kind becomes, and back.
 //!
 //! Windows pastes a format, not a MIME type, and the applications that read a picture want a
 //! DIB while a browser takes the PNG, so one payload is offered as several formats at once.
+//! A read walks the same table backwards: the formats present become MIME types, and a DIB
+//! becomes a PNG because the app reads one picture MIME whichever application copied it.
 
+use image::ImageEncoder;
 use ui_core::clipboard::ClipboardContent;
+use ui_platform::transfer::{Selection, SelectionReader};
 use windows::Win32::Foundation::{HANDLE, HWND, GlobalFree};
 use windows::Win32::Graphics::Gdi::{BI_BITFIELDS, BI_RGB, BITMAPINFOHEADER, BITMAPV5HEADER};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-    RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
-use windows::Win32::UI::Shell::DROPFILES;
+use windows::Win32::UI::Shell::{DROPFILES, DragQueryFileW, HDROP};
 use windows::core::PCWSTR;
 
 /// Put `content` on the clipboard, replacing what was there.
@@ -51,6 +55,264 @@ pub(crate) fn read_text(owner: Option<HWND>) -> Option<String> {
         let text = clipboard_text();
         let _ = CloseClipboard();
         text
+    }
+}
+
+/// The system clipboard as the engine's selection reader, for a command that pastes.
+///
+/// Windows copies its formats in whole rather than holding them for a peer to pull, so a
+/// read finishes inside the call that starts it; `poll` only hands over what was copied.
+/// The payload is held until `poll` takes it, because the command answers between turns.
+#[derive(Default)]
+pub(crate) struct ClipboardReader {
+    pending: Option<Selection>,
+}
+
+impl SelectionReader for ClipboardReader {
+    fn offers(&self) -> Vec<String> {
+        let formats = clipboard_formats();
+        mimes(&formats).into_iter().map(str::to_owned).collect()
+    }
+
+    fn read(&mut self, mime: &str) -> bool {
+        let Some(data) = read_payload(mime) else {
+            return false;
+        };
+        self.pending = Some(Selection {
+            mime: mime.to_owned(),
+            data,
+        });
+        true
+    }
+
+    fn poll(&mut self) -> Option<Selection> {
+        self.pending.take()
+    }
+}
+
+/// The clipboard's bytes for one MIME, converted from the Windows format that carries it.
+///
+/// One open covers the whole conversion: the block belongs to the application that copied
+/// it, and a copy arriving between two opens would mix two payloads.
+fn read_payload(mime: &str) -> Option<Vec<u8>> {
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let payload = match mime {
+            "text/uri-list" => clipboard_paths().map(uri_list),
+            "image/png" => clipboard_picture(),
+            "text/plain" => clipboard_text().map(String::into_bytes),
+            _ => None,
+        };
+        let _ = CloseClipboard();
+        payload
+    }
+}
+
+/// Every format the clipboard currently holds, in the order it lists them.
+fn clipboard_formats() -> Vec<u32> {
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return Vec::new();
+        }
+        let mut formats = Vec::new();
+        let mut format = EnumClipboardFormats(0);
+        while format != 0 {
+            formats.push(format);
+            format = EnumClipboardFormats(format);
+        }
+        let _ = CloseClipboard();
+        formats
+    }
+}
+
+/// The MIME types those Windows formats offer, most specific first.
+///
+/// A picture is one MIME however many formats carry it: an application that writes both
+/// `"PNG"` and a DIB copied one picture, and `read` decides which of them to hand over.
+fn mimes(formats: &[u32]) -> Vec<&'static str> {
+    let has = |format: u32| formats.contains(&format);
+    let mut found = Vec::new();
+    if has(CF_HDROP.0 as u32) {
+        found.push("text/uri-list");
+    }
+    if registered("PNG").is_some_and(has) || has(CF_DIBV5.0 as u32) || has(CF_DIB.0 as u32) {
+        found.push("image/png");
+    }
+    if has(CF_UNICODETEXT.0 as u32) {
+        found.push("text/plain");
+    }
+    found
+}
+
+/// The paths a `CF_HDROP` block names, read by the shell, which owns that format's layout.
+fn clipboard_paths() -> Option<Vec<String>> {
+    unsafe {
+        let handle = GetClipboardData(CF_HDROP.0 as u32).ok()?;
+        let drop = HDROP(handle.0);
+        let count = DragQueryFileW(drop, u32::MAX, None);
+        let mut paths = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let length = DragQueryFileW(drop, index, None) as usize;
+            let mut buffer = vec![0u16; length + 1];
+            DragQueryFileW(drop, index, Some(&mut buffer));
+            paths.push(String::from_utf16_lossy(&buffer[..length]));
+        }
+        // A block that names no path is not a file list, whatever else it holds.
+        (!paths.is_empty()).then_some(paths)
+    }
+}
+
+/// The copied paths as a `text/uri-list`, the Web's file-list form: one `file:` URI a line.
+fn uri_list(paths: Vec<String>) -> Vec<u8> {
+    let mut list = String::new();
+    for path in paths {
+        list.push_str(&file_uri(&path));
+        list.push_str("\r\n");
+    }
+    list.into_bytes()
+}
+
+/// One Windows path as a `file:` URI.
+///
+/// `\\server\share\x` is another machine's share, which a URI names as its host; every other
+/// path has an empty authority, so its own path starts after the third slash.
+fn file_uri(path: &str) -> String {
+    let (authority, path) = match path.strip_prefix(r"\\") {
+        Some(unc) => match unc.split_once('\\') {
+            Some((host, rest)) => (format!("//{host}"), rest.to_owned()),
+            // A share with no path in it still names the share, which has a URI form of its own.
+            None => (format!("//{unc}"), String::new()),
+        },
+        None => ("//".to_owned(), path.to_owned()),
+    };
+    let slash = if path.is_empty() { "" } else { "/" };
+    format!("file:{authority}{slash}{}", encode_path(&path))
+}
+
+/// The path's separators made URI ones and every byte a URI does not carry escaped.
+///
+/// The colon after a drive letter is a path character under RFC 3986 and stays as it is; a
+/// space, a `%` or any non-ASCII byte is escaped from its UTF-8 encoding.
+fn encode_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'\\' => encoded.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+/// The clipboard's picture as PNG: `"PNG"` already is one, and a DIB is decoded into one.
+fn clipboard_picture() -> Option<Vec<u8>> {
+    if let Some(png) = registered("PNG").and_then(block) {
+        return Some(png);
+    }
+    let dib = block(CF_DIBV5.0 as u32).or_else(|| block(CF_DIB.0 as u32))?;
+    match dib_to_png(&dib) {
+        Ok(png) => Some(png),
+        Err(error) => {
+            // The command asked for a picture and cannot have it; say why it could not.
+            log::warn!("ui-platform-win32: {error}");
+            None
+        }
+    }
+}
+
+/// Decode a device-independent bitmap, header first and no file header, into PNG bytes.
+///
+/// The block gets the `BITMAPFILEHEADER` Windows leaves off, because that header is where a
+/// BMP reader learns where the pixels start. Nothing is copied twice: the DIB's own header,
+/// masks and palette follow the fourteen bytes prepended to them.
+fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, String> {
+    let pixels = dib_pixels(dib).ok_or("the copied bitmap does not begin with a bitmap header")?;
+    let mut bmp = Vec::with_capacity(14 + dib.len());
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(
+        &u32::try_from(14 + dib.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    bmp.extend_from_slice(&[0; 4]);
+    let pixels = u32::try_from(14 + pixels).unwrap_or(u32::MAX);
+    bmp.extend_from_slice(&pixels.to_le_bytes());
+    bmp.extend_from_slice(dib);
+    let decoder = image::codecs::bmp::BmpDecoder::new(std::io::Cursor::new(bmp))
+        .map_err(|error| format!("the copied bitmap does not decode: {error}"))?;
+    let image = image::DynamicImage::from_decoder(decoder)
+        .map_err(|error| format!("the copied bitmap does not decode: {error}"))?
+        .into_rgba8();
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| format!("the copied bitmap does not encode as PNG: {error}"))?;
+    Ok(png)
+}
+
+/// Where the DIB's pixels start: after its header, the colour masks and the palette.
+///
+/// A 40-byte info header has no room for bit masks, so `BI_BITFIELDS` puts them right after
+/// it; the later headers carry them inside themselves, and only a paletted bitmap has a
+/// palette at all.
+fn dib_pixels(dib: &[u8]) -> Option<usize> {
+    let header = field(dib, 0)? as usize;
+    if header < 12 {
+        return None;
+    }
+    // The core header states its bit count 16 bits in and has no compression or palette size.
+    if header == 12 {
+        let bits = u16::from_le_bytes([*dib.get(10)?, *dib.get(11)?]) as usize;
+        let palette = if bits <= 8 { 1 << bits } else { 0 };
+        return Some(header + palette * 3);
+    }
+    let bits = u16::from_le_bytes([*dib.get(14)?, *dib.get(15)?]) as usize;
+    let compression = field(dib, 16)?;
+    let used = field(dib, 32)? as usize;
+    let palette = if bits <= 8 {
+        if used == 0 { 1 << bits } else { used }
+    } else {
+        0
+    };
+    let masks = if compression == 3 && header == 40 {
+        12
+    } else {
+        0
+    };
+    Some(header + masks + palette * 4)
+}
+
+/// A little-endian 32-bit field, the only width a bitmap header's numbers use.
+fn field(bytes: &[u8], offset: usize) -> Option<u32> {
+    let bytes = bytes.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// The clipboard's bytes for one format, copied while the clipboard is open.
+///
+/// `None` when the format is not there, or when the block cannot be locked or sized.
+fn block(format: u32) -> Option<Vec<u8>> {
+    unsafe {
+        let handle = GetClipboardData(format).ok()?;
+        let memory = windows::Win32::Foundation::HGLOBAL(handle.0);
+        let pointer = GlobalLock(memory);
+        if pointer.is_null() {
+            return None;
+        }
+        let length = GlobalSize(memory);
+        let bytes = std::slice::from_raw_parts(pointer.cast::<u8>(), length).to_vec();
+        let _ = GlobalUnlock(memory);
+        Some(bytes)
     }
 }
 
@@ -309,4 +571,90 @@ fn as_bytes<T>(value: &T) -> &[u8] {
     // SAFETY: the DIB headers are plain `repr(C)` integers, so every byte of one is
     // initialised and reading it as a byte slice cannot observe another type's padding.
     unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 2x2 fixture: red and green over blue and white, and one pixel that only `CF_DIBV5`
+    /// can carry the alpha of.
+    fn picture() -> image::RgbaImage {
+        let mut picture = image::RgbaImage::new(2, 2);
+        picture.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        picture.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+        picture.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
+        picture.put_pixel(1, 1, image::Rgba([255, 255, 255, 128]));
+        picture
+    }
+
+    fn png_of(picture: &image::RgbaImage) -> Vec<u8> {
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                picture.as_raw(),
+                picture.width(),
+                picture.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("the fixture encodes");
+        png
+    }
+
+    fn decoded(png: &[u8]) -> image::RgbaImage {
+        image::load_from_memory_with_format(png, image::ImageFormat::Png)
+            .expect("the read side encodes a PNG")
+            .to_rgba8()
+    }
+
+    /// A picture copied to a DIB is read back from one, because the clipboard's picture is
+    /// whichever format the application chose to write. Row order, channel order and the
+    /// alpha a `CF_DIB` cannot carry are what this pins.
+    #[test]
+    fn a_written_dib_reads_back_as_the_same_picture() {
+        let picture = picture();
+        let formats = png_formats(&png_of(&picture)).expect("a PNG is a picture");
+        let dib = |wanted: u32| {
+            formats
+                .iter()
+                .find(|(format, _)| *format == wanted)
+                .map(|(_, bytes)| bytes)
+                .expect("the write side offers both DIB headers")
+        };
+
+        assert_eq!(
+            decoded(&dib_to_png(dib(CF_DIBV5.0 as u32)).expect("the V5 DIB decodes")),
+            picture
+        );
+
+        // `CF_DIB`'s words have no alpha channel at all, so an application reading one sees
+        // the picture, not a hole where the alpha byte was left at zero.
+        let mut opaque = picture.clone();
+        for pixel in opaque.pixels_mut() {
+            pixel[3] = 255;
+        }
+        assert_eq!(
+            decoded(&dib_to_png(dib(CF_DIB.0 as u32)).expect("the DIB decodes")),
+            opaque
+        );
+    }
+
+    /// A copied file is handed over as `CF_HDROP`, whose paths become the Web's file-list
+    /// form; a path the URI cannot spell put another file on the paste.
+    #[test]
+    fn a_copied_path_becomes_a_file_uri() {
+        assert_eq!(
+            file_uri(r"C:\Users\a b\shot #1.png"),
+            "file:///C:/Users/a%20b/shot%20%231.png"
+        );
+        assert_eq!(
+            file_uri(r"\\build\share\one.png"),
+            "file://build/share/one.png"
+        );
+        let list = uri_list(vec![r"C:\one.png".into(), r"\\build\share\two.png".into()]);
+        assert_eq!(
+            String::from_utf8(list).expect("a URI list is text"),
+            "file:///C:/one.png\r\nfile://build/share/two.png\r\n"
+        );
+    }
 }

@@ -2049,6 +2049,7 @@ name = "ui-platform-win32"
 version = "0.1.0"
 dependencies = [
  "image",
+ "log",
  "ui-core",
  "ui-gpu-d3d11",
  "ui-gpu-scene",

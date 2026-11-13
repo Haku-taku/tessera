@@ -17,8 +17,9 @@ ui-gpu-d3d11 = { path = "../ui-gpu-d3d11" }
 # user32 and dxgi, and there is nothing to fall back to.
 [target.'cfg(windows)'.dependencies]
 # A copied picture is offered to Windows as a DIB, which is pixels, while the engine hands
-# over a PNG; the decoder is the only way from one to the other.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# over a PNG; reading one back walks the same table, so both decoders are needed.
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+log = "0.4"
 windows = { version = "0.62", features = [
     "Foundation",
     "Graphics_Capture",
