@@ -77,7 +77,13 @@ impl<A: App> Session<A> {
     }
 
     /// All three at once, for host code that needs the engine and the window together.
-    pub fn split(&mut self) -> (&mut AppLoop<A>, &mut Win32Window, Option<&mut Win32Presenter>) {
+    pub fn split(
+        &mut self,
+    ) -> (
+        &mut AppLoop<A>,
+        &mut Win32Window,
+        Option<&mut Win32Presenter>,
+    ) {
         (&mut self.lp, &mut self.win, Some(&mut self.presenter))
     }
 
@@ -126,6 +132,34 @@ impl<A: App> Session<A> {
     /// Drain the GPU; how long this takes is the backlog teardown would otherwise inherit.
     pub fn finish(&mut self) {
         self.presenter.finish();
+    }
+
+    /// One non-blocking turn: take the thread's messages, then draw if a frame is due.
+    ///
+    /// The host's form. It never waits — the queue is the process's and the loop sleeps
+    /// once for every surface — so it can be called for each surface of a process in turn.
+    pub fn step(&mut self) -> Result<Tick, String> {
+        self.win.pump();
+        if self.finished() {
+            return Ok(Tick::default());
+        }
+        let pointer = match self.driver.decide(&mut self.lp, &mut self.win) {
+            Turn::Draw { pointer } => pointer,
+            Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
+        };
+        self.draw(pointer)
+    }
+
+    /// When the loop must wake with nothing arriving: the engine's own deadlines.
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        // A turn that drew clears the driver's deadline, yet an animation in flight or a
+        // build that read the clock still owes the next frame. Saying "now" is what makes
+        // the host come straight back instead of sleeping until the poll timeout.
+        let owed = self.lp.is_animating().then(std::time::Instant::now);
+        match (owed, self.driver.deadline()) {
+            (Some(now), Some(at)) => Some(now.min(at)),
+            (now, at) => now.or(at),
+        }
     }
 
     /// Intake, decide, draw and pace — everything a frame needs, waiting included.

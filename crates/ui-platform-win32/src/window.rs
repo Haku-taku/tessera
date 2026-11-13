@@ -4,14 +4,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use ui_core::clipboard::ClipboardContent;
 use ui_core::geom::Point;
 use ui_core::{CursorShape, Event};
-use ui_core::clipboard::ClipboardContent;
 use ui_platform::driver::FrameHost;
 use ui_platform::window::{SurfaceRole, SurfaceSpec};
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, GlobalFree, HINSTANCE, HWND, LPARAM, LRESULT,
-    POINT, RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, GlobalFree, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
+    RECT, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
@@ -35,19 +35,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HTCLIENT,
-    IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
-    IDC_SIZENWSE, IDC_SIZEWE, IsWindow, LoadCursorW, MSG, MWMO_INPUTAVAILABLE, PM_NOREMOVE,
-    PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW,
-    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WNDCLASSEXW, WM_CHAR, WM_CLOSE,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_CROSS,
+    IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+    IsWindow, LoadCursorW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE,
+    PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SetCursor, SetCursorPos, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW,
     WS_OVERLAPPEDWINDOW,
-    MsgWaitForMultipleObjectsEx,
 };
 use windows::core::PCWSTR;
 
@@ -264,11 +262,7 @@ impl Win32Window {
     /// Physical pixels per logical unit.
     pub fn scale(&self) -> f32 {
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-        if dpi == 0 {
-            1.0
-        } else {
-            dpi as f32 / 96.0
-        }
+        if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
     }
 
     /// The pointer in logical units, once it has entered the client area.
@@ -322,10 +316,7 @@ impl Win32Window {
     /// step) can only be noticed between turns, and an unbounded wait would swallow it
     /// until unrelated input arrived.
     pub fn wait_until(&mut self, timeout: Option<Duration>) -> bool {
-        let wait = timeout
-            .unwrap_or(Duration::from_millis(250))
-            .min(Duration::from_secs(1));
-        let millis = wait.as_millis().min(u32::MAX as u128 - 1) as u32;
+        let millis = bounded_millis(timeout);
         unsafe { MsgWaitForMultipleObjectsEx(None, millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
         // Peeked, not removed: `take_events` is what drains and dispatches.
         let mut message = MSG::default();
@@ -342,11 +333,7 @@ impl Win32Window {
     /// A Win32 window has no frame callback; `DwmFlush` blocks until the composition pass
     /// that will show what was presented, which is the same pacing point.
     pub fn wait_for_frame(&mut self) {
-        if unsafe { DwmFlush() }.is_err() {
-            // Composition is off, so there is no flush to wait for; a short sleep keeps the
-            // loop from spinning at unbounded speed.
-            std::thread::sleep(Duration::from_millis(8));
-        }
+        wait_for_composition();
     }
 
     /// Apply the pointer shape this frame resolved; false when it was already that shape.
@@ -383,19 +370,7 @@ impl Win32Window {
 
     /// Put text on the clipboard; false when the content is not text this backend carries.
     pub fn write_clipboard(&mut self, content: ClipboardContent) -> bool {
-        let ClipboardContent::Text(text) = content else {
-            return false;
-        };
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe {
-            if OpenClipboard(Some(self.hwnd)).is_err() {
-                return false;
-            }
-            let stored = store_clipboard_text(&wide);
-            // Closing is the copy's real commit; a failure leaves the old clipboard intact.
-            let _ = CloseClipboard();
-            stored
-        }
+        write_clipboard_text(Some(self.hwnd), content)
     }
 
     /// Read the clipboard into a paste event; false when it holds no text.
@@ -491,7 +466,8 @@ unsafe fn handle(
 ) -> Option<LRESULT> {
     match message {
         WM_NCDESTROY => {
-            let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const RefCell<WindowState>;
+            let raw =
+                unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const RefCell<WindowState>;
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
             if !raw.is_null() {
                 // The count `Win32Window::new` added is released with the window itself.
@@ -662,9 +638,9 @@ fn key(state: &RefCell<WindowState>, vk: u16, down: bool) {
     } else if down && (held.ctrl || held.alt || held.logo) {
         // The text path never carries a chord: Ctrl+A must not insert an `a`.
         if let Some(character) = input::command_char(vk) {
-            state
-                .events
-                .push(Event::KeyPressed { key: ui_core::Key::Char(character) });
+            state.events.push(Event::KeyPressed {
+                key: ui_core::Key::Char(character),
+            });
         }
     }
 }
@@ -719,7 +695,10 @@ unsafe fn store_clipboard_text(wide: &[u16]) -> bool {
         }
         std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), target.cast::<u8>(), bytes);
         let _ = GlobalUnlock(handle);
-        match SetClipboardData(CF_UNICODETEXT.0 as u32, Some(windows::Win32::Foundation::HANDLE(handle.0))) {
+        match SetClipboardData(
+            CF_UNICODETEXT.0 as u32,
+            Some(windows::Win32::Foundation::HANDLE(handle.0)),
+        ) {
             // On success the clipboard owns the block and frees it itself.
             Ok(_) => true,
             Err(_) => {
@@ -777,6 +756,54 @@ fn register_class(class: &[u16], instance: HINSTANCE) -> Result<(), WindowError>
         }
     }
     Ok(())
+}
+
+/// How long a wait may last with no deadline given.
+///
+/// Bounded even then: an app-owned deadline (a lifetime, a scripted step) is only noticed
+/// between turns, and an unbounded wait would swallow it until unrelated input arrived.
+pub(crate) fn bounded_millis(timeout: Option<Duration>) -> u32 {
+    let wait = timeout
+        .unwrap_or(Duration::from_millis(250))
+        .min(Duration::from_secs(1));
+    wait.as_millis().min(u32::MAX as u128 - 1) as u32
+}
+
+/// Wait for the desktop compositor to take the next frame.
+///
+/// A Win32 window has no frame callback; `DwmFlush` blocks until the composition pass that
+/// will show what was presented, which is the same pacing point.
+pub(crate) fn wait_for_composition() {
+    if unsafe { DwmFlush() }.is_err() {
+        // Composition is off, so there is no flush to wait for; a short sleep keeps the
+        // loop from spinning at unbounded speed.
+        std::thread::sleep(Duration::from_millis(8));
+    }
+}
+
+/// Put text on the system clipboard with no window of its own.
+///
+/// A process-wide copy has no window to own the selection, and on Windows the clipboard
+/// belongs to the task when opened without one.
+pub fn set_system_clipboard(content: ClipboardContent) -> bool {
+    write_clipboard_text(None, content)
+}
+
+/// Open the clipboard, store `content`, and close it again.
+fn write_clipboard_text(owner: Option<HWND>, content: ClipboardContent) -> bool {
+    let ClipboardContent::Text(text) = content else {
+        return false;
+    };
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        if OpenClipboard(owner).is_err() {
+            return false;
+        }
+        let stored = store_clipboard_text(&wide);
+        // Closing is the copy's real commit; a failure leaves the old clipboard intact.
+        let _ = CloseClipboard();
+        stored
+    }
 }
 
 fn wide(value: &str) -> Vec<u16> {

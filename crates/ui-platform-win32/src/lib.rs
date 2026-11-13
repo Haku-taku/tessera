@@ -10,16 +10,18 @@
 
 #![cfg(windows)]
 
+mod backend;
 mod input;
 mod presenter;
 mod session;
 mod theme;
 mod window;
 
+pub use backend::Win32Backend;
 pub use presenter::Win32Presenter;
 pub use session::Session;
-pub use ui_platform::session::{HostSession, SessionOptions, Tick};
 pub use theme::Win32ThemeWatcher;
+pub use ui_platform::session::{HostSession, SessionOptions, Tick};
 pub use window::Win32Window;
 
 /// Why the window or its presentation path could not open.
