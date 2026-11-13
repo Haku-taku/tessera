@@ -5,10 +5,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ui_core::clipboard::ClipboardContent;
-use ui_core::geom::Point;
+use ui_core::geom::{Point, Rect};
 use ui_core::{CursorShape, Event};
 use ui_platform::driver::FrameHost;
-use ui_platform::window::{SurfaceRole, SurfaceSpec};
+use ui_platform::window::{KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, GlobalFree, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
     RECT, WPARAM,
@@ -16,7 +16,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, HBRUSH,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow, PAINTSTRUCT,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
+    MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -28,24 +29,26 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::HiDpi::{
-    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
-    GetDpiForWindow, SetProcessDpiAwarenessContext,
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor,
+    GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_CROSS,
-    IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
-    IsWindow, LoadCursorW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE,
-    PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SetCursor, SetCursorPos, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW,
-    WS_OVERLAPPEDWINDOW,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT,
+    IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
+    IDC_SIZENWSE, IDC_SIZEWE, IsWindow, LoadCursorW, MA_ACTIVATE, MA_NOACTIVATE, MSG,
+    MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
+    QS_ALLINPUT, RegisterClassExW, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SetCursor, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -75,6 +78,12 @@ struct WindowState {
     dpi: u32,
     /// The system light/dark preference changed since the last poll.
     theme_changed: bool,
+    /// A layer's keyboard request; `None` for a window the manager places, which has no
+    /// shape and no activation rule of its own.
+    keyboard: Option<KeyboardMode>,
+    /// The areas the last frame's tree consumes, surface-local logical units; `None` until a
+    /// frame publishes one, which leaves the whole surface consuming input.
+    input: Option<Vec<Rect>>,
 }
 
 /// A window the window manager places, decorates and stacks.
@@ -86,12 +95,9 @@ pub struct Win32Window {
 }
 
 impl Win32Window {
-    /// Open the window `spec` asks for. Only the window role exists on this backend so far.
+    /// Open the window `spec` asks for: a window the manager places, or a layer this backend
+    /// approximates with an undecorated popup held at the level the spec names.
     pub fn new(spec: SurfaceSpec) -> Result<Self, WindowError> {
-        let size = match spec.role {
-            SurfaceRole::Window { size } => size,
-            SurfaceRole::Layer(_) => return Err(WindowError::UnsupportedRole),
-        };
         // A manifest may already have fixed the process's awareness; a refusal means it did.
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -106,28 +112,14 @@ impl Win32Window {
             .map_err(|error| WindowError::Win32(format!("GetModuleHandleW: {error}")))?;
         let instance = HINSTANCE(instance.0);
         register_class(&class, instance)?;
-        // The spec's size is logical; the window is created at the system's DPI.
-        let dpi = unsafe { GetDpiForSystem() }.max(96);
-        let scale = dpi as f32 / 96.0;
-        let mut frame = RECT {
-            left: 0,
-            top: 0,
-            right: (size.0 as f32 * scale).round().max(1.0) as i32,
-            bottom: (size.1 as f32 * scale).round().max(1.0) as i32,
+        let opening = match &spec.role {
+            SurfaceRole::Window { size } => opening_window(*size)?,
+            SurfaceRole::Layer(layer) => opening_layer(layer)?,
         };
-        unsafe {
-            AdjustWindowRectExForDpi(
-                &mut frame,
-                WS_OVERLAPPEDWINDOW,
-                false,
-                WINDOW_EX_STYLE(0),
-                dpi,
-            )
-        }
-        .map_err(|error| WindowError::Win32(format!("AdjustWindowRectExForDpi: {error}")))?;
         let title = wide(&spec.name);
         let state = Rc::new(RefCell::new(WindowState {
-            dpi,
+            dpi: opening.dpi,
+            keyboard: opening.keyboard,
             ..WindowState::default()
         }));
         // The procedure needs the state from `WM_NCCREATE` on, before `CreateWindowExW`
@@ -137,14 +129,14 @@ impl Win32Window {
         unsafe { Rc::increment_strong_count(raw) };
         let hwnd = unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                opening.ex_style,
                 PCWSTR::from_raw(class.as_ptr()),
                 PCWSTR::from_raw(title.as_ptr()),
-                WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                frame.right - frame.left,
-                frame.bottom - frame.top,
+                opening.style,
+                opening.x,
+                opening.y,
+                opening.width,
+                opening.height,
                 None,
                 None,
                 Some(instance),
@@ -162,7 +154,19 @@ impl Win32Window {
         // The return value says whether the window was previously visible, which is not
         // an outcome this backend has a use for.
         unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            let command = if opening.keyboard.is_some() {
+                // Showing a layer must not take the keyboard away from the desktop; only an
+                // exclusive one asks for it, and even then as a separate step.
+                SW_SHOWNOACTIVATE
+            } else {
+                SW_SHOW
+            };
+            let _ = ShowWindow(hwnd, command);
+            if opening.keyboard == Some(KeyboardMode::Exclusive) {
+                // A hotkey press is what usually makes this succeed; the shell may refuse,
+                // and the click still activates the surface through `WM_MOUSEACTIVATE`.
+                let _ = SetForegroundWindow(hwnd);
+            }
         }
         Ok(Self { hwnd, state })
     }
@@ -343,6 +347,18 @@ impl Win32Window {
         true
     }
 
+    /// Publish where this frame's tree consumes input, in surface-local logical units.
+    ///
+    /// Only a layer has a shape of its own to publish: a window the manager places consumes
+    /// its whole client area, which is already what the default hit test gives it.
+    pub fn set_input_region(&mut self, areas: &[Rect]) {
+        let mut state = self.state.borrow_mut();
+        if state.keyboard.is_none() || state.input.as_deref() == Some(areas) {
+            return;
+        }
+        state.input = Some(areas.to_vec());
+    }
+
     /// Move the pointer by a logical offset; false when the platform refused.
     pub fn nudge_pointer(&mut self, dx: f32, dy: f32) -> bool {
         let mut point = POINT::default();
@@ -378,6 +394,147 @@ impl Win32Window {
         };
         self.state.borrow_mut().events.push(Event::Paste(text));
         true
+    }
+}
+
+/// What `CreateWindowExW` is asked for, worked out from the surface's role.
+struct Opening {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    style: WINDOW_STYLE,
+    ex_style: WINDOW_EX_STYLE,
+    /// The DPI of the monitor the window opens on, which its first scale reflects.
+    dpi: u32,
+    /// A layer's keyboard request; `None` for a window the manager places.
+    keyboard: Option<KeyboardMode>,
+}
+
+/// An overlapped window at the manager's default position, sized for `size` logical pixels.
+fn opening_window(size: (u32, u32)) -> Result<Opening, WindowError> {
+    let dpi = unsafe { GetDpiForSystem() }.max(96);
+    let scale = dpi as f32 / 96.0;
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: (size.0 as f32 * scale).round().max(1.0) as i32,
+        bottom: (size.1 as f32 * scale).round().max(1.0) as i32,
+    };
+    unsafe {
+        AdjustWindowRectExForDpi(
+            &mut frame,
+            WS_OVERLAPPEDWINDOW,
+            false,
+            WINDOW_EX_STYLE(0),
+            dpi,
+        )
+    }
+    .map_err(|error| WindowError::Win32(format!("AdjustWindowRectExForDpi: {error}")))?;
+    Ok(Opening {
+        x: CW_USEDEFAULT,
+        y: CW_USEDEFAULT,
+        width: frame.right - frame.left,
+        height: frame.bottom - frame.top,
+        style: WS_OVERLAPPEDWINDOW,
+        ex_style: WINDOW_EX_STYLE(0),
+        dpi,
+        keyboard: None,
+    })
+}
+
+/// A layer as the closest thing Win32 has: a borderless popup on the primary monitor.
+///
+/// The portable spec names no output, so the primary monitor is where a layer lands, as the
+/// first bound output is on Wayland. The popup is placed by arithmetic on the monitor's
+/// rectangle; nothing in the shell anchors it afterwards.
+fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
+    let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err(WindowError::Win32(String::from(
+            "GetMonitorInfoW: no primary monitor",
+        )));
+    }
+    let (mut dpi_x, mut dpi_y) = (0, 0);
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
+        .map_err(|error| WindowError::Win32(format!("GetDpiForMonitor: {error}")))?;
+    let scale = dpi_x.max(96) as f32 / 96.0;
+    let rect = info.rcMonitor;
+    let (x, width) = Span {
+        start: rect.left,
+        end: rect.right,
+        near: layer.anchor.left,
+        far: layer.anchor.right,
+        near_margin: layer.margin.left,
+        far_margin: layer.margin.right,
+    }
+    .place(layer.size.map(|size| size.0), scale);
+    let (y, height) = Span {
+        start: rect.top,
+        end: rect.bottom,
+        near: layer.anchor.top,
+        far: layer.anchor.bottom,
+        near_margin: layer.margin.top,
+        far_margin: layer.margin.bottom,
+    }
+    .place(layer.size.map(|size| size.1), scale);
+    let mut ex_style = WS_EX_TOOLWINDOW;
+    // Only the upper layers have a topmost counterpart. A lower one degrades to an ordinary
+    // window: Win32 has no supported way to sit beneath other applications' windows.
+    if matches!(layer.level, Layer::Overlay | Layer::Top) {
+        ex_style |= WS_EX_TOPMOST;
+    }
+    if layer.keyboard == KeyboardMode::None {
+        ex_style |= WS_EX_NOACTIVATE;
+    }
+    Ok(Opening {
+        x,
+        y,
+        width,
+        height,
+        style: WS_POPUP,
+        ex_style,
+        dpi: dpi_x.max(96),
+        keyboard: Some(layer.keyboard),
+    })
+}
+
+/// One axis of the monitor's rectangle, with what the spec asks of it on that axis.
+struct Span {
+    start: i32,
+    end: i32,
+    near: bool,
+    far: bool,
+    near_margin: f32,
+    far_margin: f32,
+}
+
+impl Span {
+    /// The origin and extent this axis gets: the anchors decide, the margins inset, and
+    /// `size` is honoured only where a single edge (or none) leaves room for it.
+    fn place(self, size: Option<u32>, scale: f32) -> (i32, i32) {
+        let near = self.near.then(|| (self.near_margin * scale).round() as i32);
+        let far = self.far.then(|| (self.far_margin * scale).round() as i32);
+        let inner_start = self.start + near.unwrap_or(0);
+        let inner_end = self.end - far.unwrap_or(0);
+        let span = (inner_end - inner_start).max(1);
+        // Both edges pinned is what stretches the surface; a requested size has nowhere to go.
+        let requested = match (near, far) {
+            (Some(_), Some(_)) => None,
+            _ => size.map(|size| (size as f32 * scale).round() as i32),
+        };
+        let extent = requested.unwrap_or(span);
+        let origin = match (near, far) {
+            (Some(_), None) => inner_start,
+            (None, Some(_)) => inner_end - extent,
+            // Unanchored on this axis the surface is centred, as it is on Wayland.
+            _ => inner_start + (span - extent) / 2,
+        };
+        (origin, extent)
     }
 }
 
@@ -486,7 +643,13 @@ unsafe fn handle(
             let mut window = state.borrow_mut();
             window.dpi = ((wparam.0 as u32) >> 16).max(96);
             window.silent_change = true;
+            let layer = window.keyboard.is_some();
             drop(window);
+            if layer {
+                // A layer's rectangle comes from its spec, and the manager's suggested one
+                // would move it off that placement.
+                return Some(LRESULT(0));
+            }
             // The suggested rectangle keeps the client area the same logical size.
             let suggested = unsafe { &*(lparam.0 as *const RECT) };
             unsafe {
@@ -501,6 +664,35 @@ unsafe fn handle(
                 );
             }
             Some(LRESULT(0))
+        }
+        WM_NCHITTEST => {
+            // Only a layer answers; a window the manager placed keeps the default hit test.
+            state.borrow().keyboard?;
+            let consumed = consumes_at(state, hwnd, packed_point(lparam));
+            Some(LRESULT(if consumed {
+                HTCLIENT as isize
+            } else {
+                HTTRANSPARENT as isize
+            }))
+        }
+        WM_MOUSEACTIVATE => {
+            let keyboard = state.borrow().keyboard;
+            let command = match keyboard {
+                // A window the manager places activates the ordinary way.
+                None => return None,
+                Some(KeyboardMode::None) => MA_NOACTIVATE,
+                Some(KeyboardMode::Exclusive) => MA_ACTIVATE,
+                // Windows has no focus-follows-pointer contract, so `FollowPointer` is the
+                // same rule as `OnDemand`: a click on a consumed area focuses the surface.
+                Some(KeyboardMode::OnDemand | KeyboardMode::FollowPointer) => {
+                    let mut point = POINT::default();
+                    // The cursor is where the click landed; the message carries no position.
+                    let inside = unsafe { GetCursorPos(&mut point) }.is_ok()
+                        && consumes_at(state, hwnd, point);
+                    if inside { MA_ACTIVATE } else { MA_NOACTIVATE }
+                }
+            };
+            Some(LRESULT(command as isize))
         }
         WM_MOUSEMOVE => {
             let pos = logical(state, lparam);
@@ -636,12 +828,37 @@ fn key(state: &RefCell<WindowState>, vk: u16, down: bool) {
     }
 }
 
+/// A message's position: two signed shorts packed into one parameter, in screen or client
+/// coordinates depending on the message.
+fn packed_point(lparam: LPARAM) -> POINT {
+    POINT {
+        x: (lparam.0 as i32) as i16 as i32,
+        y: ((lparam.0 as i32) >> 16) as i16 as i32,
+    }
+}
+
 /// A message's client position in logical units.
 fn logical(state: &RefCell<WindowState>, lparam: LPARAM) -> Point {
-    let x = (lparam.0 as i32) as i16 as i32;
-    let y = ((lparam.0 as i32) >> 16) as i16 as i32;
+    let point = packed_point(lparam);
     let scale = state.borrow().dpi.max(96) as f32 / 96.0;
-    Point::new(x as f32 / scale, y as f32 / scale)
+    Point::new(point.x as f32 / scale, point.y as f32 / scale)
+}
+
+/// Whether a screen position lands on an area the last frame's tree consumes.
+fn consumes_at(state: &RefCell<WindowState>, hwnd: HWND, mut point: POINT) -> bool {
+    let window = state.borrow();
+    let Some(areas) = window.input.as_ref() else {
+        // Nothing published yet: the whole surface is the engine's, which is the default.
+        return true;
+    };
+    // A refused conversion leaves the point in screen coordinates; the whole surface is the
+    // better answer for a window that no longer maps where the message says.
+    if !unsafe { ScreenToClient(hwnd, &mut point) }.as_bool() {
+        return true;
+    }
+    let scale = window.dpi.max(96) as f32 / 96.0;
+    let pos = Point::new(point.x as f32 / scale, point.y as f32 / scale);
+    areas.iter().any(|area| area.contains(pos))
 }
 
 fn button(message: u32) -> ui_core::PointerButton {

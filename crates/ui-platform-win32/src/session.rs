@@ -363,4 +363,8 @@ impl SceneTarget for Target<'_> {
     fn set_cursor(&mut self, shape: ui_core::CursorShape) {
         self.win.set_cursor(shape);
     }
+
+    fn set_input_region(&mut self, areas: &[ui_core::geom::Rect]) {
+        self.win.set_input_region(areas);
+    }
 }

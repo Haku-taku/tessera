@@ -32,8 +32,6 @@ pub use window::Win32Window;
 pub enum WindowError {
     /// A Win32 call failed.
     Win32(String),
-    /// Only the role of a window the manager places exists on this backend.
-    UnsupportedRole,
     /// D3D11 or DXGI could not set up the device, the renderer or the swap chain.
     Gpu(String),
 }
@@ -42,7 +40,6 @@ impl core::fmt::Display for WindowError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Win32(message) => write!(f, "win32: {message}"),
-            Self::UnsupportedRole => write!(f, "this backend only opens windows, not layers"),
             Self::Gpu(message) => write!(f, "gpu: {message}"),
         }
     }
