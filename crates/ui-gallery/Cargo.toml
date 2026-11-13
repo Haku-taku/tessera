@@ -26,8 +26,15 @@ hotpath = { version = "0.30", optional = true, default-features = false }
 profile = ["dep:hotpath", "hotpath/hotpath", "ui-platform/profile", "ui-platform-wayland/profile"]
 
 [dev-dependencies]
-# Examples present through a real window; the GPU path needs the dma-buf backend.
-ui-platform-wayland = { path = "../ui-platform-wayland", features = ["system-fonts", "gpu"] }
 # The material demo loads a real photo, and the gallery's wallpaper is a PNG: one decoder
 # per format keeps it honest without pulling in the rest of the crate.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ui-gpu-scene = { workspace = true }
+
+# Examples present through a real window. Which backend that is depends on the target, and
+# a target can only name the backends that compile there.
+[target.'cfg(unix)'.dev-dependencies]
+ui-platform-wayland = { path = "../ui-platform-wayland", features = ["system-fonts", "gpu"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+ui-platform-win32 = { path = "../ui-platform-win32" }

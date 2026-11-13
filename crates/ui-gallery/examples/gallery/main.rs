@@ -171,15 +171,6 @@ fn epoch_ms() -> u128 {
         .map_or(0, |d| d.as_millis())
 }
 
-/// This process's CPU time so far, in seconds: user plus system, from `/proc/self/stat`.
-fn cpu_seconds() -> f64 {
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-    let fields: Vec<&str> = stat.split_whitespace().collect();
-    let ticks: f64 = fields.get(13).and_then(|s| s.parse().ok()).unwrap_or(0.0)
-        + fields.get(14).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    ticks / 100.0
-}
-
 /// `GALLERY_CLOSE_AFTER=n` closes the window itself after n seconds.
 fn close_after() -> Option<f32> {
     std::env::var("GALLERY_CLOSE_AFTER")
@@ -486,6 +477,7 @@ fn watch_for_perf() {
 
 // Run: `WAYLAND_DISPLAY=wayland-2 cargo run -q -p ui-gallery --example gallery`
 /// Let an outside debugger attach to this process; `yama.ptrace_scope=1` otherwise refuses.
+#[cfg(unix)]
 fn allow_ptrace() {
     unsafe extern "C" {
         fn prctl(option: i32, ...) -> i32;
@@ -496,6 +488,10 @@ fn allow_ptrace() {
         prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
     }
 }
+
+/// Nothing to allow: the debugger attaches without the process's consent.
+#[cfg(not(unix))]
+fn allow_ptrace() {}
 
 #[cfg_attr(feature = "profile", hotpath::main)]
 fn main() {
@@ -725,9 +721,7 @@ fn run(mut session: Session<Gallery>) {
     // rasterizes on it, or glyphs would only be magnified from a 1× atlas.
     let ss = supersample();
     session.lp_mut().set_supersample(ss);
-    if let Some(gpu) = session.gpu_mut() {
-        gpu.renderer_mut().set_supersample(ss);
-    }
+    set_supersample(&mut session, ss);
     // A pinned capture density reaches every glass material through the tuning table.
     if let Some(v) = capture_scale() {
         ui_widgets_glass::tuning::set(ui_widgets_glass::tuning::Knob::CaptureScale, Some(v));
@@ -781,7 +775,7 @@ fn run(mut session: Session<Gallery>) {
     let key = key_once();
     let mut key_done = false;
     // The presenter never changes mid-run; the report below reads it once per turn.
-    let gpu_present = session.gpu_mut().is_some();
+    let gpu_present = gpu_present(&mut session);
 
     while !session.finished()
         && !STOP.load(std::sync::atomic::Ordering::Relaxed)
@@ -816,7 +810,11 @@ fn run(mut session: Session<Gallery>) {
             // CPU share of one core over the last second: idle and busy runs differ here.
             let wall = beat_at.elapsed().as_secs_f64();
             let cpu = cpu_seconds();
-            let share = (cpu - beat_cpu) / wall.max(1e-3) * 100.0;
+            // A host that cannot report CPU time leaves the field out rather than printing 0.
+            let share = cpu.zip(beat_cpu).map_or_else(
+                || String::from("n/a"),
+                |(cpu, previous)| format!("{:.0}%", (cpu - previous) / wall.max(1e-3) * 100.0),
+            );
             beat_at = Instant::now();
             beat_cpu = cpu;
             // `cbs` is what the compositor offered: builds below it means the loop dropped
@@ -833,10 +831,10 @@ fn run(mut session: Session<Gallery>) {
             } else {
                 String::new()
             };
-            let cbs = session.window_mut().take_frame_callbacks();
-            let hz = session.window().refresh_hz();
+            let cbs = frame_callbacks(&mut session);
+            let hz = refresh_hz(&session);
             eprintln!(
-                "[hb] t={} turns={} builds={} cbs={} cpu={share:.0}% commit={beat_commit} (dirty={beat_damage} anim={beat_anim} draws={beat_draws} band={band:.1}%{heap}) idle={beat_idle} refresh={:?}",
+                "[hb] t={} turns={} builds={} cbs={} cpu={share} commit={beat_commit} (dirty={beat_damage} anim={beat_anim} draws={beat_draws} band={band:.1}%{heap}) idle={beat_idle} refresh={:?}",
                 epoch_ms(),
                 turns - beat_turns,
                 frames - beat_frames,
@@ -1094,14 +1092,10 @@ fn run(mut session: Session<Gallery>) {
                 if want_dump()
                     && !dumped
                     && frames >= dump_frame()
-                    && let Some(gpu) = session.gpu_mut()
+                    && let Some(path) = dump_frame_now(&mut session)
                 {
-                    let _ = gpu.dump_ppm(
-                        std::path::Path::new("/tmp/gallery_frame.ppm"),
-                        std::path::Path::new("/tmp/gallery_layer.ppm"),
-                    );
                     dumped = true;
-                    println!("dumped /tmp/gallery_frame.ppm");
+                    println!("dumped {}", path.display());
                 }
             } else {
                 beat_idle += 1;
@@ -1113,7 +1107,7 @@ fn run(mut session: Session<Gallery>) {
         frames += 1;
     }
     if framelog {
-        let (partial, full) = ui_platform_wayland::partial_frames();
+        let (partial, full) = partial_frames();
         eprintln!("redraw: partial={partial} full={full}");
         // Entries held and lookups (hits, misses): reuse means a still frame rebuilt nothing.
         let (kept, hits, misses) = session.lp().decl_cache_stats();
@@ -1126,29 +1120,32 @@ fn run(mut session: Session<Gallery>) {
         frames as f32 / secs.max(1e-3),
         waited.as_secs_f64() * 1000.0 / waited_n.max(1) as f64
     );
-    let cpu = cpu_seconds() - cpu_start;
-    let (partial, full) = ui_platform_wayland::partial_frames();
-    println!(
-        "cpu {cpu:.3}s over {frames} frames = {:.0}µs/frame (partial {partial}, full {full})",
-        cpu * 1e6 / frames.max(1) as f64
-    );
+    let (partial, full) = partial_frames();
+    // Frame rate follows the compositor, so CPU per frame is the only number two builds can
+    // be compared on; a host that cannot report it prints the draw counts alone.
+    match (cpu_start, cpu_seconds()) {
+        (Some(start), Some(end)) => {
+            let cpu = end - start;
+            println!(
+                "cpu {cpu:.3}s over {frames} frames = {:.0}µs/frame (partial {partial}, full {full})",
+                cpu * 1e6 / frames.max(1) as f64
+            );
+        }
+        _ => println!("redraw: partial={partial} full={full}"),
+    }
     // In-flight dma-bufs at exit: a growing count means the compositor is not releasing them.
-    println!(
-        "dmabuf: {} inflight, {} released",
-        session.window().dmabuf_inflight(),
-        session.window().dmabuf_releases()
-    );
+    if let Some((inflight, released)) = dmabuf_stats(&session) {
+        println!("dmabuf: {inflight} inflight, {released} released");
+    }
     // Teardown order is the session's: GPU objects while the surface still exists, then the
     // loop, then the window. Timed because a slow exit is a user-visible bug.
     let t0 = Instant::now();
     ui_platform::exit_probe::stage("loop-end");
     // `EXIT_FINISH=1` drains the GPU before teardown; how long that takes is the backlog
     // the compositor would otherwise inherit.
-    if std::env::var_os("EXIT_FINISH").is_some()
-        && let Some(gpu) = session.gpu_mut()
-    {
+    if std::env::var_os("EXIT_FINISH").is_some() {
         ui_platform::exit_probe::stage("gpu: finish");
-        gpu.finish();
+        finish(&mut session);
         ui_platform::exit_probe::stage("gpu: finished");
     }
     drop(session);

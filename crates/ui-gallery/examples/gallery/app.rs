@@ -217,8 +217,8 @@ pub(crate) struct Gallery {
     pub(crate) theme_from: Option<bool>,
     /// Force the transition to restart from 0 on the next frame.
     pub(crate) theme_snap: bool,
-    /// Host light/dark watcher (XDG portal on Wayland).
-    pub(crate) theme_watch: Option<ui_platform_wayland::PortalThemeWatcher>,
+    /// Host light/dark watcher: the desktop's own signal on either backend.
+    pub(crate) theme_watch: Option<ThemeWatch>,
 }
 
 /// The Windows hover time before a tooltip opens: `SPI_GETMOUSEHOVERTIME`, 400 ms by default.
@@ -361,7 +361,7 @@ impl Gallery {
         use ui_platform::ThemeWatcher as _;
         // Publish the catalog scope before the first frame builds any page.
         init_locale();
-        let theme_watch = ui_platform_wayland::PortalThemeWatcher::new();
+        let theme_watch = ThemeWatch::new();
         // `GALLERY_DARK=0|1` seeds the appearance, so a light-theme screenshot needs no click.
         let dark = match std::env::var("GALLERY_DARK").ok().as_deref() {
             Some("0") => false,

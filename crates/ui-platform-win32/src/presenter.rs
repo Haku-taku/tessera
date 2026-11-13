@@ -49,6 +49,8 @@ pub struct Win32Presenter {
     captured: Option<Vec<u8>>,
     atlas_version: u64,
     color_atlas_version: u64,
+    /// Frames presented since the loop last read the count.
+    presented: u32,
 }
 
 impl Win32Presenter {
@@ -77,6 +79,7 @@ impl Win32Presenter {
             captured: None,
             atlas_version: u64::MAX,
             color_atlas_version: 0,
+            presented: 0,
         };
         this.allocate_targets()?;
         Ok(this)
@@ -107,6 +110,31 @@ impl Win32Presenter {
     /// Surface extent in physical pixels.
     pub fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// The scene renderer, for knobs only the scene knows about such as supersampling.
+    pub fn renderer_mut(&mut self) -> &mut GpuRenderer {
+        &mut self.renderer
+    }
+
+    /// Drain the GPU: every command submitted so far has finished when this returns.
+    pub fn finish(&mut self) {
+        self.device.finish();
+    }
+
+    /// Frames presented since the last call.
+    pub fn take_presented(&mut self) -> u32 {
+        std::mem::take(&mut self.presented)
+    }
+
+    /// Write the last composited frame as a PPM, top-down RGBA8 sampled into RGB.
+    ///
+    /// The frame target keeps the scene after the copy into the back buffer, so this works
+    /// without asking the next present to capture anything.
+    pub fn dump_frame_ppm(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.device.finish();
+        let pixels = self.device.read_pixels(self.frame, self.size.0, self.size.1);
+        write_ppm(path, self.size, &pixels)
     }
 
     /// Ask the next `present_scene` to read the back buffer back before presenting it.
@@ -234,6 +262,7 @@ impl SceneTarget for Win32Presenter {
         unsafe { self.chain.Present(1, DXGI_PRESENT(0)) }
             .ok()
             .map_err(|error| format!("Present: {error}"))?;
+        self.presented += 1;
         Ok(PresentStats {
             draw_calls: stats.draw_calls,
             band: stats.band,
@@ -286,4 +315,16 @@ fn create_chain(
         unsafe { factory.CreateSwapChainForHwnd(device, hwnd, &descriptor, None, None::<&IDXGIOutput>) }
             .map_err(|error| WindowError::Gpu(format!("CreateSwapChainForHwnd: {error}")))?;
     Ok((chain, format))
+}
+
+/// Write a PPM: the one image format a probe can read back without a decoder.
+fn write_ppm(path: &std::path::Path, size: (u32, u32), pixels: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let describe = |error: std::io::Error| format!("{}: {error}", path.display());
+    let mut file = std::fs::File::create(path).map_err(describe)?;
+    write!(file, "P6\n{} {}\n255\n", size.0, size.1).map_err(describe)?;
+    for texel in pixels.as_chunks::<4>().0 {
+        file.write_all(&texel[..3]).map_err(describe)?;
+    }
+    Ok(())
 }

@@ -4,15 +4,21 @@
 //! without user32 and dxgi, and there is nothing for a non-Windows build to fall back to, so
 //! the workspace builds an empty library there.
 //!
-//! What it does not do yet: input translation, IME, layers and clipboard. A window presents
-//! the scene the engine builds; the pointer and keyboard stay with the window procedure.
+//! What it does not do yet: input-method composition and non-text clipboard formats. Keys,
+//! the pointer, the wheel and text reach the engine as its own events; the IME stays with
+//! the window, so a composed character is not delivered.
 
 #![cfg(windows)]
 
+mod input;
 mod presenter;
+mod session;
+mod theme;
 mod window;
 
 pub use presenter::Win32Presenter;
+pub use session::{Session, SessionOptions, Tick};
+pub use theme::Win32ThemeWatcher;
 pub use window::Win32Window;
 
 /// Why the window or its presentation path could not open.
