@@ -442,6 +442,24 @@ impl ContentColour {
         max_nits: 0.0,
     };
 
+    /// Whether these pixels are absolute light, so a peak read from them is in nits.
+    ///
+    /// scRGB's 1.0 is a fixed 80 nits and PQ decodes to a fraction of 10000; every other
+    /// transfer describes codes relative to the display's own white, so their brightest
+    /// pixel says nothing about how much light there is.
+    pub fn holds_absolute_light(self) -> bool {
+        self.storage == PixelStorage::Float16 || matches!(self.transfer, TransferFunction::Pq)
+    }
+
+    /// The same picture with a peak measured from its pixels, which is what tone mapping is
+    /// bounded by: a capture states the most light the display *can* hold, not what it does.
+    pub fn with_peak(self, peak_nits: f32) -> Self {
+        Self {
+            max_nits: peak_nits,
+            ..self
+        }
+    }
+
     /// A desktop's float surface: scRGB light up to `peak_nits`, nothing converted.
     ///
     /// This is what a compositor hands over when it composites in floats — the Windows
@@ -476,7 +494,7 @@ impl ContentColour {
         // scRGB is absolute light in a fixed unit, so it needs the same treatment as PQ: its
         // 1.0 is 80 nits whatever the destination's white is.
         let scrgb = self.storage == PixelStorage::Float16;
-        let absolute = scrgb || matches!(self.transfer, TransferFunction::Pq);
+        let absolute = self.holds_absolute_light();
         let gain = if scrgb {
             SCRGB_WHITE_NITS / reference_nits.max(1.0)
         } else if absolute {

@@ -42,6 +42,9 @@ pub struct ScreenFrame {
     pub pixels: Vec<u8>,
     /// What the pixels mean: sRGB codes, or the float desktop's own scRGB light.
     pub colour: ContentColour,
+    /// The display's own SDR white, in nits: what a person sees where the desktop says
+    /// white. Zero on an SDR output, where the frame carries no light above the codes.
+    pub reference_nits: f32,
     /// The output's GDI device name, such as `\\.\DISPLAY1`.
     pub output: String,
     /// The output's device pixels per logical point.
@@ -65,6 +68,8 @@ pub struct ScreenCapture {
     scale: f32,
     /// The display's peak, in nits, when Windows presents HDR here; a float frame claims it.
     peak_nits: f32,
+    /// The display's SDR white, in nits; zero when it presents no HDR.
+    reference_nits: f32,
     rotation: DXGI_MODE_ROTATION,
 }
 
@@ -80,11 +85,12 @@ impl ScreenCapture {
         let scale = monitor_scale(monitor);
         // Without a factory2 there is no HDR answer, which reads as an SDR display: the frame
         // then never claims a peak it does not have.
-        let peak_nits = factory
+        let hdr = factory
             .cast::<IDXGIFactory2>()
             .ok()
-            .and_then(|factory| hdr_output(&factory, monitor))
-            .map_or(0.0, |hdr| hdr.peak_nits);
+            .and_then(|factory| hdr_output(&factory, monitor));
+        let peak_nits = hdr.map_or(0.0, |hdr| hdr.peak_nits);
+        let reference_nits = hdr.map_or(0.0, |hdr| hdr.reference_nits);
         let (device, context) = device_on(&adapter)?;
         let duplication = duplicate(&output, &device, &name)?;
         let description = unsafe { duplication.GetDesc() };
@@ -95,6 +101,7 @@ impl ScreenCapture {
             output: name,
             scale,
             peak_nits,
+            reference_nits,
             rotation: description.Rotation,
         })
     }
@@ -158,6 +165,7 @@ impl ScreenCapture {
                 height,
                 pixels,
                 colour,
+                reference_nits: self.reference_nits,
                 output: self.output.clone(),
                 scale: self.scale,
             });

@@ -210,6 +210,7 @@ impl GraphicsCapture {
             height: description.Height,
             pixels,
             colour,
+            reference_nits: self.hdr.map_or(0.0, |hdr| hdr.reference_nits),
             output: self.output.clone(),
             scale: self.scale,
         })
