@@ -3,7 +3,7 @@
 //! `Host` decides when to wake and what to step; this backend owns the thread's message queue
 //! and the pacing point, and turns a portable `ClipboardCopy` into the system clipboard.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use ui_platform::ipc::Channel;
 use ui_platform::jobs::Waker;
 use ui_platform::output::OutputInfo;
 use ui_platform::session::{HostSession, SessionOptions};
+use ui_platform::tray::{Icon, TrayEvent, TrayHandle, TrayId};
 use ui_platform::view::{App, AppLoop};
 use ui_platform::window::SurfaceSpec;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, RECT};
@@ -32,6 +33,7 @@ use windows::core::{BOOL, PCWSTR, PWSTR};
 
 use crate::hotkeys::Win32Hotkeys;
 use crate::session::Session;
+use crate::tray::{TrayQueue, Win32TrayIcon};
 use crate::window::{bounded_millis, pump_messages, set_system_clipboard, wait_for_composition};
 
 /// Surfaces and services on one thread's message queue.
@@ -42,6 +44,8 @@ pub struct Win32Backend {
     wake: Option<Arc<WakeEvent>>,
     /// The system-wide hotkeys, opened on the first request; absent when that failed.
     hotkeys: Option<Win32Hotkeys>,
+    /// What the tray icons' windows reported; the loop drains it each turn.
+    tray_events: TrayQueue,
 }
 
 /// The loop's wake channel from the other side: an event any worker can set.
@@ -76,6 +80,7 @@ impl Win32Backend {
             drew: Rc::new(Cell::new(false)),
             wake,
             hotkeys: None,
+            tray_events: Rc::new(RefCell::new(Vec::new())),
         }
     }
 }
@@ -165,6 +170,17 @@ impl Backend for Win32Backend {
         self.hotkeys
             .as_mut()
             .map(|hotkeys| hotkeys as &mut (dyn GlobalHotkeys + 'static))
+    }
+
+    fn create_tray(&mut self, id: TrayId, icon: Icon) -> Result<Box<dyn TrayHandle>, String> {
+        // The icon's own window joins this thread's message queue, which is the one the
+        // loop already waits on; nothing else has to be woken for a click to arrive.
+        let tray = Win32TrayIcon::create(id, icon, Rc::clone(&self.tray_events))?;
+        Ok(Box::new(tray))
+    }
+
+    fn tray_events(&mut self) -> Vec<(TrayId, TrayEvent)> {
+        std::mem::take(&mut *self.tray_events.borrow_mut())
     }
 
     fn wait(&mut self, timeout: Option<Duration>) -> Result<(), String> {

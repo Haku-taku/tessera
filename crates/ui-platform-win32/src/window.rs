@@ -1188,6 +1188,6 @@ pub fn set_system_clipboard(content: ClipboardContent) -> bool {
     crate::clipboard::write(None, &content)
 }
 
-fn wide(value: &str) -> Vec<u16> {
+pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }

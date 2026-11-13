@@ -16,6 +16,7 @@ use crate::ipc::{Channel, Reply};
 use crate::jobs::{Jobs, Waker};
 use crate::output::OutputInfo;
 use crate::transfer::{Selection, SelectionReader};
+use crate::tray::{Icon, Tray, TrayEvent, TrayHandle, TrayId};
 use crate::view::App;
 use crate::window::SurfaceSpec;
 
@@ -351,6 +352,21 @@ pub trait Backend {
     fn hotkeys(&mut self) -> Option<&mut (dyn GlobalHotkeys + 'static)> {
         None
     }
+
+    /// Put `icon` in the system tray, reporting what the user does through
+    /// [`Self::tray_events`].
+    ///
+    /// `id` is what every later report for this icon carries. The default is a platform with
+    /// no notification area, which is what the error says.
+    fn create_tray(&mut self, id: TrayId, icon: Icon) -> Result<Box<dyn TrayHandle>, String> {
+        let _ = (id, icon);
+        Err("this platform has no system tray".into())
+    }
+
+    /// What the user did to a tray icon since the last call, in order.
+    fn tray_events(&mut self) -> Vec<(TrayId, TrayEvent)> {
+        Vec::new()
+    }
 }
 
 /// A platform with no wait to interrupt: a finished job waits for the next turn.
@@ -381,6 +397,10 @@ pub struct Host {
     on_turn: Option<TurnHandler>,
     /// What a pressed hotkey does; it answers the same way a channel request does.
     on_hotkey: Option<HotkeyHandler>,
+    /// What the user did to a tray icon; the icons themselves are the app's.
+    on_tray: Option<TrayHandler>,
+    /// The id the next tray icon gets; never reused, so a held id cannot name a later icon.
+    next_tray: u64,
     /// Background work shared by the app; a completion forces one frame.
     jobs: Jobs,
     /// Jobs completed as of the last turn.
@@ -390,6 +410,7 @@ pub struct Host {
 type MessageHandler = Box<dyn FnMut(&mut dyn Reply, &[u8], &mut MessageCtx<'_>) -> Effect>;
 type TurnHandler = Box<dyn FnMut(&mut MessageCtx<'_>, &mut LoopCtx<'_>)>;
 type HotkeyHandler = Box<dyn FnMut(ShortcutId, &mut MessageCtx<'_>) -> Effect>;
+type TrayHandler = Box<dyn FnMut(TrayId, TrayEvent, &mut MessageCtx<'_>) -> Effect>;
 
 impl Host {
     pub fn new(backend: Box<dyn Backend>) -> Self {
@@ -411,6 +432,8 @@ impl Host {
             pending_draw: false,
             on_turn: None,
             on_hotkey: None,
+            on_tray: None,
+            next_tray: 0,
         }
     }
 
@@ -493,6 +516,29 @@ impl Host {
         self.next_surface += 1;
         self.surfaces.push((id, handle));
         Ok(id)
+    }
+
+    /// Put an icon in the system tray, visible at once.
+    ///
+    /// The returned handle is the app's; dropping it takes the icon out of the tray. The
+    /// platform's reason comes back when it has no tray at all or refuses the icon.
+    pub fn tray(&mut self, icon: Icon) -> Result<Tray, String> {
+        let id = TrayId::from_u64(self.next_tray);
+        let handle = self.backend.create_tray(id, icon)?;
+        self.next_tray += 1;
+        Ok(Tray::new(id, handle))
+    }
+
+    /// Called for each tray event the backend reports, with the same context a hotkey
+    /// handler gets: "Open" opens a surface, "Quit" stops the loop.
+    ///
+    /// A right-click both opens the icon's menu and reports [`TrayEvent::Click`], so a report
+    /// is not news that the menu stayed shut.
+    pub fn on_tray(
+        &mut self,
+        handler: impl FnMut(TrayId, TrayEvent, &mut MessageCtx<'_>) -> Effect + 'static,
+    ) {
+        self.on_tray = Some(Box::new(handler));
     }
 
     /// Ask the loop to stop after the current turn.
@@ -599,6 +645,7 @@ impl Host {
         self.backend.serve_clipboard()?;
         self.surfaces.retain(|(_, surface)| !surface.is_closed());
         self.serve_hotkeys();
+        self.serve_tray();
         self.serve_channel();
         self.serve_turn();
         Ok(())
@@ -625,6 +672,31 @@ impl Host {
                 pending_draw: &mut self.pending_draw,
             };
             if handler(id, &mut context) == Effect::Quit {
+                quit = true;
+            }
+        }
+        self.quit |= quit;
+    }
+
+    /// Hand every tray event the backend queued to the application's handler.
+    ///
+    /// Drained even with no handler set: an app may create its icon before it decides what a
+    /// click does, and a queue nobody empties would grow for the life of the process.
+    fn serve_tray(&mut self) {
+        let reports = self.backend.tray_events();
+        let Some(handler) = self.on_tray.as_mut() else {
+            return;
+        };
+        let mut quit = false;
+        for (id, event) in reports {
+            let mut context = MessageCtx {
+                outputs: &self.outputs,
+                backend: &mut *self.backend,
+                surfaces: &mut self.surfaces,
+                next_surface: &mut self.next_surface,
+                pending_draw: &mut self.pending_draw,
+            };
+            if handler(id, event, &mut context) == Effect::Quit {
                 quit = true;
             }
         }

@@ -24,6 +24,7 @@ mod outputs;
 mod presenter;
 mod session;
 mod theme;
+mod tray;
 mod wgc;
 mod window;
 

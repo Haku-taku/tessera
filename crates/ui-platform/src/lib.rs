@@ -22,6 +22,7 @@ pub mod state;
 pub mod text_pass;
 pub mod theme;
 pub mod transfer;
+pub mod tray;
 pub mod view;
 pub mod window;
 
