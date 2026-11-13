@@ -1,0 +1,16 @@
+[package]
+name = "ui-widgets-fluent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ui-design.workspace = true
+ui-core = { path = "../ui-core" }
+ui-platform = { path = "../ui-platform" }
+ui-style = { path = "../ui-style" }
+ui-widgets = { path = "../ui-widgets" }
+
+[dev-dependencies]
+# The WinUI Gallery example: the shared window bootstrap, the face bytes and the `App` trait.
+ui-demo = { path = "../ui-demo" }

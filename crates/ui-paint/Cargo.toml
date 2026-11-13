@@ -1,0 +1,11 @@
+[package]
+name = "ui-paint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Primitives, batching, CPU rasterizer (zeno), command encoding."
+
+[dependencies]
+ui-core = { workspace = true }
+zeno = { workspace = true }

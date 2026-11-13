@@ -1,0 +1,14 @@
+[package]
+name = "ui-richtext"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Block document model: the tree a Markdown source becomes before layout."
+
+[lib]
+path = "src/document.rs"
+
+[dependencies]
+ui-core = { workspace = true }
+pulldown-cmark = { version = "0.13.6", default-features = false }

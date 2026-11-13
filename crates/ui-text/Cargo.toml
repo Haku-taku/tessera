@@ -1,0 +1,15 @@
+[package]
+name = "ui-text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Font stack abstraction with platform-native providers and fallback."
+
+[dependencies]
+ui-core = { workspace = true }
+unicode-bidi = "0.3"
+unicode-bidi-mirroring = "0.4"
+unicode-linebreak = "0.1"
+unicode-properties = "0.1"
+parley_emoji = "0.12"

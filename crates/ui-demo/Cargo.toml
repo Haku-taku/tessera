@@ -1,0 +1,12 @@
+[package]
+name = "ui-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ui-core = { path = "../ui-core" }
+ui-platform = { path = "../ui-platform" }
+ui-platform-wayland = { path = "../ui-platform-wayland", features = ["gpu"] }
+# The wallpaper is decoded by the host, not the engine: one decoder per format it accepts.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

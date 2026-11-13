@@ -1,0 +1,17 @@
+[package]
+name = "ui-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Engine + declaration layer: tree, layout, hit, events, damage."
+
+[features]
+# Widens the box-blur passes to four lanes. Chosen at compile time, so the scalar path
+# carries no runtime check when the feature is off.
+simd = ["dep:wide"]
+
+[dependencies]
+wide = { version = "0.7", optional = true }
+unicode-segmentation = "1"
+rustc-hash.workspace = true

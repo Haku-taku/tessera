@@ -1,0 +1,10 @@
+[package]
+name = "ui-style"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustc-hash.workspace = true
+ui-core = { path = "../ui-core" }
+ui-design = { path = "../ui-design" }

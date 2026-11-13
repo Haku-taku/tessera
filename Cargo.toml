@@ -1,0 +1,41 @@
+[workspace]
+# Edition 2024 defaults to resolver 3; the workspace root is virtual, so it must say so.
+resolver = "3"
+members = ["crates/*"]
+# Shared assets, not a crate: `crates/*` would otherwise try to build the fonts directory.
+exclude = ["crates/assets"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+ui-color-hct = { path = "crates/ui-color-hct" }
+ui-design = { path = "crates/ui-design" }
+ui-core = { path = "crates/ui-core" }
+ui-i18n = { path = "crates/ui-i18n" }
+ui-text = { path = "crates/ui-text" }
+ui-paint = { path = "crates/ui-paint" }
+ui-paint-gpu = { path = "crates/ui-paint-gpu" }
+ui-platform = { path = "crates/ui-platform" }
+ui-style = { path = "crates/ui-style" }
+ui-text-fontique = { path = "crates/ui-text-fontique", default-features = false }
+math-core = { path = "../../mathstack/crates/math-core" }
+math-syntax = { path = "../../mathstack/crates/math-syntax" }
+math-font = { path = "../../mathstack/crates/math-font" }
+math-editor = { path = "../../mathstack/crates/math-editor" }
+ui-platform-wayland = { path = "crates/ui-platform-wayland" }
+zeno = { version = "0.3", default-features = false, features = ["std", "eval"] }
+# Engine-internal maps and content digests: keys are ours, so SipHash buys nothing.
+rustc-hash = "2"
+tiny-skia = { version = "0.11", default-features = false, features = ["std"] }
+
+# Must match the main project's profile verbatim.
+[profile.dev]
+debug = false
+opt-level = 1
+
+[profile.test]
+debug-assertions = true

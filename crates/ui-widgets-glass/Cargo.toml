@@ -1,0 +1,16 @@
+[package]
+name = "ui-widgets-glass"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ui-design.workspace = true
+ui-core = { path = "../ui-core" }
+ui-style = { path = "../ui-style" }
+ui-widgets = { path = "../ui-widgets" }
+
+[dev-dependencies]
+# The Liquid Glass showcase: the shared window bootstrap and the face bytes it draws with.
+ui-demo = { path = "../ui-demo" }
+ui-platform = { path = "../ui-platform" }

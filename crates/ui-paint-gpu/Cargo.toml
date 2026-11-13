@@ -1,0 +1,24 @@
+[package]
+name = "ui-paint-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GPU paint backend: EGL + OpenGL ES rendering into dma-buf backed targets."
+
+[dependencies]
+ui-core = { workspace = true }
+ui-gpu-egl = { path = "../ui-gpu-egl" }
+glow = "0.18"
+# Frame-phase timing for the `profile` feature; absent from normal builds.
+hotpath = { version = "0.30", optional = true, default-features = false }
+
+[features]
+# Times each render phase; the gallery's own `profile` feature turns it on.
+profile = ["dep:hotpath", "hotpath/hotpath"]
+
+[dev-dependencies]
+ui-paint = { workspace = true }
+ui-platform = { workspace = true, features = ["system-fonts"] }
+ui-widgets-fluent = { path = "../ui-widgets-fluent" }
+ui-widgets-glass = { path = "../ui-widgets-glass" }

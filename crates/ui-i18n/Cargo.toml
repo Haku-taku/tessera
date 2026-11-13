@@ -1,0 +1,25 @@
+[package]
+name = "ui-i18n"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+fluent-bundle = "0.16.0"
+# Language negotiation over the shipped set: the six matching levels of BCP-47.
+fluent-langneg = "0.14"
+unic-langid = { version = "0.9.6", features = ["macros"] }
+log = "0.4"
+# CLDR data, and the memoizer Fluent's formatter hook is written against.
+icu_calendar = "2.4"
+icu_datetime = { version = "2.4", features = ["compiled_data"] }
+icu_decimal = { version = "2.4", features = ["alloc"] }
+icu_locale_core = "2.4"
+# ICU payloads use a non-atomic refcount unless this feature is on, and the bundle's
+# memoizer keeps formatters in a `Sync` map.
+icu_provider = { version = "2.4", default-features = false, features = ["sync"] }
+intl-memoizer = "0.5"
+
+[build-dependencies]
+fluent-syntax = "0.12.0"

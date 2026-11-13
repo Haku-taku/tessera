@@ -1,0 +1,11 @@
+[package]
+name = "ui-design"
+description = "Design-system layer: one semantic layer, three complete native systems (MD3, Fluent, HIG)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ui-color-hct.workspace = true
+ui-core.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "ui-widgets-md3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ui-design.workspace = true
+ui-core = { path = "../ui-core" }
+ui-i18n = { path = "../ui-i18n" }
+ui-style = { path = "../ui-style" }
+ui-widgets = { path = "../ui-widgets" }
+
+[dev-dependencies]
+# Cross-style contract tests compare the three implementations; siblings stay a DAG.
+ui-widgets-fluent = { path = "../ui-widgets-fluent" }
+ui-widgets-glass = { path = "../ui-widgets-glass" }

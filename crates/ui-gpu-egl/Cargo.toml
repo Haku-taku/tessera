@@ -1,0 +1,11 @@
+[package]
+name = "ui-gpu-egl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+khronos-egl = { version = "6.0", features = ["dynamic"] }
+glow = "0.18"
+libc = "0.2"

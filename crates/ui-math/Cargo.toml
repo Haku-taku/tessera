@@ -1,0 +1,21 @@
+[package]
+name = "ui-math"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Formula layout: LaTeX to a model tree to a glyph display list, behind our own seam."
+
+[lib]
+path = "src/math.rs"
+
+[dependencies]
+ui-core = { workspace = true }
+math-core = { workspace = true }
+math-syntax = { workspace = true }
+math-font = { workspace = true }
+math-editor = { workspace = true }
+
+[dev-dependencies]
+ui-text = { workspace = true }
+ui-text-fontique = { workspace = true, features = ["system"] }

@@ -1,0 +1,14 @@
+[package]
+name = "ui-widgets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ui-core = { path = "../ui-core" }
+ui-design = { path = "../ui-design" }
+ui-i18n = { path = "../ui-i18n" }
+ui-platform = { path = "../ui-platform" }
+ui-richtext = { path = "../ui-richtext" }
+ui-style = { path = "../ui-style" }
+log = "0.4"

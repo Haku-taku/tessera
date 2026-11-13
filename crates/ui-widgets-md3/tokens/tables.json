@@ -1,0 +1,290 @@
+{
+  "src/spec/app_bar_tokens.rs": {
+    "export": "tokens/app-bar.json",
+    "prefixes": [
+      "md.comp.app-bar"
+    ]
+  },
+  "src/spec/assist_chip_tokens.rs": {
+    "export": "tokens/chips.json",
+    "prefixes": [
+      "md.comp.assist-chip"
+    ]
+  },
+  "src/spec/badge_tokens.rs": {
+    "export": "tokens/badges.json",
+    "prefixes": [
+      "md.comp.badge"
+    ]
+  },
+  "src/spec/button_group_tokens.rs": {
+    "export": "tokens/buttons/button-groups.json",
+    "prefixes": [
+      "md.comp.button-group.connected"
+    ]
+  },
+  "src/spec/button_tokens.rs": {
+    "export": "tokens/buttons/buttons.json",
+    "prefixes": [
+      "md.comp.button"
+    ]
+  },
+  "src/spec/carousel_tokens.rs": {
+    "export": "tokens/carousel.json",
+    "prefixes": [
+      "md.comp.carousel-item"
+    ]
+  },
+  "src/spec/checkbox_tokens.rs": {
+    "export": "tokens/checkbox.json",
+    "prefixes": [
+      "md.comp.checkbox"
+    ]
+  },
+  "src/spec/date_input_tokens.rs": {
+    "export": "tokens/date-pickers.json",
+    "prefixes": [
+      "md.comp.date-input.modal"
+    ]
+  },
+  "src/spec/date_picker_modal_tokens.rs": {
+    "export": "tokens/date-pickers.json",
+    "prefixes": [
+      "md.comp.date-picker.modal"
+    ]
+  },
+  "src/spec/date_picker_tokens.rs": {
+    "export": "tokens/date-pickers.json",
+    "prefixes": [
+      "md.comp.date-picker.docked"
+    ]
+  },
+  "src/spec/dialog_tokens.rs": {
+    "export": "tokens/dialogs.json",
+    "prefixes": [
+      "md.comp.dialog"
+    ]
+  },
+  "src/spec/divider_tokens.rs": {
+    "export": "tokens/divider.json",
+    "prefixes": [
+      "md.comp.divider"
+    ]
+  },
+  "src/spec/elevated_card_tokens.rs": {
+    "export": "tokens/cards.json",
+    "prefixes": [
+      "md.comp.elevated-card"
+    ]
+  },
+  "src/spec/fab_menu_tokens.rs": {
+    "export": "tokens/buttons/fab-menu.json",
+    "prefixes": [
+      "md.comp.fab-menu"
+    ]
+  },
+  "src/spec/filled_card_tokens.rs": {
+    "export": "tokens/cards.json",
+    "prefixes": [
+      "md.comp.filled-card"
+    ]
+  },
+  "src/spec/filled_text_field_tokens.rs": {
+    "export": "tokens/text-fields.json",
+    "prefixes": [
+      "md.comp.filled-text-field"
+    ]
+  },
+  "src/spec/filter_chip_tokens.rs": {
+    "export": "tokens/chips.json",
+    "prefixes": [
+      "md.comp.filter-chip"
+    ]
+  },
+  "src/spec/icon_button_tokens.rs": {
+    "export": "tokens/buttons/icon-buttons.json",
+    "prefixes": [
+      "md.comp.icon-button"
+    ]
+  },
+  "src/spec/input_chip_tokens.rs": {
+    "export": "tokens/chips.json",
+    "prefixes": [
+      "md.comp.input-chip"
+    ]
+  },
+  "src/spec/list_tokens.rs": {
+    "export": "tokens/lists.json",
+    "prefixes": [
+      "md.comp.list"
+    ]
+  },
+  "src/spec/menu_tokens.rs": {
+    "export": "tokens/menus.json",
+    "prefixes": [
+      "md.comp.menus"
+    ]
+  },
+  "src/spec/navigation_bar_tokens.rs": {
+    "export": "tokens/navigation/navigation-bar.json",
+    "prefixes": [
+      "md.comp.navigation-bar"
+    ]
+  },
+  "src/spec/navigation_drawer_tokens.rs": {
+    "export": "tokens/navigation/navigation-drawer.json",
+    "prefixes": [
+      "md.comp.navigation-drawer"
+    ]
+  },
+  "src/spec/navigation_rail_tokens.rs": {
+    "export": "tokens/navigation/navigation-rail.json",
+    "prefixes": [
+      "md.comp.navigation-rail"
+    ]
+  },
+  "src/spec/outlined_card_tokens.rs": {
+    "export": "tokens/cards.json",
+    "prefixes": [
+      "md.comp.outlined-card"
+    ]
+  },
+  "src/spec/outlined_segmented_button_tokens.rs": {
+    "export": "tokens/buttons/segmented-buttons.json",
+    "prefixes": [
+      "md.comp.outlined-segmented-button"
+    ]
+  },
+  "src/spec/outlined_text_field_tokens.rs": {
+    "export": "tokens/text-fields.json",
+    "prefixes": [
+      "md.comp.outlined-text-field"
+    ]
+  },
+  "src/spec/plain_tooltip_tokens.rs": {
+    "export": "tokens/tooltips.json",
+    "prefixes": [
+      "md.comp.plain-tooltip"
+    ]
+  },
+  "src/spec/progress_indicator_tokens.rs": {
+    "export": "tokens/indicators/progress-indicators.json",
+    "prefixes": [
+      "md.comp.progress-indicator"
+    ]
+  },
+  "src/spec/radio_button_tokens.rs": {
+    "export": "tokens/radio-button.json",
+    "prefixes": [
+      "md.comp.radio-button"
+    ]
+  },
+  "src/spec/range_selection_tokens.rs": {
+    "export": "tokens/date-pickers.json",
+    "prefixes": [
+      "md.comp.date-picker.modal.range-selection"
+    ]
+  },
+  "src/spec/rich_tooltip_tokens.rs": {
+    "export": "tokens/tooltips.json",
+    "prefixes": [
+      "md.comp.rich-tooltip"
+    ]
+  },
+  "src/spec/search_bar_tokens.rs": {
+    "export": "tokens/search-bar-view.json",
+    "prefixes": [
+      "md.comp.search-bar"
+    ]
+  },
+  "src/spec/secondary_navigation_tab_tokens.rs": {
+    "export": "tokens/tabs.json",
+    "prefixes": [
+      "md.comp.secondary-navigation-tab"
+    ]
+  },
+  "src/spec/sheet_tokens.rs": {
+    "export": "tokens/sheets/bottom-sheets.json",
+    "prefixes": [
+      "md.comp.sheet.bottom.docked"
+    ]
+  },
+  "src/spec/slider_tokens.rs": {
+    "export": "tokens/sliders.json",
+    "prefixes": [
+      "md.comp.slider"
+    ]
+  },
+  "src/spec/snackbar_tokens.rs": {
+    "export": "tokens/snackbar.json",
+    "prefixes": [
+      "md.comp.snackbar"
+    ]
+  },
+  "src/spec/suggestion_chip_tokens.rs": {
+    "export": "tokens/chips.json",
+    "prefixes": [
+      "md.comp.suggestion-chip"
+    ]
+  },
+  "src/spec/switch_tokens.rs": {
+    "export": "tokens/switch.json",
+    "prefixes": [
+      "md.comp.switch"
+    ]
+  },
+  "src/spec/time_picker_tokens.rs": {
+    "export": "tokens/time-pickers.json",
+    "prefixes": [
+      "md.comp.time-input"
+    ]
+  },
+  "src/spec/toolbar_docked_tokens.rs": {
+    "export": "tokens/toolbars.json",
+    "prefixes": [
+      "md.comp.toolbar.docked"
+    ]
+  },
+  "src/spec/toolbar_fab_tokens.rs": {
+    "export": "tokens/toolbars.json",
+    "prefixes": [
+      "md.comp.toolbar.floating.fab"
+    ]
+  },
+  "src/spec/toolbar_floating_tokens.rs": {
+    "export": "tokens/toolbars.json",
+    "prefixes": [
+      "md.comp.toolbar.floating"
+    ]
+  },
+  "src/spec/toolbar_standard_tokens.rs": {
+    "export": "tokens/toolbars.json",
+    "prefixes": [
+      "md.comp.toolbar.standard"
+    ]
+  },
+  "src/spec/toolbar_vibrant_tokens.rs": {
+    "export": "tokens/toolbars.json",
+    "prefixes": [
+      "md.comp.toolbar.vibrant"
+    ]
+  },
+  "src/spec/side_sheet_tokens.rs": {
+    "export": "tokens/sheets/side-sheets.json",
+    "prefixes": [
+      "md.comp.sheet.side"
+    ]
+  },
+  "src/spec/fab_tokens.rs": {
+    "export": "tokens/buttons/floating-action-button.json",
+    "prefixes": [
+      "md.comp.fab"
+    ]
+  },
+  "src/spec/split_button_tokens.rs": {
+    "export": "tokens/buttons/split-button.json",
+    "prefixes": [
+      "md.comp.split-button"
+    ]
+  }
+}

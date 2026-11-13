@@ -1,0 +1,9 @@
+[package]
+name = "ui-color-hct"
+description = "HCT colour space (CAM16 x CIELAB L*) implemented from published colour science"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
