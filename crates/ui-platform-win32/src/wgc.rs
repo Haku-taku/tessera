@@ -39,8 +39,8 @@ use crate::outputs::{HdrOutput, hdr_output};
 /// A capture session over one output, alive until it drops.
 pub struct GraphicsCapture {
     pool: Direct3D11CaptureFramePool,
-    /// Held because releasing the session stops the capture, whatever the pool still holds.
-    _session: GraphicsCaptureSession,
+    /// Held so `Drop` can close it: until then Windows keeps what the capture holds.
+    session: GraphicsCaptureSession,
     context: ID3D11DeviceContext,
     /// The frame's texture belongs to this device; the field keeps it alive with the context.
     _device: ID3D11Device,
@@ -109,7 +109,7 @@ impl GraphicsCapture {
             .map_err(|error| format!("StartCapture on {name}: {error}"))?;
         Ok(Self {
             pool,
-            _session: session,
+            session,
             context,
             _device: device,
             staging: None,
@@ -214,6 +214,17 @@ impl GraphicsCapture {
             output: self.output.clone(),
             scale: self.scale,
         })
+    }
+}
+
+/// A session holds the compositor's frames and its share of the desktop's capture plumbing
+/// until it is closed; releasing the last reference alone keeps all of it. Every grab opens a
+/// session, so a screenshot that skipped this would cost one session's handles and buffers.
+impl Drop for GraphicsCapture {
+    fn drop(&mut self) {
+        // Closing cannot fail in a way the caller could act on: the object is going away.
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
     }
 }
 
