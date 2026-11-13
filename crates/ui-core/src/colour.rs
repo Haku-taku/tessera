@@ -420,6 +420,40 @@ pub fn half_to_f32(bits: u16) -> f32 {
     }
 }
 
+/// A float as the nearest binary16, which is how scRGB pixels are stored.
+///
+/// Rounding to nearest means a value between two halves lands on the closer one, and a
+/// rounding carry out of the mantissa increments the exponent by itself.
+pub fn f32_to_half(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x7f_ffff;
+    if exponent == 0xff {
+        // A NaN keeps a payload bit so it does not come back as infinity.
+        let payload = if mantissa != 0 { 0x200 } else { 0 };
+        return sign | 0x7c00 | payload;
+    }
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 0x1f {
+        return sign | 0x7c00;
+    }
+    // Round to nearest; the carry out of the mantissa increments the exponent by itself,
+    // which is the encoding of the next power of two.
+    let rounded = |mantissa: u32, shift: u32| (mantissa + (1 << (shift - 1))) >> shift;
+    if half_exponent <= 0 {
+        // Past the subnormal range entirely, which rounds to a signed zero.
+        if half_exponent < -10 {
+            return sign;
+        }
+        let extended = mantissa | 0x80_0000;
+        let shift = (14 - half_exponent) as u32;
+        return sign | rounded(extended, shift) as u16;
+    }
+    let exponent_bits = (half_exponent as u32) << 10;
+    sign | (exponent_bits + rounded(mantissa, 13)) as u16
+}
+
 /// What a picture's pixels mean: how they are packed and what they were authored against.
 ///
 /// This travels with the pixels and is never rewritten for a display: a conversion is a
