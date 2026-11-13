@@ -317,7 +317,7 @@ impl GpuWindow {
     ///
     /// A queue still full at exit drains while the compositor waits behind it, which is
     /// what a frozen screen after closing looks like.
-    pub fn finish(&self) {
+    pub fn finish(&mut self) {
         if let Err(error) = self.ctx.make_current() {
             eprintln!("gpu: no current context to finish the queue: {error}");
             return;

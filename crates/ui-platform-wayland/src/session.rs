@@ -367,8 +367,8 @@ impl<A: App> HostSession<A> for Session<A> {
         // every Unix kernel offers without a syscall wrapper.
         let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
         let fields: Vec<&str> = stat.split_whitespace().collect();
-        let ticks: f64 = fields.get(13).and_then(|s| s.parse().ok())?
-            + fields.get(14).and_then(|s| s.parse().ok())?;
+        let ticks: f64 = fields.get(13).and_then(|s| s.parse::<f64>().ok())?
+            + fields.get(14).and_then(|s| s.parse::<f64>().ok())?;
         Some(ticks / 100.0)
     }
 
