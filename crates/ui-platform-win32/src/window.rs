@@ -39,17 +39,17 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT,
-    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO,
-    IDC_SIZEALL, IDC_SIZENESW,
-    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IsWindow, LoadCursorW, MA_ACTIVATE,
-    MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE,
-    PeekMessageW, QS_ALLINPUT, RegisterClassExW, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SM_CXMINTRACK, SM_CYMINTRACK, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+    GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
+    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_CROSS, IDC_HAND,
+    IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IsWindow,
+    LoadCursorW, MA_ACTIVATE, MA_NOACTIVATE, MINMAXINFO, MSG, MWMO_INPUTAVAILABLE,
+    MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+    RegisterClassExW, SM_CXMINTRACK, SM_CYMINTRACK, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_GETMINMAXINFO,
     WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
     WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
@@ -94,6 +94,8 @@ struct WindowState {
     display_changed: bool,
     /// Physical pixels per logical unit, in whole DPI.
     dpi: u32,
+    /// The smallest client area the spec allows, in logical units.
+    min_size: Option<(u32, u32)>,
     /// A layer's keyboard request; `None` for a window the manager places, which has no
     /// shape and no activation rule of its own.
     keyboard: Option<KeyboardMode>,
@@ -168,6 +170,7 @@ impl Win32Window {
         let state = Rc::new(RefCell::new(WindowState {
             dpi: opening.dpi,
             keyboard: opening.keyboard,
+            min_size: spec.min_size,
             ..WindowState::default()
         }));
         // The procedure needs the state from `WM_NCCREATE` on, before `CreateWindowExW`
@@ -902,6 +905,14 @@ unsafe fn handle(
             state.borrow_mut().silent_change = true;
             None
         }
+        WM_GETMINMAXINFO => {
+            let declared = state.borrow().min_size?;
+            let (width, height) = tracked_minimum(hwnd, Some(declared));
+            let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+            info.ptMinTrackSize = POINT { x: width, y: height };
+            // Answering keeps `DefWindowProcW` from writing the system minimum back over it.
+            Some(LRESULT(0))
+        }
         WM_DPICHANGED => {
             let mut window = state.borrow_mut();
             window.dpi = ((wparam.0 as u32) >> 16).max(96);
@@ -1195,6 +1206,38 @@ fn theme_caption(hwnd: HWND) {
     }
 }
 
+/// The smallest window a user may drag to: the system's tracking size or the spec's floor.
+///
+/// The spec names a client area in logical units; a tracked size is the whole window, so the
+/// frame is added back through the same adjustment the opening size used.
+fn tracked_minimum(hwnd: HWND, declared: Option<(u32, u32)>) -> (i32, i32) {
+    let system = unsafe { (GetSystemMetrics(SM_CXMINTRACK), GetSystemMetrics(SM_CYMINTRACK)) };
+    let Some((width, height)) = declared else {
+        return system;
+    };
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let scale = dpi as f32 / 96.0;
+    let client = (
+        (width as f32 * scale).ceil().max(1.0) as i32,
+        (height as f32 * scale).ceil().max(1.0) as i32,
+    );
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: client.0,
+        bottom: client.1,
+    };
+    let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32);
+    let ex_style = WINDOW_EX_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32);
+    if unsafe { AdjustWindowRectExForDpi(&mut frame, style, false, ex_style, dpi) }.is_err() {
+        return (system.0.max(client.0), system.1.max(client.1));
+    }
+    (
+        (frame.right - frame.left).max(system.0),
+        (frame.bottom - frame.top).max(system.1),
+    )
+}
+
 /// Offer a key to the attached input methods; true when one took it.
 fn tsf_key(state: &RefCell<WindowState>, down: bool, wparam: WPARAM, lparam: LPARAM) -> bool {
     let session = state.borrow().tsf.clone();
@@ -1312,9 +1355,9 @@ fn sizing_step(state: &RefCell<WindowState>, hwnd: HWND, at: POINT) -> bool {
         HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT => bottom += dy,
         _ => {}
     }
-    // The modal loop is what applies the system's minimum tracking size, so this drag
-    // applies it itself; the window sets no constraints of its own.
-    let minimum = unsafe { (GetSystemMetrics(SM_CXMINTRACK), GetSystemMetrics(SM_CYMINTRACK)) };
+    // The modal loop is what applies a tracked minimum, so this drag applies it itself —
+    // the system's, and the floor the surface spec declared.
+    let minimum = tracked_minimum(hwnd, state.borrow().min_size);
     if right - left < minimum.0 {
         match sizing.edge {
             HTLEFT | HTTOPLEFT | HTBOTTOMLEFT => left = right - minimum.0,

@@ -1221,6 +1221,10 @@ impl WaylandWindow {
                 let toplevel = xdg.get_toplevel(&qh, ());
                 toplevel.set_title(spec.name.clone());
                 toplevel.set_app_id(spec.app_id.clone());
+                // Logical units, which is what xdg_toplevel's minimum is in.
+                if let Some((width, height)) = spec.min_size {
+                    toplevel.set_min_size(width as i32, height as i32);
+                }
                 (Some(xdg), Some(toplevel), None)
             }
             Some(cfg) => {

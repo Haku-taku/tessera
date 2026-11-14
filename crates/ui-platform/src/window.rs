@@ -24,6 +24,12 @@ pub struct SurfaceSpec {
     /// match layer namespaces, so those conventionally start with the app id.
     pub name: String,
     pub role: SurfaceRole,
+    /// The smallest client area a user may size a window to, in logical units.
+    ///
+    /// A layer is placed rather than sized, so it ignores this. The platform enforces it in
+    /// its own resize path; a programmatic size still wins, as it must for a surface the app
+    /// itself shrinks.
+    pub min_size: Option<(u32, u32)>,
 }
 
 impl SurfaceSpec {
@@ -33,7 +39,14 @@ impl SurfaceSpec {
             app_id: app_id.into(),
             name: title.into(),
             role: SurfaceRole::Window { size },
+            min_size: None,
         }
+    }
+
+    /// Declare the smallest client area a user may size this window to.
+    pub fn with_min_size(mut self, size: (u32, u32)) -> Self {
+        self.min_size = Some(size);
+        self
     }
 
     /// A layer the engine places; see [`LayerSpec`].
@@ -46,6 +59,7 @@ impl SurfaceSpec {
             app_id: app_id.into(),
             name: namespace.into(),
             role: SurfaceRole::Layer(layer),
+            min_size: None,
         }
     }
 

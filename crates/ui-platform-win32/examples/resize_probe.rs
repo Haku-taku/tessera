@@ -54,7 +54,8 @@ fn windows_main() -> Result<(), String> {
     use ui_platform_win32::Session;
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
     use windows::Win32::UI::WindowsAndMessaging::{
-        HTBOTTOMRIGHT, HTTOPLEFT, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCLBUTTONDOWN,
+        HTBOTTOMRIGHT, HTTOPLEFT, MINMAXINFO, SendMessageW, WM_GETMINMAXINFO, WM_KEYDOWN,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCLBUTTONDOWN,
     };
 
     let expect = |pattern: &str, found: bool| {
@@ -64,7 +65,8 @@ fn windows_main() -> Result<(), String> {
     let mut ok = true;
 
     let options = SessionOptions {
-        surface: SurfaceSpec::window("crabsnap-resize", "crabsnap — resize probe", (420, 300)),
+        surface: SurfaceSpec::window("crabsnap-resize", "crabsnap — resize probe", (420, 300))
+            .with_min_size((420, 300)),
         uncapped: false,
         cpu_presenter: false,
     };
@@ -161,6 +163,45 @@ fn windows_main() -> Result<(), String> {
         "Escape restores the rectangle the drag began on",
         window_rect(hwnd)? == before,
     );
+
+    // The opening size is also the declared floor: the shell is told it before a sizing
+    // drag, and the drag's own clamp reads the same value.
+    let mut limits = MINMAXINFO::default();
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            None,
+            Some(LPARAM(&mut limits as *mut MINMAXINFO as isize)),
+        );
+    }
+    ok &= expect(
+        "the shell is told the spec's minimum",
+        (limits.ptMinTrackSize.x, limits.ptMinTrackSize.y)
+            == (start.right - start.left, start.bottom - start.top),
+    );
+
+    let shrinking = window_rect(hwnd)?;
+    post(
+        hwnd,
+        WM_NCLBUTTONDOWN,
+        HTBOTTOMRIGHT as usize,
+        packed(shrinking.right, shrinking.bottom),
+    );
+    session.step()?;
+    post(
+        hwnd,
+        WM_MOUSEMOVE,
+        0,
+        client_of(hwnd, shrinking.right - 240, shrinking.bottom - 160),
+    );
+    session.step()?;
+    ok &= expect(
+        "a drag stops at the declared minimum",
+        session.window().client_size() == (width, height),
+    );
+    post(hwnd, WM_LBUTTONUP, 0, packed(0, 0));
+    session.step()?;
 
     let _ = std::fs::remove_file(&path);
 
