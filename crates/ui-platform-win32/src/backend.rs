@@ -4,7 +4,7 @@
 //! and the pacing point, and turns a portable `ClipboardCopy` into the system clipboard.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use ui_platform::transfer::SelectionReader;
 use ui_platform::tray::{Icon, TrayEvent, TrayHandle, TrayId};
 use ui_platform::view::{App, AppLoop};
 use ui_platform::window::SurfaceSpec;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, RECT, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DMDO_90, DMDO_180, DMDO_270, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors,
     EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
@@ -33,6 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR};
 
 use crate::clipboard::ClipboardReader;
+use crate::frame_pace::FramePace;
 use crate::hotkeys::Win32Hotkeys;
 use crate::session::Session;
 use crate::tray::{TrayQueue, Win32TrayIcon};
@@ -50,6 +51,9 @@ pub struct Win32Backend {
     tray_events: TrayQueue,
     /// The system clipboard, read in place: a copy is already complete when it lands.
     reader: ClipboardReader,
+    /// Every surface's frame window: the compositor wakes the loop through these. Weak, so
+    /// a retired surface takes its entry with it; the wait prunes what is left.
+    paces: Vec<Weak<FramePace>>,
 }
 
 /// The loop's wake channel from the other side: an event any worker can set.
@@ -86,6 +90,7 @@ impl Win32Backend {
             hotkeys: None,
             tray_events: Rc::new(RefCell::new(Vec::new())),
             reader: ClipboardReader::default(),
+            paces: Vec::new(),
         }
     }
 }
@@ -123,6 +128,9 @@ impl Backend for Win32Backend {
                 cpu_presenter: false,
             },
         )?;
+        // The host's one sleep must end when this surface's compositor window opens; the
+        // session keeps the pace alive, so the entry needs no removal on retirement.
+        self.paces.push(Rc::downgrade(&session.frame_pace()));
         Ok(Box::new(HostedSurface {
             session,
             drew: Rc::clone(&self.drew),
@@ -189,17 +197,44 @@ impl Backend for Win32Backend {
     }
 
     fn wait(&mut self, timeout: Option<Duration>) -> Result<(), String> {
-        // The queue's own messages and the wake event are what end the sleep.
-        let handles = [self.wake.as_ref().map_or(HANDLE::default(), |wake| wake.0)];
-        let given = if self.wake.is_some() {
-            &handles[..]
-        } else {
-            &handles[..0]
-        };
+        // The queue's own messages, the worker's wake event and every surface's frame
+        // window end the sleep. A frame window is what makes a surface drawable again:
+        // consuming it here is the same act as a Wayland frame callback arriving.
+        self.paces.retain(|pace| pace.strong_count() > 0);
+        let live: Vec<Rc<FramePace>> = self.paces.iter().filter_map(Weak::upgrade).collect();
+        let mut handles: Vec<HANDLE> = Vec::with_capacity(live.len() + 1);
+        if let Some(wake) = &self.wake {
+            handles.push(wake.0);
+        }
+        let first_pace = handles.len();
+        let mut paced: Vec<&Rc<FramePace>> = Vec::new();
+        for pace in &live {
+            if let Some(handle) = pace.handle() {
+                handles.push(handle);
+                paced.push(pace);
+            }
+        }
         let millis = bounded_millis(timeout);
-        // SAFETY: `given` is a live slice of handles, or empty.
-        unsafe {
-            MsgWaitForMultipleObjectsEx(Some(given), millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        // SAFETY: every handle is live for the duration of the wait: the wake event is
+        // owned here, and a pace's handle belongs to its swap chain, which the session
+        // keeps alive.
+        let result = unsafe {
+            MsgWaitForMultipleObjectsEx(Some(handles.as_slice()), millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+        };
+        let index = result.0 as usize;
+        if index >= first_pace && index < handles.len() {
+            // The wait consumed the auto-reset object for this surface.
+            paced[index - first_pace].opened();
+        } else if result == WAIT_TIMEOUT {
+            // A compositor that never answers must not hold a drawable surface for good.
+            for pace in &paced {
+                pace.opened();
+            }
+        }
+        // Any other surface whose window opened at the same composition. The one the wait
+        // returned on was consumed above; this finds the rest.
+        for pace in &paced {
+            pace.take_signal();
         }
         // Dispatched here as well as per surface: a hotkey arrives at a window of this
         // process that no surface owns, and a loop with no surfaces would never deliver it.
@@ -208,9 +243,19 @@ impl Backend for Win32Backend {
     }
 
     fn flush(&mut self) {
-        // The process's one pacing point: every frame presented this turn is taken by the
-        // next composition pass, which is what a Wayland frame callback marks.
-        if self.drew.replace(false) {
+        let drew = self.drew.replace(false);
+        if !drew {
+            return;
+        }
+        // A surface with a frame-latency waitable paces itself: it cannot draw again until
+        // `wait` sees the handle. Only a chain that refused one falls back to the flush,
+        // which waits for composition without any input in between.
+        let fallback = self
+            .paces
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|pace| pace.handle().is_none());
+        if fallback {
             wait_for_composition();
         }
     }

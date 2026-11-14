@@ -17,6 +17,7 @@ mod backend;
 mod capture;
 mod clipboard;
 mod dnd;
+mod frame_pace;
 mod hotkeys;
 mod ime;
 mod input;

@@ -77,6 +77,9 @@ fn windows_main() -> Result<(), String> {
     let mut drew = false;
     for _ in 0..20 {
         drew |= session.step()?.drew;
+        if drew {
+            break;
+        }
     }
     if !drew {
         return Err(String::from("the window never drew its first frame"));
@@ -91,7 +94,7 @@ fn windows_main() -> Result<(), String> {
         HTBOTTOMRIGHT as usize,
         packed(start.right, start.bottom),
     );
-    session.step()?;
+    session.tick()?;
 
     // The pointer moves out and down by the corner's delta, and the loop takes a turn.
     // Messages name the client position, so the probe converts the screen point it means.
@@ -101,7 +104,7 @@ fn windows_main() -> Result<(), String> {
         0,
         client_of(hwnd, start.right + 60, start.bottom + 40),
     );
-    let tick = session.step()?;
+    let tick = session.tick()?;
     let grown = session.window().client_size();
     ok &= expect(
         "a dragged border resizes the window",
@@ -122,9 +125,9 @@ fn windows_main() -> Result<(), String> {
 
     // The release ends the drag: a later move is the app's pointer, not the border's.
     post(hwnd, WM_LBUTTONUP, 0, packed(0, 0));
-    session.step()?;
+    session.tick()?;
     post(hwnd, WM_MOUSEMOVE, 0, packed(200, 30));
-    session.step()?;
+    session.tick()?;
     ok &= expect(
         "a move after the release leaves the size alone",
         session.window().client_size() == grown,
@@ -141,9 +144,9 @@ fn windows_main() -> Result<(), String> {
         HTTOPLEFT as usize,
         packed(press.0, press.1),
     );
-    session.step()?;
+    session.tick()?;
     post(hwnd, WM_MOUSEMOVE, 0, client_of(hwnd, target.0, target.1));
-    session.step()?;
+    session.tick()?;
     let dragged = window_rect(hwnd)?;
     ok &= expect(
         "the top-left edge moves the window's origin",
@@ -158,7 +161,7 @@ fn windows_main() -> Result<(), String> {
 
     // Escape puts the window back where the drag began, as the system's own sizing does.
     post(hwnd, WM_KEYDOWN, VK_ESCAPE.0 as usize, 0);
-    session.step()?;
+    session.tick()?;
     ok &= expect(
         "Escape restores the rectangle the drag began on",
         window_rect(hwnd)? == before,
@@ -188,20 +191,20 @@ fn windows_main() -> Result<(), String> {
         HTBOTTOMRIGHT as usize,
         packed(shrinking.right, shrinking.bottom),
     );
-    session.step()?;
+    session.tick()?;
     post(
         hwnd,
         WM_MOUSEMOVE,
         0,
         client_of(hwnd, shrinking.right - 240, shrinking.bottom - 160),
     );
-    session.step()?;
+    session.tick()?;
     ok &= expect(
         "a drag stops at the declared minimum",
         session.window().client_size() == (width, height),
     );
     post(hwnd, WM_LBUTTONUP, 0, packed(0, 0));
-    session.step()?;
+    session.tick()?;
 
     let _ = std::fs::remove_file(&path);
 

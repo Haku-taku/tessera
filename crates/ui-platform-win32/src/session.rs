@@ -1,16 +1,18 @@
 //! One engine-owned surface on Windows: window, presenter, driver and teardown order.
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use ui_core::Damage;
 use ui_core::draw::DrawList;
 use ui_core::geom::Point;
-use ui_platform::driver::{Driver, Turn};
+use ui_platform::driver::{Driver, FrameHost as _, Turn};
 use ui_platform::present::{CanvasFrame, PresentStats, SceneTarget};
 use ui_platform::session::{HostSession, SessionOptions, Tick};
 use ui_platform::text_pass::TextPass;
 use ui_platform::view::{App, AppLoop};
 
+use crate::frame_pace::FramePace;
 use crate::presenter::Win32Presenter;
 use crate::window::Win32Window;
 
@@ -24,6 +26,9 @@ pub struct Session<A: App> {
     driver: Driver,
     lp: AppLoop<A>,
     win: Win32Window,
+    /// The compositor's frame window, shared with the presenter, the window and the host's
+    /// wait set. The handle inside it belongs to the chain, so it is never closed here.
+    pace: Rc<FramePace>,
     /// Scripted pointer for the next frame; see [`set_pointer`](Self::set_pointer).
     pointer: Option<Point>,
     /// The app asked for this surface to close.
@@ -44,12 +49,16 @@ impl<A: App> Session<A> {
             .map_err(|error| format!("cannot open a Win32 window: {error}"))?;
         // This loop pumps frames inside the system's move loop, so it must start the move.
         win.defer_system_move();
-        let presenter = Win32Presenter::new(&win).map_err(|error| error.to_string())?;
+        let pace = Rc::new(FramePace::new());
+        let presenter =
+            Win32Presenter::open(&win, Rc::clone(&pace)).map_err(|error| error.to_string())?;
+        win.set_frame_pace(Rc::clone(&pace));
         Ok(Self {
             presenter: Some(presenter),
             driver: Driver::new().uncapped(opts.uncapped),
             lp,
             win,
+            pace,
             pointer: None,
             closed: false,
             supersample: 1,
@@ -70,6 +79,11 @@ impl<A: App> Session<A> {
 
     pub fn window_mut(&mut self) -> &mut Win32Window {
         &mut self.win
+    }
+
+    /// This surface's frame window, for the host's process-wide wait set.
+    pub(crate) fn frame_pace(&self) -> Rc<FramePace> {
+        Rc::clone(&self.pace)
     }
 
     /// Physical pixels per logical unit.
@@ -173,6 +187,12 @@ impl<A: App> Session<A> {
 
     /// When the loop must wake with nothing arriving: the engine's own deadlines.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        // A frame the compositor has not opened a window for is not a deadline of ours:
+        // the frame-latency waitable wakes the host. Saying "now" here would spin the loop
+        // through a zero-length sleep for the whole of a long frame.
+        if !self.win.can_draw() {
+            return self.driver.deadline();
+        }
         // A turn that drew clears the driver's deadline, yet an animation in flight or a
         // build that read the clock still owes the next frame. Saying "now" is what makes
         // the host come straight back instead of sleeping until the poll timeout.
@@ -230,11 +250,13 @@ impl<A: App> Session<A> {
         // A window holds one flip chain at a time, so the old stack goes before the new one
         // is built; this is the only moment the surface has no presenter.
         self.presenter = None;
-        let mut presenter = Win32Presenter::new(&self.win).map_err(|error| {
-            format!("the presenter could not be rebuilt after {reason}: {error}")
-        })?;
+        let mut presenter = Win32Presenter::open(&self.win, Rc::clone(&self.pace)).map_err(
+            |error| format!("the presenter could not be rebuilt after {reason}: {error}"),
+        )?;
         presenter.renderer_mut().set_supersample(self.supersample);
         self.presenter = Some(presenter);
+        // The new chain holds no frame: the compositor's window for it is open already.
+        self.pace.opened();
         Ok(())
     }
 

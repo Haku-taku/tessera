@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ui_core::clipboard::ClipboardContent;
 use ui_core::geom::{Point, Rect};
@@ -14,7 +14,8 @@ use ui_platform::window::{
     AutoHide, KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec,
 };
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
+    WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE, DwmFlush, DwmSetWindowAttribute,
@@ -158,6 +159,9 @@ pub struct Win32Window {
     /// The surface reaches the desktop through a compositor, so the frame's own alpha
     /// decides what is seen: a layer, not a decorated window.
     composited: bool,
+    /// The presenter's frame window, set once the swap chain exists. Absent for a window
+    /// without one, which is always drawable and paces on `DwmFlush`.
+    pace: Option<Rc<crate::frame_pace::FramePace>>,
 }
 
 impl Win32Window {
@@ -282,6 +286,7 @@ impl Win32Window {
             drag,
             drop_target,
             composited: opening.composited,
+            pace: None,
         })
     }
 
@@ -484,12 +489,53 @@ impl Win32Window {
         let _ = self.wait_until(None);
     }
 
+    /// Adopt the frame window of the swap chain this window presents through.
+    ///
+    /// The presenter calls this as it opens or rebuilds its chain; the handle itself is the
+    /// chain's, so replacing it here never closes the previous one.
+    pub(crate) fn set_frame_pace(&mut self, pace: Rc<crate::frame_pace::FramePace>) {
+        self.pace = Some(pace);
+    }
+
     /// Wait for the desktop compositor to take the next frame.
     ///
-    /// A Win32 window has no frame callback; `DwmFlush` blocks until the composition pass
-    /// that will show what was presented, which is the same pacing point.
+    /// With a frame-latency waitable this is the compositor's own window, and the wait
+    /// also ends on input: a resize or a title-bar drag is dispatched by the loop's next
+    /// turn instead of waiting behind the frame in flight. A chain without one falls back
+    /// to `DwmFlush`, which waits for composition without any input in between.
     pub fn wait_for_frame(&mut self) {
-        wait_for_composition();
+        let Some(pace) = self.pace.as_ref() else {
+            wait_for_composition();
+            return;
+        };
+        let Some(handle) = pace.handle() else {
+            wait_for_composition();
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !pace.can_draw() {
+            let now = Instant::now();
+            if now >= deadline {
+                // A compositor that never answers must not deadlock the app; the next
+                // present either works or reports its own failure.
+                pace.opened();
+                return;
+            }
+            let millis = bounded_millis(Some(deadline - now));
+            let result = unsafe {
+                MsgWaitForMultipleObjectsEx(Some(&[handle]), millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+            };
+            if result == WAIT_OBJECT_0 {
+                // The wait consumed the auto-reset object: this is the window.
+                pace.opened();
+                return;
+            }
+            if result.0 == WAIT_OBJECT_0.0 + 1 {
+                // Input arrived first. Return to the loop, which dispatches it before the
+                // next frame; dispatching here would run the app inside its own pace.
+                return;
+            }
+        }
     }
 
     /// Apply the pointer shape this frame resolved; false when it was already that shape.
@@ -877,8 +923,9 @@ impl FrameHost for Win32Window {
         Win32Window::pointer(self)
     }
     fn can_draw(&self) -> bool {
-        // There is no compositor window to wait for: every turn may present.
-        true
+        // The compositor's frame window, when the chain has one; otherwise every turn may
+        // present and `DwmFlush` does the pacing.
+        self.pace.as_ref().is_none_or(|pace| pace.can_draw())
     }
     fn wait_until(&mut self, timeout: Option<Duration>) -> bool {
         Win32Window::wait_until(self, timeout)

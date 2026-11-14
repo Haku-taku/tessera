@@ -1,5 +1,7 @@
 //! The swap chain and the scene that fills it: the engine's [`SceneTarget`] on Windows.
 
+use std::rc::Rc;
+
 use ui_core::Damage;
 use ui_core::colour::{
     Chromaticities, Destination, Domain, LinearEncoding, ToneMapping, WhiteAdaptation,
@@ -22,13 +24,14 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1,
-    IDXGISwapChain3,
+    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2,
+    IDXGIOutput, IDXGISwapChain1, IDXGISwapChain2, IDXGISwapChain3,
 };
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::core::Interface as _;
 
+use crate::frame_pace::FramePace;
 use crate::outputs::HdrOutput;
 use crate::window::Win32Window;
 use crate::WindowError;
@@ -47,6 +50,11 @@ pub struct Win32Presenter {
     device: D3d11Device,
     renderer: GpuRenderer,
     chain: IDXGISwapChain1,
+    /// The flags the chain was opened with: `ResizeBuffers` must repeat them exactly, and
+    /// the waitable one cannot be added later.
+    chain_flags: u32,
+    /// The compositor's frame window, shared with the window and the host's wait set.
+    pace: Rc<FramePace>,
     format: DXGI_FORMAT,
     /// The output the chain declares HDR for, with how that light is encoded; `None` on an
     /// 8-bit SDR surface.
@@ -70,8 +78,19 @@ pub struct Win32Presenter {
 }
 
 impl Win32Presenter {
-    /// Build the device and open a swap chain on `window`.
+    /// Build the device and open a swap chain on `window`, with a frame window of its own.
+    ///
+    /// Callers that drive a loop themselves use this; the session shares one with the
+    /// window and the host's wait set through [`open`](Self::open).
     pub fn new(window: &Win32Window) -> Result<Self, WindowError> {
+        Self::open(window, Rc::new(FramePace::new()))
+    }
+
+    /// Build the device and open a swap chain on `window`, paced through `pace`.
+    ///
+    /// The chain's waitable object goes into `pace`, and every successful present closes
+    /// it until the compositor takes the frame.
+    pub(crate) fn open(window: &Win32Window, pace: Rc<FramePace>) -> Result<Self, WindowError> {
         let size = window.client_size();
         if size.0 == 0 || size.1 == 0 {
             return Err(WindowError::Win32(String::from(
@@ -88,14 +107,32 @@ impl Win32Presenter {
             size,
             window.composited(),
         )?;
+        // The waitable object is what makes `Present(0)` return instead of blocking the
+        // loop: one frame in flight, and the next draw waits for the compositor's window.
+        // A chain opened without the flag has none, and the loop keeps its old pacing.
+        if let (true, Ok(chain2)) = (opened.waitable, opened.chain.cast::<IDXGISwapChain2>()) {
+            // A latency the chain refuses is not fatal: it only leaves the default in place.
+            let _ = unsafe { chain2.SetMaximumFrameLatency(1) };
+            let handle = unsafe { chain2.GetFrameLatencyWaitableObject() };
+            pace.set_handle((!handle.0.is_null()).then_some(handle));
+        } else {
+            pace.set_handle(None);
+        }
         // Before the frame target exists: its format follows the destination.
         if let Some((output, encoding)) = opened.hdr {
             aim_at_hdr(&mut renderer, output, encoding);
         }
+        let chain_flags = if opened.waitable {
+            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32
+        } else {
+            0
+        };
         let mut this = Self {
             device,
             renderer,
             chain: opened.chain,
+            chain_flags,
+            pace,
             format: opened.format,
             hdr: opened.hdr,
             _composition: opened.composition,
@@ -125,8 +162,13 @@ impl Win32Presenter {
         self.device.release_target(self.buffer);
         self.buffer = TargetId(0);
         unsafe {
-            self.chain
-                .ResizeBuffers(BUFFERS, size.0, size.1, self.format, DXGI_SWAP_CHAIN_FLAG(0))
+            self.chain.ResizeBuffers(
+                BUFFERS,
+                size.0,
+                size.1,
+                self.format,
+                DXGI_SWAP_CHAIN_FLAG(self.chain_flags as i32),
+            )
         }
         .map_err(|error| WindowError::Gpu(format!("ResizeBuffers: {error}")))?;
         self.size = size;
@@ -305,9 +347,15 @@ impl SceneTarget for Win32Presenter {
             self.capture = false;
             self.captured = Some(self.device.read_pixels(self.buffer, self.size.0, self.size.1));
         }
-        unsafe { self.chain.Present(1, DXGI_PRESENT(0)) }
+        // With a waitable object the frame is queued without waiting for the compositor:
+        // the loop draws the next one only when that object names a window, so the wait
+        // happens in a message-aware sleep instead of here. Without one, present at the
+        // next vblank as before.
+        let interval = if self.pace.handle().is_some() { 0 } else { 1 };
+        unsafe { self.chain.Present(interval, DXGI_PRESENT(0)) }
             .ok()
             .map_err(|error| format!("Present: {error}"))?;
+        self.pace.presented();
         if self.presented == 0 {
             // The window is on screen; the programs it did not draw compile from here, so the
             // one that first draws glass does not wait for it.
@@ -343,6 +391,8 @@ struct Chain {
     format: DXGI_FORMAT,
     hdr: Option<(HdrOutput, LinearEncoding)>,
     composition: Option<Composition>,
+    /// Whether the chain was opened with a frame-latency waitable object.
+    waitable: bool,
 }
 
 /// The DirectComposition stack a transparent surface presents through.
@@ -371,24 +421,28 @@ fn open_chain(
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     if let Some(output) = crate::outputs::hdr_output(&factory, monitor) {
         let format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        let (chain, composition) = create_chain(&factory, device, hwnd, size, format, composited)?;
+        let (chain, composition, waitable) =
+            create_chain(&factory, device, hwnd, size, format, composited)?;
         if let Some(encoding) = declare_hdr(&chain) {
             return Ok(Chain {
                 chain,
                 format,
                 hdr: Some((output, encoding)),
                 composition,
+                waitable,
             });
         }
         drop(chain);
     }
     let format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    let (chain, composition) = create_chain(&factory, device, hwnd, size, format, composited)?;
+    let (chain, composition, waitable) =
+        create_chain(&factory, device, hwnd, size, format, composited)?;
     Ok(Chain {
         chain,
         format,
         hdr: None,
         composition,
+        waitable,
     })
 }
 
@@ -446,6 +500,9 @@ fn aim_at_hdr(renderer: &mut GpuRenderer, output: HdrOutput, encoding: LinearEnc
 }
 
 /// A flip-model chain at `format`, composed when the surface's alpha is meant to be seen.
+///
+/// The waitable object is preferred, not required: a driver or a composition surface that
+/// refuses the flag still gets a chain, and the loop paces it the old way.
 fn create_chain(
     factory: &IDXGIFactory2,
     device: &ID3D11Device,
@@ -453,6 +510,24 @@ fn create_chain(
     size: (u32, u32),
     format: DXGI_FORMAT,
     composited: bool,
+) -> Result<(IDXGISwapChain1, Option<Composition>, bool), WindowError> {
+    let waitable = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
+    match create_chain_with(factory, device, hwnd, size, format, composited, waitable) {
+        Ok((chain, composition)) => Ok((chain, composition, true)),
+        Err(_) => create_chain_with(factory, device, hwnd, size, format, composited, 0)
+            .map(|(chain, composition)| (chain, composition, false)),
+    }
+}
+
+/// One attempt at a chain, with exactly the flags it was given.
+fn create_chain_with(
+    factory: &IDXGIFactory2,
+    device: &ID3D11Device,
+    hwnd: HWND,
+    size: (u32, u32),
+    format: DXGI_FORMAT,
+    composited: bool,
+    flags: u32,
 ) -> Result<(IDXGISwapChain1, Option<Composition>), WindowError> {
     let descriptor = DXGI_SWAP_CHAIN_DESC1 {
         Width: size.0,
@@ -472,7 +547,7 @@ fn create_chain(
         } else {
             DXGI_ALPHA_MODE_UNSPECIFIED
         },
-        Flags: 0,
+        Flags: flags,
     };
     if composited {
         let chain = unsafe {
