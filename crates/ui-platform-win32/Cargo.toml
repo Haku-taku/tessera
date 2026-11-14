@@ -20,6 +20,8 @@ ui-gpu-d3d11 = { path = "../ui-gpu-d3d11" }
 # over a PNG; reading one back walks the same table, so both decoders are needed.
 image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 log = "0.4"
+# `#[implement]` expands against the crate's own core types, not the facade's re-exports.
+windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Foundation",
     "Graphics_Capture",
@@ -35,6 +37,7 @@ windows = { version = "0.62", features = [
     "Win32_Devices_Display",
     "Win32_Graphics_Gdi",
     "Win32_Globalization",
+    "Win32_System_Com",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
@@ -45,6 +48,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Pipes",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_Variant",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
@@ -54,5 +58,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_Pointer",
     "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_TextServices",
     "Win32_UI_WindowsAndMessaging",
 ] }

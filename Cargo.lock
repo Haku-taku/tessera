@@ -2055,6 +2055,7 @@ dependencies = [
  "ui-gpu-scene",
  "ui-platform",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

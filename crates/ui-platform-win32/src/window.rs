@@ -17,10 +17,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgn, DEVMODEW, DeleteObject, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
-    GetMonitorInfoW, HBRUSH, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
-    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, MonitorFromRect,
-    MonitorFromWindow, PAINTSTRUCT, RGN_OR, ScreenToClient, SetWindowRgn,
+    ClientToScreen, CombineRgn, CreateRectRgn, DEVMODEW, DeleteObject, ENUM_CURRENT_SETTINGS,
+    EnumDisplaySettingsW, GetMonitorInfoW, HBRUSH, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint,
+    MonitorFromRect, MonitorFromWindow, PAINTSTRUCT, RGN_OR, ScreenToClient, SetWindowRgn,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -98,6 +98,10 @@ struct WindowState {
     ime_open: bool,
     /// The buffer is secret: the input method's own candidate list is hidden too.
     ime_hidden: bool,
+    /// The TSF document this window hands an input method, once a text field has asked.
+    tsf: Option<Rc<RefCell<crate::tsf::Session>>>,
+    /// TSF could not be brought up: the window keeps IMM32 for the rest of its life.
+    tsf_failed: bool,
     /// The areas the last frame's tree consumes, surface-local logical units; `None` until a
     /// frame publishes one, which leaves the whole surface consuming input.
     input: Option<Vec<Rect>>,
@@ -366,6 +370,7 @@ impl Win32Window {
     /// Events since the last call, in arrival order.
     pub fn take_events(&mut self) -> Vec<Event> {
         self.pump();
+        self.drain_tsf();
         std::mem::take(&mut self.state.borrow_mut().events)
     }
 
@@ -446,6 +451,9 @@ impl Win32Window {
     ///
     /// A context change sends messages back to this thread's window procedure, so nothing is
     /// borrowed while the IME calls run.
+    /// A focused field that is not secret hands the input to TSF, which is the only Windows
+    /// path that carries the surrounding text and a request to delete it. Every other state
+    /// — no field, a secret one — keeps the IMM32 path.
     pub fn set_ime(&mut self, state: ImeState) {
         let (open, dpi) = {
             let mut window = self.state.borrow_mut();
@@ -456,6 +464,31 @@ impl Win32Window {
             window.ime_hidden = state.hidden;
             (window.ime_open, window.dpi)
         };
+        let wants_tsf = state.enabled && !state.hidden;
+        let session = self.tsf(wants_tsf);
+        if let Some(session) = session {
+            let attached = {
+                let mut session = session.borrow_mut();
+                if !wants_tsf {
+                    session.set_attached(false);
+                }
+                let attached = wants_tsf && session.set_attached(true);
+                if attached {
+                    let mut origin = POINT::default();
+                    // The store's rectangles are in screen pixels; the caret arrives in
+                    // surface-local logical units.
+                    unsafe {
+                        let _ = ClientToScreen(self.hwnd, &mut origin);
+                    }
+                    session.publish(&state, dpi, origin);
+                }
+                attached
+            };
+            self.drain_tsf();
+            if attached {
+                return;
+            }
+        }
         if crate::ime::set_open(self.hwnd, state.enabled, open) {
             self.state.borrow_mut().ime_open = state.enabled;
         }
@@ -463,6 +496,39 @@ impl Win32Window {
             && let Some(caret) = state.cursor
         {
             crate::ime::place(self.hwnd, dpi, caret);
+        }
+    }
+
+    /// The window's TSF document, started on first need; `None` once TSF refused to start.
+    fn tsf(&mut self, start: bool) -> Option<Rc<RefCell<crate::tsf::Session>>> {
+        if let Some(session) = self.state.borrow().tsf.clone() {
+            return Some(session);
+        }
+        if !start || self.state.borrow().tsf_failed {
+            return None;
+        }
+        match crate::tsf::Session::attach(self.hwnd) {
+            Ok(session) => {
+                let session = Rc::new(RefCell::new(session));
+                self.state.borrow_mut().tsf = Some(session.clone());
+                Some(session)
+            }
+            Err(error) => {
+                log::warn!("tsf: not available, keeping IMM32: {error}");
+                self.state.borrow_mut().tsf_failed = true;
+                None
+            }
+        }
+    }
+
+    /// Move the events a TSF edit produced into the window's queue.
+    fn drain_tsf(&mut self) {
+        let Some(session) = self.state.borrow().tsf.clone() else {
+            return;
+        };
+        let events = session.borrow().take_events();
+        if !events.is_empty() {
+            self.state.borrow_mut().events.extend(events);
         }
     }
 
@@ -944,14 +1010,25 @@ unsafe fn handle(
             Some(LRESULT(0))
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if tsf_key(state, true, wparam, lparam) {
+                return Some(LRESULT(0));
+            }
             key(state, (wparam.0 & 0xFFFF) as u16, true);
             Some(LRESULT(0))
         }
         WM_KEYUP | WM_SYSKEYUP => {
+            if tsf_key(state, false, wparam, lparam) {
+                return Some(LRESULT(0));
+            }
             key(state, (wparam.0 & 0xFFFF) as u16, false);
             Some(LRESULT(0))
         }
         WM_CHAR => {
+            // A key an input method took still produces a character through
+            // `TranslateMessage`, and feeding it back would type the composition twice.
+            if tsf_swallows_char(state) {
+                return Some(LRESULT(0));
+            }
             // Control characters are the command path's: `WM_KEYDOWN` already named them.
             if let Some(character) = char::from_u32((wparam.0 & 0xFFFF) as u32)
                 && !character.is_control()
@@ -964,6 +1041,9 @@ unsafe fn handle(
             Some(LRESULT(0))
         }
         WM_IME_SETCONTEXT => {
+            if tsf_attached(state) {
+                return Some(LRESULT(0));
+            }
             let hidden = state.borrow().ime_hidden;
             let flags = crate::ime::ui_flags(lparam, hidden);
             Some(unsafe { DefWindowProcW(hwnd, message, wparam, flags) })
@@ -973,6 +1053,9 @@ unsafe fn handle(
             // own composition window stays hidden and this needs no default handling. The
             // place is refreshed here because the caret is the last frame's, and the window
             // may have moved since.
+            if tsf_attached(state) {
+                return Some(LRESULT(0));
+            }
             let (caret, dpi) = {
                 let window = state.borrow();
                 (window.ime.as_ref().and_then(|ime| ime.cursor), window.dpi)
@@ -983,11 +1066,17 @@ unsafe fn handle(
             Some(LRESULT(0))
         }
         WM_IME_COMPOSITION => {
+            if tsf_attached(state) {
+                return Some(LRESULT(0));
+            }
             let events = crate::ime::composition(hwnd, lparam.0 as u32);
             state.borrow_mut().events.extend(events);
             Some(LRESULT(0))
         }
         WM_IME_ENDCOMPOSITION => {
+            if tsf_attached(state) {
+                return Some(LRESULT(0));
+            }
             state.borrow_mut().events.push(Event::Preedit(None));
             Some(LRESULT(0))
         }
@@ -1019,6 +1108,31 @@ unsafe fn handle(
         }
         _ => None,
     }
+}
+
+/// Offer a key to the attached input methods; true when one took it.
+fn tsf_key(state: &RefCell<WindowState>, down: bool, wparam: WPARAM, lparam: LPARAM) -> bool {
+    let session = state.borrow().tsf.clone();
+    let Some(session) = session else {
+        return false;
+    };
+    session.borrow_mut().key(down, wparam.0, lparam.0)
+}
+
+/// Whether the input methods own this window's keyboard right now.
+fn tsf_attached(state: &RefCell<WindowState>) -> bool {
+    let session = state.borrow().tsf.clone();
+    session
+        .map(|session| session.borrow().is_attached())
+        .unwrap_or(false)
+}
+
+/// Whether the pending character belongs to a key an input method already handled.
+fn tsf_swallows_char(state: &RefCell<WindowState>) -> bool {
+    let session = state.borrow().tsf.clone();
+    session
+        .map(|session| session.borrow().take_swallowed_char())
+        .unwrap_or(false)
 }
 
 /// Turn one key message into modifiers and, when it names one, a key event.

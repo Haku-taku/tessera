@@ -26,6 +26,7 @@ mod presenter;
 mod session;
 mod theme;
 mod tray;
+mod tsf;
 mod wgc;
 mod window;
 
