@@ -206,7 +206,9 @@ pub(crate) fn icon_button_page(
             tr(&scoped, Msg::GALLERY_ICON_BUTTON_DISABLED),
         ))
         .child(sample_row(
-            Id::str("icon-button/disabled"),
+            // The row and its one sample cannot share an id: the tree keys by id, so the
+            // button's declaration would collapse into the row's.
+            icon_button_disabled_id().with("row"),
             vec![disabled],
             &mut scoped,
         ));

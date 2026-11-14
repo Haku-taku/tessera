@@ -394,7 +394,9 @@ impl Widget for Md3RichToolTip {
             bottom: RICH_TEXT_BOTTOM,
         };
         root = root.child(
-            self.band("text", pad, 0.0, 0.0).child(
+            // The band cannot be called "text": the paragraph inside it is, and the tree keys
+            // by id, so the two would collapse into one node.
+            self.band("text-band", pad, 0.0, 0.0).child(
                 Text::new(
                     self.id.with("text"),
                     self.text.clone(),
