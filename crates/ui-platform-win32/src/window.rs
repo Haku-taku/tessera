@@ -42,17 +42,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
-    HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_CROSS,
+    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_CROSS,
     IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
-    IsWindow,
+    IsWindow, KillTimer,
     LoadCursorW, MA_ACTIVATE, MA_NOACTIVATE, MINMAXINFO, MSG, MWMO_INPUTAVAILABLE,
     MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
     RegisterClassExW, SM_CXMINTRACK, SM_CYMINTRACK, SW_SHOW, SW_SHOWNOACTIVATE,
     SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow,
-    SetWindowLongPtrW,
+    SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENTERSIZEMOVE,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE,
     WM_GETMINMAXINFO,
     WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
     WM_KEYDOWN, WM_KEYUP,
@@ -125,16 +126,9 @@ struct WindowState {
     previous: Option<HWND>,
     /// A sizing drag this window runs itself; see `begin_sizing`.
     sizing: Option<Sizing>,
-    /// A title-bar press waiting for the loop to replay it, carrying the press's screen
-    /// point: `DefWindowProc` would run its move loop inside message dispatch, where the
-    /// engine cannot paint, so the loop replays the press once the pump is armed.
-    move_request: Option<isize>,
-    /// The press in dispatch is the loop's replay: it goes to `DefWindowProc` untouched,
-    /// which is what activates, raises and moves the window on any other press.
-    replay_move: bool,
-    /// The loop driving this window services [`move_request`]. Without that promise the
-    /// press keeps its default handling, or a direct `Win32Window` user could not move it.
-    deferred_move: bool,
+    /// The shell's move or resize loop has the thread: it dispatches this window's
+    /// messages and owns the pointer until the release.
+    size_move: bool,
 }
 
 /// A border drag: the hit test that began it, and where the pointer and window were then.
@@ -308,20 +302,6 @@ impl Win32Window {
         self.drag.clone()
     }
 
-    /// The screen point of a title-bar press waiting for [`start_system_move`], if any.
-    pub(crate) fn take_move_request(&mut self) -> Option<isize> {
-        self.state.borrow_mut().move_request.take()
-    }
-
-    /// Promise that the loop will start a title-bar move itself, with a pump armed.
-    ///
-    /// `Session` makes this promise and services it after every pump. A loop that never
-    /// asks for the request leaves the press to `DefWindowProc`, which moves the window
-    /// without the engine's frames — but moves it.
-    pub(crate) fn defer_system_move(&mut self) {
-        self.state.borrow_mut().deferred_move = true;
-    }
-
     /// The window the frame is composed into.
     pub fn visual_hwnd(&self) -> HWND {
         self.visual
@@ -330,6 +310,11 @@ impl Win32Window {
     /// Whether the frame's own alpha is composed over the desktop.
     pub fn alpha(&self) -> crate::presenter::Alpha {
         self.alpha
+    }
+
+    /// Whether the shell's move or resize loop has this window's thread and pointer.
+    pub fn in_size_move(&self) -> bool {
+        self.state.borrow().size_move
     }
 
     /// Whether the window still exists; closing it destroys it and ends the loop.
@@ -1088,31 +1073,48 @@ unsafe fn handle(
             Some(LRESULT(HTCLIENT as isize))
         }
         WM_NCLBUTTONDOWN => {
-            // `DefWindowProc` is what activates and raises a window on a non-client press,
-            // and it is also what starts the title bar's modal move loop. The loop belongs
-            // to the shell — snapping included — but it would begin inside message dispatch,
-            // where the host cannot reach the surface to keep painting. So the press is
-            // recorded instead, and the host loop replays it through this procedure with
-            // its frame pump armed: the replayed copy takes the default handling below, so
-            // the window activates, raises and moves exactly as a window without an engine.
+            // The sizing border is a drag `DefWindowProcW` would run in a modal loop; this
+            // window sizes itself instead, one message at a time, so a frame follows every
+            // move. Every other non-client part — the title bar most of all — keeps the
+            // default handling: `DefWindowProc` activates, raises, starts the move loop
+            // and owns snapping, and `WM_ENTERSIZEMOVE` arms the timer that keeps the
+            // rest of the process drawing while that loop runs.
             let edge = (wparam.0 as u32) & 0xFFFF;
-            let replay = state.borrow().replay_move;
-            if replay {
-                state.borrow_mut().replay_move = false;
-                return None;
-            }
-            // The sizing border is a drag `DefWindowProcW` would also run in a modal loop;
-            // this window sizes itself instead, one message at a time, so a frame follows
-            // every move. Every other non-client part keeps the default behaviour.
             if sizing_edge(edge) {
                 begin_sizing(state, hwnd, edge, packed_point(lparam));
                 return Some(LRESULT(0));
             }
-            let deferred = state.borrow().deferred_move;
-            if edge == HTCAPTION && deferred {
-                state.borrow_mut().move_request = Some(lparam.0);
-                return Some(LRESULT(0));
+            None
+        }
+        WM_ENTERSIZEMOVE => {
+            state.borrow_mut().size_move = true;
+            // The shell's move or resize loop owns this thread's queue until the pointer
+            // comes up, and it dispatches nothing but input and `WM_TIMER`. This timer is
+            // that channel: every other surface of the process draws from it while the
+            // moved one keeps the frame it had.
+            crate::modal::enter_shell();
+            // SAFETY: the window is this thread's and the id is this module's own.
+            unsafe {
+                let _ = SetTimer(
+                    Some(hwnd),
+                    crate::modal::SHELL_TIMER_ID,
+                    crate::modal::TICK_MS,
+                    None,
+                );
             }
+            // The default procedure does nothing for this notification, and Qt skips it
+            // the same way; the loop itself runs either way.
+            Some(LRESULT(0))
+        }
+        WM_EXITSIZEMOVE => {
+            state.borrow_mut().size_move = false;
+            crate::modal::exit_shell();
+            // SAFETY: the id is the one `SetTimer` was given, on this window.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), crate::modal::SHELL_TIMER_ID);
+            }
+            // A move may have crossed a display: its rate and colour space are the new
+            // output's, and `WM_WINDOWPOSCHANGED` has already asked for that re-read.
             None
         }
         WM_MOUSEACTIVATE => {
@@ -1447,30 +1449,6 @@ fn key(state: &RefCell<WindowState>, vk: u16, down: bool) {
             });
         }
     }
-}
-
-/// Replay a title-bar press through the window procedure so `DefWindowProc` handles it.
-///
-/// The procedure recorded the press instead of letting `DefWindowProc` run its move loop
-/// inside message dispatch, where the host cannot reach the surface to keep painting. This
-/// is that press again, a moment later and with a frame pump armed: the procedure marks it
-/// as a replay, the default procedure activates and raises the window the way it does on
-/// any title bar, and its move loop — snapping included — runs to the release while
-/// `WM_TIMER` keeps building frames.
-pub(crate) fn start_system_move(window: &Win32Window, press: isize) {
-    window.state.borrow_mut().replay_move = true;
-    // SAFETY: the window is this thread's; the call returns when the move loop ends.
-    unsafe {
-        SendMessageW(
-            window.hwnd,
-            WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            Some(LPARAM(press)),
-        );
-    }
-    // A press that never reached the procedure would leave the flag set and swallow the
-    // next one; clearing an already-cleared flag costs nothing.
-    window.state.borrow_mut().replay_move = false;
 }
 
 /// Whether a hit-test code names a border or a corner, which is what a sizing drag moves.

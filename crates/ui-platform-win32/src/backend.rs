@@ -246,6 +246,14 @@ impl SurfaceHandle for HostedSurface {
         Ok(SurfaceStep { drew: tick.drew })
     }
 
+    fn moving(&self) -> bool {
+        self.session.moving()
+    }
+
+    fn pump_moved(&mut self) -> bool {
+        self.session.pump_moved()
+    }
+
     fn next_deadline(&self) -> Option<Instant> {
         self.session.next_deadline()
     }

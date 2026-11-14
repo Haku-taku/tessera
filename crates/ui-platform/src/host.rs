@@ -43,6 +43,22 @@ pub struct SurfaceStep {
 pub trait SurfaceHandle {
     fn step(&mut self) -> Result<SurfaceStep, String>;
 
+    /// Whether a move or resize loop the platform started owns this surface right now.
+    ///
+    /// That loop dispatches this thread's messages until the pointer comes up, so a step
+    /// would find nothing to do — and must not pump the queue, which the loop is reading.
+    fn moving(&self) -> bool {
+        false
+    }
+
+    /// Build a frame for a surface a move loop is moving; true when one was handed over.
+    ///
+    /// The loop dispatches only input and the timer it armed, so this tick is the surface's
+    /// only chance to draw while it follows the pointer.
+    fn pump_moved(&mut self) -> bool {
+        false
+    }
+
     /// Hand this surface a texture it did not have when it opened.
     ///
     /// A pin's canvas is already on screen when the next pin arrives, so the texture cannot
@@ -376,6 +392,39 @@ impl Waker for NoWaker {
     fn wake(&self) {}
 }
 
+/// Step each surface once: a turn's work for them, without touching the backend.
+///
+/// Returns the copies each surface finished and the ones that failed, so a caller that
+/// cannot hold the backend — one inside a wait, stepped from a modal loop — can hand them
+/// over afterwards through [`Host::absorb`].
+fn step_surfaces(
+    surfaces: &mut [LiveSurface],
+    stats: &mut RunStats,
+) -> (Vec<ClipboardCopy>, Vec<(SurfaceId, String)>) {
+    let mut copies = Vec::new();
+    let mut retired = Vec::new();
+    for (id, surface) in surfaces {
+        // A surface the platform's own move loop is moving draws from that loop's tick and
+        // nowhere else: a step here would pump the queue the loop is reading.
+        if surface.moving() {
+            if surface.pump_moved() {
+                stats.frames += 1;
+            }
+            continue;
+        }
+        match surface.step() {
+            Ok(step) => {
+                if step.drew {
+                    stats.frames += 1;
+                }
+                copies.extend(surface.take_copies());
+            }
+            Err(reason) => retired.push((*id, reason)),
+        }
+    }
+    (copies, retired)
+}
+
 /// The loop. One per process; created by the application's platform layer.
 pub struct Host {
     backend: Box<dyn Backend>,
@@ -591,7 +640,29 @@ impl Host {
             }
             // Everything that had already arrived is done: only now is a sleep correct.
             let timeout = self.timeout(until);
-            self.backend.wait(timeout)?;
+            // A modal gesture can begin in the wait itself — a title-bar press arrives as
+            // a message, not as a turn — so the rest of the loop is armed here too. The
+            // shell's move loop dispatches nothing but input and `WM_TIMER`, and that
+            // timer is what reaches this hook.
+            // What the modal loop's steps produce is collected here and handed over once the
+            // wait is over: the backend it would be handed to is the one being waited on.
+            let mut copies = Vec::new();
+            let mut retired = Vec::new();
+            let waited = {
+                let surfaces = &mut self.surfaces;
+                let stats = &mut self.stats;
+                let mut others = || {
+                    let (stepped_copies, stepped_retired) = step_surfaces(surfaces, stats);
+                    copies.extend(stepped_copies);
+                    retired.extend(stepped_retired);
+                };
+                crate::modal::arm(&mut others);
+                let waited = self.backend.wait(timeout);
+                crate::modal::disarm();
+                waited
+            };
+            self.absorb(copies, retired);
+            waited?;
         }
         Ok(self.stats)
     }
@@ -689,19 +760,15 @@ impl Host {
     /// gesture's surface, which the platform draws from its own timer. Copies still reach
     /// the clipboard; a failing surface is retired here exactly as a turn would retire it.
     fn pump_others(&mut self) {
-        let mut copies = Vec::new();
-        let mut retired = Vec::new();
-        for (id, surface) in &mut self.surfaces {
-            match surface.step() {
-                Ok(step) => {
-                    if step.drew {
-                        self.stats.frames += 1;
-                    }
-                    copies.extend(surface.take_copies());
-                }
-                Err(reason) => retired.push((*id, reason)),
-            }
-        }
+        let (copies, retired) = step_surfaces(&mut self.surfaces, &mut self.stats);
+        self.absorb(copies, retired);
+    }
+
+    /// Hand over what a step of every surface produced, exactly as a turn would.
+    ///
+    /// Kept apart from the step so a caller holding the backend — one inside a wait — can
+    /// run the step from a modal loop and still deliver what it collected.
+    fn absorb(&mut self, copies: Vec<ClipboardCopy>, retired: Vec<(SurfaceId, String)>) {
         for copy in copies {
             self.backend.set_clipboard_copy(copy);
         }

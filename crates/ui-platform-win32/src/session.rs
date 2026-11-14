@@ -75,8 +75,6 @@ impl<A: App> Session<A> {
         }
         let mut win = Win32Window::new(opts.surface)
             .map_err(|error| format!("cannot open a Win32 window: {error}"))?;
-        // This loop pumps frames inside the system's move loop, so it must start the move.
-        win.defer_system_move();
         let pace = Arc::new(FramePace::new());
         let render = RenderThread::open(
             win.visual_hwnd(),
@@ -180,14 +178,50 @@ impl<A: App> Session<A> {
     /// The host's form. It never waits — the queue is the process's and the loop sleeps
     /// once for every surface — so it can be called for each surface of a process in turn.
     pub fn step(&mut self) -> Result<Tick, String> {
+        // The shell's move or resize loop owns this window until the pointer comes up. Its
+        // messages are dispatched by that loop, so pumping here would take messages out
+        // from under it; the surface keeps drawing from the loop's timer instead.
+        if self.win.in_size_move() {
+            return Ok(Tick::default());
+        }
+        self.under_move_pump(Session::step_body)
+    }
+
+    /// Run `step` with this window's own frame pump answering the shell's move-loop timer.
+    ///
+    /// The host answers that tick for a surface still in its list — it asks
+    /// [`moving`](Self::moving) and calls [`pump_moved`](Self::pump_moved). This covers the
+    /// other half: a title-bar press that arrives inside the step itself, when the surface
+    /// has been taken out of that list so its own step could run. A step dispatches from
+    /// more than one place — the window's pump and the driver's intake — so the pump has to
+    /// be armed before the step starts, not around the call that happens to see the press.
+    ///
+    /// The pump reads the session through a raw pointer because the step holds `&mut self`
+    /// across the same call stack. That is the one alias this module allows: the closure is
+    /// cleared before the step returns, and while the move loop is on the stack the step's
+    /// own borrow is not used — it is blocked inside the message dispatch that started it.
+    fn under_move_pump(
+        &mut self,
+        body: fn(&mut Self) -> Result<Tick, String>,
+    ) -> Result<Tick, String> {
+        let session: *mut Self = self;
+        // SAFETY: see above — the pointer is only called while this step is on the stack,
+        // and only from the shell's loop, which is the step's own dispatch.
+        let mut pump = || {
+            let _ = unsafe { (*session).pump_moved() };
+        };
+        let held = crate::modal::attach(&mut pump);
+        let stepped = body(self);
+        crate::modal::detach(held);
+        stepped
+    }
+
+    fn step_body(&mut self) -> Result<Tick, String> {
         self.win.pump();
         if self.finished() {
             return Ok(Tick::default());
         }
         self.check_render()?;
-        if let Some(press) = self.win.take_move_request() {
-            self.run_native_move(press);
-        }
         let pointer = match self.driver.decide(&mut self.lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
             Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
@@ -195,8 +229,21 @@ impl<A: App> Session<A> {
         self.draw(pointer)
     }
 
+    /// Whether the shell's move or resize loop owns this surface right now.
+    ///
+    /// The host reads it: such a surface draws from the loop's timer and cannot take a step
+    /// of its own, because the queue that step would read is the loop's.
+    pub fn moving(&self) -> bool {
+        self.win.in_size_move()
+    }
+
     /// When the loop must wake with nothing arriving: the engine's own deadlines.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        // A move loop the shell is running owes nothing of its own: its timer is what
+        // steps the rest of the process, and a deadline here would only spin the host.
+        if self.win.in_size_move() {
+            return None;
+        }
         // A frame the render thread has not finished is not a deadline of ours: its event
         // wakes the host. Saying "now" here would spin the loop through a zero-length sleep
         // for the whole of a long frame.
@@ -220,11 +267,17 @@ impl<A: App> Session<A> {
         if self.finished() {
             return Ok(Tick::default());
         }
+        // A move or resize loop the shell is running has this thread; a turn here would
+        // wait for a message the loop is dispatching.
+        if self.win.in_size_move() {
+            return Ok(Tick::default());
+        }
+        self.under_move_pump(Session::tick_body)
+    }
+
+    fn tick_body(&mut self) -> Result<Tick, String> {
         self.check_render()?;
         let turn = self.driver.step(&mut self.lp, &mut self.win);
-        if let Some(press) = self.win.take_move_request() {
-            self.run_native_move(press);
-        }
         let pointer = match turn {
             Turn::Draw { pointer } => pointer,
             Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
@@ -232,6 +285,45 @@ impl<A: App> Session<A> {
         let tick = self.draw(pointer)?;
         self.driver.pace(&mut self.win);
         Ok(tick)
+    }
+
+    /// Draw this surface from the shell's move-loop timer.
+    ///
+    /// `DefWindowProc` does not return until the pointer comes up, so this tick is the only
+    /// chance the engine gets to build a frame for the window it is moving. Without it the
+    /// moved surface holds its last frame for the whole drag while every other surface of
+    /// the process draws from the same tick — the window would keep following the pointer
+    /// with yesterday's contents in it, which is what a user sees as the window freezing.
+    ///
+    /// Nothing may block here: this thread is the one that moves the window, so a wait in
+    /// this tick stops the window under the pointer until the wait ends. A frame the chain
+    /// refuses is simply retried on the next tick, the timer being periodic.
+    pub fn pump_moved(&mut self) -> bool {
+        // The same question the loop asks: something the app or the clock reached owes a
+        // frame, and a still surface owes none.
+        let pointer = match self.driver.decide(&mut self.lp, &mut self.win) {
+            Turn::Draw { pointer } => pointer,
+            Turn::Idle | Turn::Waiting => return false,
+        };
+        let (width, height) = self.win.client_size();
+        if width == 0 || height == 0 || !self.win.can_draw() {
+            return false;
+        }
+        let drew = present_once(
+            &mut self.lp,
+            &mut self.win,
+            &self.render,
+            &self.pace,
+            &mut self.atlases,
+            pointer,
+        )
+        .is_ok();
+        self.closed |= self.lp.take_close();
+        for (dx, dy) in self.lp.take_pointer_steps() {
+            self.win.nudge_pointer(dx, dy);
+        }
+        self.win.set_drop_effect(self.lp.drop_effect());
+        drew
     }
 
     /// Report what the render thread refused, if anything, before a turn tries to draw.
@@ -373,52 +465,6 @@ impl<A: App> Session<A> {
         }
     }
 
-    /// Replay the title-bar press so the system moves the window, with frames inside it.
-    ///
-    /// The replayed press does not return until the window is dropped, exactly like
-    /// `DoDragDrop`, so the same timer pump keeps an animation alive while the shell
-    /// activates, raises and moves the window. There is no queue to serve here — the shell
-    /// owns the pointer — and a still surface has nothing to rebuild, so the pump only runs
-    /// while the app is animating.
-    fn run_native_move(&mut self, press: isize) {
-        let hwnd = self.win.hwnd();
-        let Session {
-            lp,
-            win,
-            render,
-            pace,
-            atlases,
-            closed,
-            ..
-        } = self;
-        let mut pump = || {
-            if !lp.is_animating() {
-                return;
-            }
-            let size = win.client_size();
-            if size.0 == 0 || size.1 == 0 {
-                return;
-            }
-            // The move loop is modal the same way a drag is: blocking on the frame channel
-            // here would freeze the window under the pointer until the render thread
-            // took the frame.
-            if !win.can_draw() {
-                return;
-            }
-            let pointer = win.pointer();
-            let _ = present_once(lp, win, render, pace, atlases, pointer);
-            *closed |= lp.take_close();
-            for (dx, dy) in lp.take_pointer_steps() {
-                win.nudge_pointer(dx, dy);
-            }
-            win.set_drop_effect(lp.drop_effect());
-        };
-        let timer = crate::modal::arm(hwnd, &mut pump);
-        crate::window::start_system_move(win, press);
-        crate::modal::disarm(hwnd, timer);
-        // The window may have crossed a display, which changes its scale or extent.
-        lp.request_frame();
-    }
 }
 
 impl<A: App> Drop for Session<A> {
