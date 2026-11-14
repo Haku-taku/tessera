@@ -313,8 +313,8 @@ impl<A: App> Session<A> {
         }
         // A drag that asked to leave the app becomes the compositor's; the outcome comes
         // back as an event once the target is done with it.
-        if let Some(data) = self.lp.take_native_drag()
-            && !self.win.begin_drag(data)
+        if let Some(drag) = self.lp.take_native_drag()
+            && !self.win.begin_drag(drag.data)
         {
             // The host refused, so the gesture ends without a drop.
             self.lp
@@ -404,8 +404,10 @@ impl<A: App> HostSession<A> for Session<A> {
         self.win.request_paste()
     }
 
-    fn begin_drag(&mut self, data: ui_core::DragData) -> bool {
-        self.win.begin_drag(data)
+    fn begin_drag(&mut self, drag: ui_platform::view::NativeDrag) -> bool {
+        // A compositor drag has no image of its own: the surface behind it keeps painting,
+        // so the element under the pointer is what shows.
+        self.win.begin_drag(drag.data)
     }
 
     fn gpu_present(&self) -> bool {

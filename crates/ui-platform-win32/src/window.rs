@@ -418,8 +418,8 @@ impl Win32Window {
     }
 
     /// Start a drag this app carries, so another window can take the payload.
-    pub fn begin_drag(&mut self, data: ui_core::DragData) -> bool {
-        crate::dnd::begin(self.hwnd, data)
+    pub fn begin_drag(&mut self, drag: ui_platform::view::NativeDrag) -> bool {
+        crate::dnd::begin(self.hwnd, drag, &self.drag)
     }
 
     /// Whether focus, extent or scale changed without an `Event`.
@@ -915,17 +915,6 @@ unsafe fn handle(
         WM_DESTROY => {
             state.borrow_mut().close_requested = true;
             None
-        }
-        crate::dnd::WM_DND_FINISHED => {
-            // The worker thread that ran `DoDragDrop` posts the outcome; the engine tells
-            // the source whether a target took its payload.
-            state
-                .borrow_mut()
-                .events
-                .push(Event::Dnd(ui_core::DndEvent::Finished {
-                    dropped: wparam.0 != 0,
-                }));
-            Some(LRESULT(0))
         }
         WM_SIZE => {
             state.borrow_mut().silent_change = true;

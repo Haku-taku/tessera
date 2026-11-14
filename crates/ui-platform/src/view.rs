@@ -967,6 +967,20 @@ impl DragSession {
     }
 }
 
+/// A drag this app owns, ready for the host to run as an operating-system drag.
+#[derive(Clone, Debug)]
+pub struct NativeDrag {
+    /// What the drop carries.
+    pub data: ui_core::DragData,
+    /// The dragged node's box when the gesture started, in surface units.
+    ///
+    /// The host paints the drag image from the same pixels the pointer left, so this is
+    /// where the picture came from rather than something the engine renders again.
+    pub bounds: Option<ui_core::geom::Rect>,
+    /// The press point, in surface units: the image hangs from here under the pointer.
+    pub origin: ui_core::geom::Point,
+}
+
 pub struct AppLoop<A: App> {
     app: A,
     tree: Tree,
@@ -1080,7 +1094,7 @@ pub struct AppLoop<A: App> {
     /// The node that started the native drag the host is running, until it finishes.
     native_source: Option<Id>,
     /// A native drag the host has not started yet.
-    native_request: Option<(Id, ui_core::DragData)>,
+    native_request: Option<NativeDrag>,
     /// Hovered node and its ancestors, root first; only hover subscribers appear here.
     hovered_path: Vec<Id>,
     /// Every node under the pointer, subscribers or not; cursor inheritance walks this.
@@ -1378,12 +1392,12 @@ impl<A: App> AppLoop<A> {
         std::mem::take(&mut self.pointer_steps)
     }
 
-    /// The payload of a drag that asked to leave the app, waiting for the host to start it.
+    /// The drag that asked to leave the app, waiting for the host to start it.
     ///
     /// The source has already heard `DragStarted`; the host reports the outcome later as
     /// `Event::Dnd(DndEvent::Finished)`.
-    pub fn take_native_drag(&mut self) -> Option<ui_core::DragData> {
-        self.native_request.take().map(|(_, data)| data)
+    pub fn take_native_drag(&mut self) -> Option<NativeDrag> {
+        self.native_request.take()
     }
 
     /// What dropping the live drag here would do, or `None` when nothing takes it.
@@ -2833,21 +2847,31 @@ impl<A: App> AppLoop<A> {
         let (id, change) = match event {
             // A drag start carries no value yet: the first `Moved` says where the pointer
             // is inside the control, and that is what a control maps to a value.
-            DragEvent::Started { on, .. } => {
+            DragEvent::Started { on, from, .. } => {
                 // A new gesture starts with no movement banked: the previous drag's slice
                 // must not be added to this one if both fall inside a single frame.
                 self.drag_step = None;
-                let (data, native) = self
+                let node = self
                     .tree
                     .find_by_id(on)
-                    .and_then(|nid| self.tree.get(nid))
-                    .map(|n| (n.drag.clone(), n.drag_out))
-                    .unwrap_or((None, false));
+                    .and_then(|nid| self.tree.get(nid));
+                let (data, native, bounds) = match node {
+                    Some(node) => (
+                        node.drag.clone(),
+                        node.drag_out,
+                        Some(node.visual_rect()),
+                    ),
+                    None => (None, false, None),
+                };
                 match data {
                     // A native drag hands the gesture to the host: this loop only hears
                     // how it ended.
                     Some(data) if native => {
-                        self.native_request = Some((on, (*data).clone()));
+                        self.native_request = Some(NativeDrag {
+                            data: (*data).clone(),
+                            bounds,
+                            origin: from,
+                        });
                         self.native_source = Some(on);
                         self.drag.reset();
                     }
@@ -3025,12 +3049,16 @@ impl<A: App> AppLoop<A> {
                 let Some(source) = self.native_source.take() else {
                     return false;
                 };
-                // Another application took the payload (or none did); this loop never saw
-                // where it landed, so the source learns only that the gesture ended.
-                let change = if dropped {
-                    Change::Dropped(None)
-                } else {
+                // A drop on one of this app's own targets is the one landing this loop did
+                // see; anything else is another application's, and the source learns only
+                // that the gesture was taken by something it cannot name.
+                let change = if !dropped {
                     Change::Cancelled
+                } else {
+                    match self.drop_target {
+                        Some(target) => Change::Dropped(Some(target)),
+                        None => Change::Dropped(None),
+                    }
                 };
                 self.app_changed(source, change)
             }
@@ -5458,6 +5486,19 @@ impl<A: App> AppLoop<A> {
         if let ui_core::Event::Dnd(dnd) = &event {
             let requested = self.dnd_event(dnd.clone());
             return requested || before != (self.hovered, self.pressed, self.focused);
+        }
+        // A native drag owns the pointer from the moment the host takes it until `Finished`:
+        // the press and release this window still sees belong to the OS gesture, and letting
+        // them through would click the source the drag was started from.
+        if self.native_source.is_some()
+            && matches!(
+                event,
+                ui_core::Event::PointerPressed { .. }
+                    | ui_core::Event::PointerMoved { .. }
+                    | ui_core::Event::PointerReleased { .. }
+            )
+        {
+            return false;
         }
         // An open menu owns the pointer until it closes: a pick, or a dismissal.
         if self.menu.is_some()

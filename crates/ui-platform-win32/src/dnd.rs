@@ -1,10 +1,10 @@
 //! Drag and drop on Windows: OLE's drop target, and the source a drag leaves the app with.
 //!
-//! Both directions go through OLE, and both run on the window's own thread or on one STA
-//! thread that outlives the gesture. A drag this app receives arrives as `IDropTarget`
-//! callbacks, which post engine events to the window's queue; a drag this app starts is
-//! handed to `DoDragDrop` on a worker thread, because that call is modal and the window must
-//! keep painting while another application decides whether to take the payload.
+//! Both directions go through OLE, on the window's own thread, because that is the thread
+//! whose window holds the mouse: `DoDragDrop` is modal on the thread that started it. A
+//! drag this app receives arrives as `IDropTarget` callbacks, which post engine events to
+//! the window's queue; a drag this app starts runs inside the turn that began it and shows
+//! the element's own pixels under the pointer.
 
 use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
@@ -12,15 +12,21 @@ use std::rc::Rc;
 
 use ui_core::Event;
 use ui_core::dnd::{DndEvent, DragData, DragItem, DropEffect};
-use ui_core::geom::Point;
+use ui_core::geom::{Point, Rect};
+use ui_platform::view::NativeDrag;
 use windows::Win32::Foundation::{
-    DV_E_FORMATETC, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY, HGLOBAL, HWND, LPARAM, POINT, POINTL,
-    S_FALSE, S_OK, WPARAM,
+    COLORREF, DV_E_FORMATETC, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY, HGLOBAL, HWND, POINT, POINTL,
+    S_FALSE, S_OK, SIZE,
 };
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleDC,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HGDIOBJ, ReleaseDC, SRCCOPY,
+    ScreenToClient, SelectObject,
+};
 use windows::Win32::System::Com::{
-    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
-    IEnumFORMATETC, IEnumFORMATETC_Impl, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
+    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, STGMEDIUM, STGMEDIUM_0,
+    STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{
@@ -32,13 +38,12 @@ use windows::Win32::System::SystemServices::{
     MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+use windows::Win32::UI::Shell::{
+    CLSID_DragDropHelper, IDragSourceHelper, IDropTargetHelper, SHCreateMemStream, SHDRAGIMAGE,
+};
 use windows::core::{BOOL, Error, HRESULT, Ref, Result, implement};
 
 use crate::clipboard;
-
-/// The message a finished drag posts to the window, carrying its dropped flag.
-pub(crate) const WM_DND_FINISHED: u32 = WM_APP + 0x31;
 
 /// OLE objects shared with the window's own thread: the events a drag produced, and the
 /// effect the last frame negotiated for the pointer.
@@ -74,7 +79,7 @@ impl DragQueue {
         self.effect.set(bits.0);
     }
 
-    fn push(&self, event: Event) {
+    pub(crate) fn push(&self, event: Event) {
         self.events.borrow_mut().push(event);
     }
 
@@ -96,7 +101,11 @@ pub(crate) fn register(hwnd: HWND, queue: Rc<DragQueue>) -> Option<IDropTarget> 
         log::warn!("ui-platform-win32: OLE could not start, so the window takes no drops");
         return None;
     }
-    let target: IDropTarget = DropTarget { queue }.into();
+    // OLE's own helper is what paints a source's image and drop description on this
+    // window: a drag image is only ever drawn by the target that asks for it.
+    let helper: Option<IDropTargetHelper> =
+        unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }.ok();
+    let target: IDropTarget = DropTarget { queue, helper }.into();
     // SAFETY: the window is this thread's and the interface outlives the registration.
     match unsafe { RegisterDragDrop(hwnd, &target) } {
         Ok(()) => Some(target),
@@ -130,50 +139,191 @@ fn ensure_ole() -> bool {
     })
 }
 
-/// Start a blocking drag on a worker STA thread.
+/// Start the drag this app owns, and stay in it until the gesture ends.
 ///
-/// `DoDragDrop` runs its own message loop until a target takes the payload or the gesture is
-/// cancelled, so running it here is what keeps this window responsive during the drag. The
-/// outcome comes back as `WM_DND_FINISHED`.
-pub(crate) fn begin(hwnd: HWND, data: DragData) -> bool {
-    let formats = payload_formats(&data);
+/// `DoDragDrop` runs a modal loop on the calling thread, and that loop wakes on the mouse
+/// input the thread's window captured. A worker thread has no window the OS feeds, so its
+/// loop never observes the release: measured, `QueryContinueDrag` was never called and the
+/// call never returned. The drag therefore runs on the window's thread, inside the turn that
+/// started it; the engine paints again only once the gesture is over, which is why an
+/// outgoing drag shows its last frame rather than highlighting targets as the pointer
+/// passes them. The outcome is queued as `DndEvent::Finished` behind OLE's callbacks.
+pub(crate) fn begin(hwnd: HWND, drag: NativeDrag, queue: &DragQueue) -> bool {
+    let formats = payload_formats(&drag.data);
     if formats.is_empty() {
         return false;
     }
-    let allowed = match data.effect {
+    let allowed = match drag.data.effect {
         DropEffect::Copy => DROPEFFECT_COPY,
         DropEffect::Move => DROPEFFECT_MOVE,
         DropEffect::Link => DROPEFFECT_LINK,
     };
-    let window = hwnd.0 as isize;
-    std::thread::Builder::new()
-        .name("dnd-source".to_owned())
-        .spawn(move || {
-            if !ensure_ole() {
-                post_finished(window, false);
-                return;
-            }
-            let object: IDataObject = DataObject { formats }.into();
-            let source: IDropSource = DropSource.into();
-            let mut effect = DROPEFFECT_NONE;
-            // SAFETY: both interfaces are local to this thread and outlive the call.
-            let result = unsafe { DoDragDrop(&object, &source, allowed, &mut effect) };
-            post_finished(window, result.is_ok() && effect != DROPEFFECT_NONE);
-        })
-        .is_ok()
+    // The window's drop target started OLE when it registered; this only covers a window
+    // that takes drags out but never any in.
+    if !ensure_ole() {
+        return false;
+    }
+    let object: IDataObject = DataObject {
+        formats: RefCell::new(formats),
+    }
+    .into();
+    attach_image(hwnd, &drag, &object);
+    let source: IDropSource = DropSource.into();
+    let mut effect = DROPEFFECT_NONE;
+    // SAFETY: both interfaces are local to this call and outlive it.
+    let result = unsafe { DoDragDrop(&object, &source, allowed, &mut effect) };
+    // Queued behind the callbacks OLE just made: any drop this window took is processed
+    // before the source hears the gesture is over.
+    queue.push(Event::Dnd(DndEvent::Finished {
+        dropped: result.is_ok() && effect != DROPEFFECT_NONE,
+    }));
+    true
 }
 
-/// Tell the window how the native drag ended.
-fn post_finished(hwnd: isize, dropped: bool) {
-    // SAFETY: a destroyed window refuses the post, which is the only failure possible here.
-    unsafe {
-        let _ = PostMessageW(
-            Some(HWND(hwnd as *mut core::ffi::c_void)),
-            WM_DND_FINISHED,
-            WPARAM(dropped as usize),
-            LPARAM(0),
-        );
+/// Carry the dragged element's own pixels under the pointer for the whole gesture.
+///
+/// The window is composited by the GPU, so its content cannot be asked for through a DC;
+/// the screen already shows it, and the box the gesture started from is where those pixels
+/// are. OLE copies the bitmap and owns it from the moment the helper takes it.
+fn attach_image(hwnd: HWND, drag: &NativeDrag, object: &IDataObject) {
+    let Some(bounds) = drag.bounds else {
+        return;
+    };
+    let Some((bitmap, width, height, hotspot)) = capture(hwnd, bounds, drag.origin) else {
+        return;
+    };
+    let helper: Result<IDragSourceHelper> =
+        unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) };
+    let helper = match helper {
+        Ok(helper) => helper,
+        Err(error) => {
+            log::warn!("ui-platform-win32: the drag image helper is unavailable: {error}");
+            // SAFETY: the bitmap was created here and OLE never saw it.
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            }
+            return;
+        }
+    };
+    let image = SHDRAGIMAGE {
+        sizeDragImage: SIZE {
+            cx: width,
+            cy: height,
+        },
+        ptOffset: POINT {
+            x: hotspot.0,
+            y: hotspot.1,
+        },
+        hbmpDragImage: bitmap,
+        crColorKey: COLORREF(u32::MAX),
+    };
+    // SAFETY: the data object outlives the call, and the bitmap is handed over with it.
+    if let Err(error) = unsafe { helper.InitializeFromBitmap(&image, object) } {
+        log::warn!("ui-platform-win32: the drag image was refused: {error}");
     }
+}
+
+/// Copy the screen under `bounds` into a 32-bit bitmap, hotspot included.
+///
+/// `bounds` and `origin` are surface units, and `origin` is the press point: the image's
+/// offset is how far inside the element the pointer was, so the picture hangs where the
+/// user grabbed it.
+fn capture(
+    hwnd: HWND,
+    bounds: Rect,
+    origin: Point,
+) -> Option<(windows::Win32::Graphics::Gdi::HBITMAP, i32, i32, (i32, i32))> {
+    let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
+    let width = (bounds.size.w * scale).round() as i32;
+    let height = (bounds.size.h * scale).round() as i32;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let mut at = POINT {
+        x: (bounds.origin.x * scale).round() as i32,
+        y: (bounds.origin.y * scale).round() as i32,
+    };
+    // SAFETY: the window is this thread's and the point outlives the call.
+    if !unsafe { ClientToScreen(hwnd, &mut at) }.as_bool() {
+        return None;
+    }
+    let screen = unsafe { GetDC(None) };
+    if screen.0.is_null() {
+        return None;
+    }
+    let memory = unsafe { CreateCompatibleDC(Some(screen)) };
+    if memory.0.is_null() {
+        unsafe { ReleaseDC(None, screen) };
+        return None;
+    }
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            // Negative height: rows top down, the way the screen reads.
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..BITMAPINFOHEADER::default()
+        },
+        ..BITMAPINFO::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    // SAFETY: the header describes a 32-bit DIB and the out-pointer is writable.
+    let bitmap = match unsafe {
+        CreateDIBSection(Some(memory), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+    } {
+        Ok(bitmap) => bitmap,
+        Err(_) => {
+            unsafe {
+                let _ = DeleteDC(memory);
+                ReleaseDC(None, screen);
+            }
+            return None;
+        }
+    };
+    // SAFETY: both DCs and the bitmap are valid for the call.
+    let previous = unsafe { SelectObject(memory, HGDIOBJ(bitmap.0)) };
+    let copied = unsafe {
+        BitBlt(
+            memory,
+            0,
+            0,
+            width,
+            height,
+            Some(screen),
+            at.x,
+            at.y,
+            SRCCOPY,
+        )
+    }
+    .is_ok();
+    unsafe {
+        SelectObject(memory, previous);
+        let _ = DeleteDC(memory);
+        ReleaseDC(None, screen);
+    }
+    if !copied || bits.is_null() {
+        // SAFETY: the bitmap was created here and never handed to OLE.
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        }
+        return None;
+    }
+    // A `BitBlt` leaves the alpha channel at zero, and OLE reads exactly that channel: the
+    // element would drag as nothing at all.
+    // SAFETY: the section is `width * height` pixels of four bytes, top down.
+    let pixels =
+        unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), (width * height * 4) as usize) };
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[3] = 0xFF;
+    }
+    let hotspot = (
+        (((origin.x - bounds.origin.x) * scale).round() as i32).clamp(0, width),
+        (((origin.y - bounds.origin.y) * scale).round() as i32).clamp(0, height),
+    );
+    Some((bitmap, width, height, hotspot))
 }
 
 /// The Windows formats a payload offers; empty when no MIME type has a Windows form.
@@ -258,6 +408,53 @@ fn medium_bytes(medium: &STGMEDIUM) -> Option<Vec<u8>> {
     lock_bytes(handle)
 }
 
+/// Most a medium read back can hold; a drag description never comes near it.
+const STREAM_LIMIT: usize = 16 << 20;
+
+/// The bytes of a `TYMED_ISTREAM` medium, read from its start.
+fn stream_bytes(medium: &STGMEDIUM) -> Option<Vec<u8>> {
+    if medium.tymed != TYMED_ISTREAM.0 as u32 {
+        return None;
+    }
+    // SAFETY: the union member is the one `tymed` names, and the stream outlives the call.
+    let stream = unsafe { (*medium.u.pstm).as_ref() }?;
+    // SAFETY: the stream belongs to the medium and is only read here.
+    if unsafe { stream.Seek(0, STREAM_SEEK_SET, None) }.is_err() {
+        return None;
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let mut read = 0;
+        // SAFETY: the buffer is writable for `chunk.len()` bytes and `read` is an out-param.
+        let status = unsafe {
+            stream.Read(
+                chunk.as_mut_ptr().cast(),
+                chunk.len() as u32,
+                Some(&mut read),
+            )
+        };
+        if status.is_err() {
+            return None;
+        }
+        if read == 0 {
+            return Some(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..read as usize]);
+        if bytes.len() > STREAM_LIMIT {
+            return None;
+        }
+    }
+}
+
+/// Whether the reader asked for the bytes as a stream rather than as a global block.
+fn bytes_wanted_as_stream(pformatetc: *const FORMATETC) -> bool {
+    // SAFETY: OLE passes a valid pointer for the duration of the call.
+    unsafe { pformatetc.as_ref() }.is_some_and(|etc| {
+        etc.tymed & TYMED_ISTREAM.0 as u32 != 0 && etc.tymed & TYMED_HGLOBAL.0 as u32 == 0
+    })
+}
+
 /// The bytes of an `HGLOBAL`, copied out.
 fn lock_bytes(handle: HGLOBAL) -> Option<Vec<u8>> {
     // SAFETY: the handle was allocated globally and is locked only for the copy.
@@ -277,6 +474,43 @@ fn lock_bytes(handle: HGLOBAL) -> Option<Vec<u8>> {
 #[implement(IDropTarget)]
 struct DropTarget {
     queue: Rc<DragQueue>,
+    /// Paints the source's drag image and drop description over this window.
+    helper: Option<IDropTargetHelper>,
+}
+
+impl DropTarget {
+    /// Hand the same phase to OLE's helper, which owns what the user sees.
+    fn show(&self, phase: Phase<'_>) {
+        let Some(helper) = &self.helper else {
+            return;
+        };
+        let effect = DROPEFFECT(self.queue.effect.get());
+        // SAFETY: the window is this thread's and every pointer lives for the call.
+        let _ = unsafe {
+            match phase {
+                Phase::Enter { data, at } => helper.DragEnter(self.queue.hwnd, data, at, effect),
+                Phase::Over { at } => helper.DragOver(at, effect),
+                Phase::Leave => helper.DragLeave(),
+                Phase::Drop { data, at } => helper.Drop(data, at, effect),
+            }
+        };
+    }
+}
+
+/// One callback of a drag, as the helper understands it.
+enum Phase<'a> {
+    Enter {
+        data: &'a IDataObject,
+        at: &'a POINT,
+    },
+    Over {
+        at: &'a POINT,
+    },
+    Leave,
+    Drop {
+        data: &'a IDataObject,
+        at: &'a POINT,
+    },
 }
 
 impl IDropTarget_Impl for DropTarget_Impl {
@@ -301,6 +535,8 @@ impl IDropTarget_Impl for DropTarget_Impl {
             self.queue.effect.set(DROPEFFECT_COPY.0);
         }
         write_effect(pdweffect, self.queue.effect.get());
+        let at = POINT { x: pt.x, y: pt.y };
+        self.show(Phase::Enter { data, at: &at });
         Ok(())
     }
 
@@ -314,11 +550,14 @@ impl IDropTarget_Impl for DropTarget_Impl {
             self.queue.push(Event::Dnd(DndEvent::Over { pos }));
         }
         write_effect(pdweffect, self.queue.effect.get());
+        let at = POINT { x: pt.x, y: pt.y };
+        self.show(Phase::Over { at: &at });
         Ok(())
     }
 
     fn DragLeave(&self) -> Result<()> {
         self.queue.push(Event::Dnd(DndEvent::Left));
+        self.show(Phase::Leave);
         self.queue.effect.set(0);
         Ok(())
     }
@@ -340,6 +579,8 @@ impl IDropTarget_Impl for DropTarget_Impl {
                 .push(Event::Dnd(DndEvent::Dropped { pos, data: payload }));
         }
         write_effect(pdweffect, effect);
+        let at = POINT { x: pt.x, y: pt.y };
+        self.show(Phase::Drop { data, at: &at });
         self.queue.effect.set(0);
         Ok(())
     }
@@ -355,17 +596,29 @@ fn write_effect(target: *mut DROPEFFECT, bits: u32) {
 }
 
 /// The payload as an `IDataObject`, with every Windows format it can offer.
+///
+/// The list grows: OLE's drag-image helper adds its own formats through `SetData`, and the
+/// picture under the pointer is one of them.
 #[implement(IDataObject)]
 struct DataObject {
-    formats: Vec<(u32, Vec<u8>)>,
+    formats: RefCell<Vec<(u32, Vec<u8>)>>,
 }
 
 impl DataObject {
-    fn bytes(&self, format: u32) -> Option<&[u8]> {
+    fn bytes(&self, format: u32) -> Option<Vec<u8>> {
         self.formats
+            .borrow()
             .iter()
             .find(|(known, _)| *known == format)
-            .map(|(_, bytes)| bytes.as_slice())
+            .map(|(_, bytes)| bytes.clone())
+    }
+
+    fn insert(&self, format: u32, bytes: Vec<u8>) {
+        let mut formats = self.formats.borrow_mut();
+        match formats.iter_mut().find(|(known, _)| *known == format) {
+            Some(slot) => slot.1 = bytes,
+            None => formats.push((format, bytes)),
+        }
     }
 }
 
@@ -378,7 +631,20 @@ impl IDataObject_Impl for DataObject_Impl {
         let bytes = self
             .bytes(format)
             .ok_or_else(|| Error::from_hresult(DV_E_FORMATETC))?;
-        global_medium(bytes)
+        // Anything added through `SetData` came in one medium or the other, and a reader
+        // asks for the one it prefers; the bytes are what it actually wants.
+        if bytes_wanted_as_stream(pformatetcin) {
+            let stream = unsafe { SHCreateMemStream(Some(&bytes)) }
+                .ok_or_else(|| Error::from_hresult(E_OUTOFMEMORY))?;
+            return Ok(STGMEDIUM {
+                tymed: TYMED_ISTREAM.0 as u32,
+                u: STGMEDIUM_0 {
+                    pstm: ManuallyDrop::new(Some(stream)),
+                },
+                pUnkForRelease: ManuallyDrop::new(None),
+            });
+        }
+        global_medium(&bytes)
     }
 
     fn GetDataHere(&self, _pformatetc: *const FORMATETC, _pmedium: *mut STGMEDIUM) -> Result<()> {
@@ -393,8 +659,10 @@ impl IDataObject_Impl for DataObject_Impl {
         let wanted = etc.cfFormat as u32;
         let present = self.bytes(wanted).is_some();
         let content = etc.dwAspect == DVASPECT_CONTENT.0;
-        let global = etc.tymed == 0 || etc.tymed & TYMED_HGLOBAL.0 as u32 != 0;
-        if present && content && global {
+        let carryable = etc.tymed == 0
+            || etc.tymed & TYMED_HGLOBAL.0 as u32 != 0
+            || etc.tymed & TYMED_ISTREAM.0 as u32 != 0;
+        if present && content && carryable {
             S_OK
         } else {
             DV_E_FORMATETC
@@ -411,11 +679,43 @@ impl IDataObject_Impl for DataObject_Impl {
 
     fn SetData(
         &self,
-        _pformatetc: *const FORMATETC,
-        _pmedium: *const STGMEDIUM,
-        _frelease: BOOL,
+        pformatetc: *const FORMATETC,
+        pmedium: *const STGMEDIUM,
+        frelease: BOOL,
     ) -> Result<()> {
-        Err(Error::from_hresult(E_NOTIMPL))
+        // SAFETY: OLE passes both pointers valid for the duration of the call.
+        let format = unsafe { pformatetc.as_ref() }
+            .ok_or_else(|| Error::from_hresult(E_FAIL))?
+            .cfFormat as u32;
+        if pmedium.is_null() {
+            return Err(Error::from_hresult(E_FAIL));
+        }
+        // A medium offered with release is this call's to free, so it is taken by value;
+        // without it, only the bytes are read and the caller keeps ownership.
+        let medium = if frelease.as_bool() {
+            unsafe { std::ptr::read(pmedium) }
+        } else {
+            unsafe { (*pmedium).clone() }
+        };
+        // The helper offers its image as a global block and its context as a stream; both
+        // are bytes here, and what a reader asks for is decided again in `GetData`.
+        let bytes = if medium.tymed == TYMED_HGLOBAL.0 as u32 {
+            medium_bytes(&medium)
+        } else if medium.tymed == TYMED_ISTREAM.0 as u32 {
+            stream_bytes(&medium)
+        } else {
+            None
+        };
+        if frelease.as_bool() {
+            let mut medium = medium;
+            // SAFETY: the medium was moved in above and is released exactly once.
+            unsafe { ReleaseStgMedium(&mut medium) };
+        }
+        let Some(bytes) = bytes else {
+            return Err(Error::from_hresult(E_NOTIMPL));
+        };
+        self.insert(format, bytes);
+        Ok(())
     }
 
     fn EnumFormatEtc(&self, dwdirection: u32) -> Result<IEnumFORMATETC> {
@@ -424,6 +724,7 @@ impl IDataObject_Impl for DataObject_Impl {
         }
         let formats = self
             .formats
+            .borrow()
             .iter()
             .map(|(format, _)| etc(*format))
             .collect();

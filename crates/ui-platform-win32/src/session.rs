@@ -267,15 +267,18 @@ impl<A: App> Session<A> {
         }
         // A drag that asked to leave the app becomes OLE's; one that highlighted a drop
         // publishes the effect the pointer should show from now on.
-        if let Some(data) = self.lp.take_native_drag()
-            && !self.win.begin_drag(data)
-        {
-            // The host refused, so the gesture ends without a drop.
-            self.lp
-                .dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Finished {
-                    dropped: false,
-                }));
-            self.lp.request_frame();
+        if let Some(drag) = self.lp.take_native_drag() {
+            // The drag runs to its end inside this call; the frame after this one is the
+            // first that can show its outcome.
+            let started = self.win.begin_drag(drag);
+            if !started {
+                // The host refused, so the gesture ends without a drop.
+                self.lp
+                    .dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Finished {
+                        dropped: false,
+                    }));
+                self.lp.request_frame();
+            }
         }
         self.win.set_drop_effect(self.lp.drop_effect());
         Ok(Tick {
@@ -353,8 +356,8 @@ impl<A: App> HostSession<A> for Session<A> {
         self.win.request_paste()
     }
 
-    fn begin_drag(&mut self, data: ui_core::DragData) -> bool {
-        self.win.begin_drag(data)
+    fn begin_drag(&mut self, drag: ui_platform::view::NativeDrag) -> bool {
+        self.win.begin_drag(drag)
     }
 
     fn gpu_present(&self) -> bool {
