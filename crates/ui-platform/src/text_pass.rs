@@ -578,7 +578,13 @@ impl TextPass {
                 &mut stack,
             );
         }
-        // Then the platform's own choice for the generic family.
+        // Then the platform's own choice for the generic family, the UI face ahead of the
+        // plain sans: the default style asks for `SystemUi`, and this is the stack it gets.
+        take(
+            self,
+            &FontRequest::new(GenericFamily::SystemUi),
+            &mut stack,
+        );
         take(
             self,
             &FontRequest::new(GenericFamily::SansSerif),

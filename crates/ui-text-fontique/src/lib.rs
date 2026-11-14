@@ -180,7 +180,10 @@ fn admit_faces(
 
 fn generic_of(g: GenericFamily) -> fontique::GenericFamily {
     match g {
-        GenericFamily::SansSerif | GenericFamily::SystemUi => fontique::GenericFamily::SansSerif,
+        // `SystemUi` is the desktop's own face — Segoe UI, the system font, the configured
+        // default — and folding it into the sans slot served Arial to every app on Windows.
+        GenericFamily::SystemUi => fontique::GenericFamily::SystemUi,
+        GenericFamily::SansSerif => fontique::GenericFamily::SansSerif,
         GenericFamily::Serif => fontique::GenericFamily::Serif,
         GenericFamily::Monospace => fontique::GenericFamily::Monospace,
     }

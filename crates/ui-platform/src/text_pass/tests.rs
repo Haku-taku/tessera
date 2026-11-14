@@ -1279,6 +1279,28 @@ mod contracts {
     }
 
     #[test]
+    fn the_default_style_shapes_in_the_platforms_ui_face() {
+        // The default style names `SystemUi`. A base stack built from the generic sans
+        // instead served every app Arial on Windows while the style asked for the UI face.
+        // The system provider: `new` is isolated, and an isolated pass has no stack at all.
+        let mut pass = TextPass::with_stack(&[]);
+        if !pass.has_face() {
+            eprintln!("skipped: no system fonts");
+            return;
+        }
+        let ui = pass
+            .provider
+            .borrow()
+            .resolve(&FontRequest::new(GenericFamily::SystemUi));
+        let stack = pass.stack_for(DEFAULT_FAMILY, ui_core::Weight::REGULAR, false);
+        assert_eq!(
+            ui,
+            stack.first().copied(),
+            "the base stack must begin with the platform's UI face"
+        );
+    }
+
+    #[test]
     fn an_icon_run_does_not_poison_the_latin_stack() {
         // PUA icons read as Script::LATIN, so a face cache keyed by script alone let the
         // icon face answer for later Latin text — the font's ligature component glyphs.
