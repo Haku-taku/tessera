@@ -38,6 +38,7 @@ pub use outputs::HdrOutput;
 pub use presenter::Win32Presenter;
 pub use session::Session;
 pub use theme::Win32ThemeWatcher;
+pub use tsf::serves_input;
 pub use ui_platform::session::{HostSession, SessionOptions, Tick};
 pub use wgc::GraphicsCapture;
 pub use window::Win32Window;

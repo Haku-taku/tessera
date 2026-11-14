@@ -523,6 +523,15 @@ impl Win32Window {
         if !start || self.state.borrow().tsf_failed {
             return None;
         }
+        // TSF would only take the keyboard away here: an out-of-process input method serves
+        // this window through IMM32, which an associated document switches off.
+        if !crate::tsf::serves_input() {
+            log::info!(
+                "tsf: the active input method is out of process, so this window keeps IMM32"
+            );
+            self.state.borrow_mut().tsf_failed = true;
+            return None;
+        }
         match crate::tsf::Session::attach(self.hwnd) {
             Ok(session) => {
                 let session = Rc::new(RefCell::new(session));

@@ -4,9 +4,11 @@
 //! Run: `cargo run -p ui-platform-win32 --example tsf_probe`
 //!
 //! The checks are deterministic: the document's focus, the text TSF reads out of it, and the
-//! character path beside it. Whether the input method this machine ships composes into the
-//! store is reported but does not fail the probe, because which text service a machine has,
-//! and whether that service starts, is not this backend's.
+//! character path beside it. Which kind of input method a machine ships decides whether a
+//! window may use TSF at all — an out-of-process one is driven through IMM32 — so on such a
+//! machine the document checks are reported as skipped rather than failed. Whether the
+//! service this machine ships composes is likewise reported, not judged: which text service
+//! a machine has, and whether that service starts, is not this backend's.
 
 #[cfg(windows)]
 fn main() {
@@ -26,9 +28,6 @@ use windows::core::{Interface, implement};
 
 #[cfg(windows)]
 fn windows_main() -> Result<(), String> {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
     use ui_core::Event;
     use ui_core::geom::Rect;
     use ui_platform::present::ImeState;
@@ -40,9 +39,7 @@ fn windows_main() -> Result<(), String> {
         ActivateKeyboardLayout, GetKeyboardLayout, LoadKeyboardLayoutW, VK_A, VK_H, VK_I, VK_N,
         VK_O, VK_SPACE,
     };
-    use windows::Win32::UI::TextServices::{
-        CLSID_TF_ThreadMgr, ITfEditSession, ITfThreadMgr, TF_ES_READ, TF_ES_SYNC,
-    };
+    use windows::Win32::UI::TextServices::{CLSID_TF_ThreadMgr, ITfThreadMgr};
     use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR, WM_KEYDOWN};
 
     let expect = |pattern: &str, found: bool| {
@@ -68,6 +65,20 @@ fn windows_main() -> Result<(), String> {
     let client = unsafe { manager.Activate() }.map_err(|error| format!("Activate: {error}"))?;
     let previous = unsafe { GetKeyboardLayout(0) };
 
+    // The platform decides whether a window may use TSF at all: an out-of-process input
+    // method is driven through the window's IMM32 emulation, which a TSF document would
+    // switch off. The probe reports which path this machine takes.
+    let served = ui_platform_win32::serves_input();
+    println!(
+        "{:58} {}",
+        "the input method can be served through TSF",
+        if served {
+            "yes"
+        } else {
+            "no (out of process, so the window keeps IMM32)"
+        }
+    );
+
     // A field with a caret five characters into "hello world", as the engine publishes it.
     let field = ImeState {
         enabled: true,
@@ -76,42 +87,10 @@ fn windows_main() -> Result<(), String> {
         ..ImeState::default()
     };
     window.set_ime(field.clone());
-    let focused = unsafe { manager.GetFocus() }.ok();
-    ok &= expect(
-        "an enabled field gives TSF a focused document",
-        focused.is_some(),
-    );
-    let context = focused
-        .as_ref()
-        .and_then(|document| unsafe { document.GetTop() }.ok());
-    ok &= expect(
-        "the focused document carries the field's context",
-        context.is_some(),
-    );
-
-    // Reading the context back is what an input method does before it composes: the text
-    // comes out of the engine through the store, not out of the probe.
-    if let Some(context) = context.clone() {
-        let seen = Rc::new(RefCell::new(None));
-        let session: ITfEditSession = ReadStore {
-            context: context.clone(),
-            seen: seen.clone(),
-        }
-        .into();
-        let requested =
-            unsafe { context.RequestEditSession(client, &session, TF_ES_SYNC | TF_ES_READ) }
-                .map_err(|error| format!("RequestEditSession: {error}"))?;
-        if !requested.is_ok() {
-            println!("the read session did not run synchronously: {requested:?}");
-        }
-        let seen = seen.borrow().clone();
-        ok &= expect(
-            "the document shows the field's surrounding text",
-            seen.as_ref().is_some_and(|(text, start, end)| {
-                text == "hello world" && *start == 5 && *end == 5
-            }),
-        );
-        println!("TSF read: {seen:?}");
+    if served {
+        ok &= store_checks(&manager, client)?;
+    } else {
+        println!("the document checks are skipped: this input method stays on IMM32");
     }
 
     // The character path has to keep working: TSF owns the keyboard, not the text.
@@ -168,16 +147,17 @@ fn windows_main() -> Result<(), String> {
     if let Ok(chinese) = chinese {
         let _ = unsafe { ActivateKeyboardLayout(chinese, Default::default()) };
     }
-    let _ = drain(&mut window, 300);
+    let mut events = drain(&mut window, 300);
     if unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } == hwnd {
         for key in [VK_N, VK_I, VK_H, VK_A, VK_O, VK_SPACE] {
             send_key(key);
-            let _ = drain(&mut window, 120);
+            // An input method answers a key it takes within the millisecond after it.
+            events.extend(drain(&mut window, 120));
         }
     } else {
         println!("the probe's window is not the foreground window; keys not sent");
     }
-    let events = drain(&mut window, 1_500);
+    events.extend(drain(&mut window, 1_500));
     let preedits = events
         .iter()
         .filter(|event| matches!(event, Event::Preedit(Some(_))))
@@ -189,9 +169,11 @@ fn windows_main() -> Result<(), String> {
             _ => None,
         })
         .collect();
+    // An input method in its English mode types the letters through, so a machine where the
+    // keys arrive as text is the input method's state, not a fault of either path.
     println!(
         "{:58} preedits {preedits}, committed {committed:?}",
-        "the input method composes against the store"
+        "what a few typed keys produced"
     );
 
     window.set_ime(ImeState::default());
@@ -206,6 +188,63 @@ fn windows_main() -> Result<(), String> {
     } else {
         Err("some checks failed".to_owned())
     }
+}
+
+/// What an input method reads out of the document a focused field publishes.
+#[cfg(windows)]
+fn store_checks(
+    manager: &windows::Win32::UI::TextServices::ITfThreadMgr,
+    client: u32,
+) -> Result<bool, String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use windows::Win32::UI::TextServices::{ITfEditSession, TF_ES_READ, TF_ES_SYNC};
+
+    let expect = |pattern: &str, found: bool| {
+        println!("{pattern:58} {}", if found { "OK" } else { "FAIL" });
+        found
+    };
+    let mut ok = true;
+
+    let focused = unsafe { manager.GetFocus() }.ok();
+    ok &= expect(
+        "an enabled field gives TSF a focused document",
+        focused.is_some(),
+    );
+    let context = focused
+        .as_ref()
+        .and_then(|document| unsafe { document.GetTop() }.ok());
+    ok &= expect(
+        "the focused document carries the field's context",
+        context.is_some(),
+    );
+
+    // Reading the context back is what an input method does before it composes: the text
+    // comes out of the engine through the store, not out of the probe.
+    if let Some(context) = context {
+        let seen = Rc::new(RefCell::new(None));
+        let session: ITfEditSession = ReadStore {
+            context: context.clone(),
+            seen: seen.clone(),
+        }
+        .into();
+        let requested =
+            unsafe { context.RequestEditSession(client, &session, TF_ES_SYNC | TF_ES_READ) }
+                .map_err(|error| format!("RequestEditSession: {error}"))?;
+        if !requested.is_ok() {
+            println!("the read session did not run synchronously: {requested:?}");
+        }
+        let seen = seen.borrow().clone();
+        ok &= expect(
+            "the document shows the field's surrounding text",
+            seen.as_ref().is_some_and(|(text, start, end)| {
+                text == "hello world" && *start == 5 && *end == 5
+            }),
+        );
+        println!("TSF read: {seen:?}");
+    }
+    Ok(ok)
 }
 
 /// A read of the focused document, run under the store's lock as an input method would.

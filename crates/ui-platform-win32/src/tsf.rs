@@ -27,11 +27,13 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
 };
 use windows::Win32::UI::TextServices::{
-    CLSID_TF_ThreadMgr, ITextStoreACP, ITextStoreACP_Impl, ITextStoreACPSink, ITfCompositionView,
-    ITfContext, ITfContextOwnerCompositionSink, ITfContextOwnerCompositionSink_Impl,
-    ITfDocumentMgr, ITfKeystrokeMgr, ITfRange, ITfRangeACP, ITfThreadMgr, TEXT_STORE_LOCK_FLAGS,
-    TF_IAS_QUERYONLY, TS_AE_END, TS_AE_START, TS_E_NOLAYOUT, TS_E_NOLOCK, TS_E_SYNCHRONOUS,
-    TS_LC_CHANGE, TS_LC_CREATE, TS_LF_SYNC, TS_RT_PLAIN, TS_RUNINFO, TS_S_ASYNC, TS_SELECTION_ACP,
+    CLSID_TF_InputProcessorProfiles, CLSID_TF_ThreadMgr, GUID_TFCAT_TIP_KEYBOARD, ITextStoreACP,
+    ITextStoreACP_Impl, ITextStoreACPSink, ITfCompositionView, ITfContext,
+    ITfContextOwnerCompositionSink, ITfContextOwnerCompositionSink_Impl, ITfDocumentMgr,
+    ITfInputProcessorProfileMgr, ITfKeystrokeMgr, ITfRange, ITfRangeACP, ITfThreadMgr,
+    TEXT_STORE_LOCK_FLAGS, TF_INPUTPROCESSORPROFILE, TF_IPP_FLAG_ACTIVE, TF_IAS_QUERYONLY,
+    TS_AE_END, TS_AE_START, TS_E_NOLAYOUT, TS_E_NOLOCK, TS_E_SYNCHRONOUS, TS_LC_CHANGE,
+    TS_LC_CREATE, TS_LF_SYNC, TS_RT_PLAIN, TS_RUNINFO, TS_S_ASYNC, TS_SELECTION_ACP,
     TS_SELECTIONSTYLE, TS_STATUS, TS_TEXTCHANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -794,6 +796,56 @@ pub(crate) struct Session {
     attached: bool,
     /// The next `WM_CHAR` belongs to a key the IME took and must not reach the engine.
     swallow_char: Cell<bool>,
+}
+
+/// Whether this thread's active input method is a service TSF can drive.
+///
+/// TSF asks a text service about a key synchronously, which only a service loaded into this
+/// process can answer. The platform's out-of-process input methods — the Windows 11 IMEs,
+/// `ChsIME.exe` and its kin — are instead driven through the window's IMM32 emulation, and
+/// `ITfThreadMgr::AssociateFocus` switches that emulation off: a window associated with one
+/// of them took no key, composed nothing, and could not even be switched. Which kind a
+/// profile is is what the registry says it registers, `InprocServer32` or `LocalServer32`.
+pub fn serves_input() -> bool {
+    use windows::Win32::System::Registry::{
+        HKEY_CLASSES_ROOT, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW,
+    };
+
+    // The profile manager is a COM object. A thread some other part of the process already
+    // put in an apartment can still create it, so a failed call here means no TSF at all.
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let profiles: ITfInputProcessorProfileMgr = match unsafe {
+        CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
+    } {
+        Ok(profiles) => profiles,
+        Err(_) => return false,
+    };
+    let mut active = TF_INPUTPROCESSORPROFILE::default();
+    if unsafe { profiles.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut active) }.is_err() {
+        return false;
+    }
+    if active.dwFlags & TF_IPP_FLAG_ACTIVE == 0 {
+        // No service holds the keyboard, so there is nothing TSF could carry.
+        return false;
+    }
+
+    let path = crate::window::wide(&format!("CLSID\\{{{:?}}}\\InprocServer32", active.clsid));
+    let mut key = windows::Win32::System::Registry::HKEY::default();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CLASSES_ROOT,
+            PCWSTR::from_raw(path.as_ptr()),
+            None,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if opened.0 != 0 {
+        return false;
+    }
+    // The key was only opened to exist; a close that fails leaves nothing this call owns.
+    let _ = unsafe { RegCloseKey(key) };
+    true
 }
 
 impl Session {
