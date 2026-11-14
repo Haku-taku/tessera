@@ -83,6 +83,7 @@ impl<A: App> Session<A> {
             win.client_size(),
             win.alpha(),
             opts.uncapped,
+            win.refresh_hz(),
             Arc::clone(&pace),
         )
         .map_err(|error| format!("the D3D11 renderer could not start: {error}"))?;
@@ -280,7 +281,7 @@ impl<A: App> Session<A> {
             // Resolution, a monitor or its HDR state changed: the chain's format and colour
             // space were decided from the old output, so the render thread opens a new one.
             self.render
-                .rebuild(String::from("the display changed"));
+                .rebuild(String::from("the display changed"), self.win.refresh_hz());
         }
         if self.render.take_atlas_request() {
             self.atlases.forget();

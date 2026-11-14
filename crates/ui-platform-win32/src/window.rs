@@ -59,7 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
     WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_WINDOWPOSCHANGED,
     WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_TIMER,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
@@ -98,6 +98,9 @@ struct WindowState {
     silent_change: bool,
     /// The display mode or topology changed: what the output presents has to be re-read.
     display_changed: bool,
+    /// The output this window is on, so a move to another one is noticed: that output's
+    /// refresh rate paces the surface, and its chain carries that output's colour space.
+    monitor: isize,
     /// Physical pixels per logical unit, in whole DPI.
     dpi: u32,
     /// The smallest client area the spec allows, in logical units.
@@ -194,6 +197,8 @@ impl Win32Window {
             dpi: opening.dpi,
             keyboard: opening.keyboard,
             min_size: spec.min_size,
+            // Recorded on the first `WM_WINDOWPOSCHANGED`; there is no window yet here.
+            monitor: 0,
             ..WindowState::default()
         }));
         // The procedure needs the state from `WM_NCCREATE` on, before `CreateWindowExW`
@@ -1006,6 +1011,22 @@ unsafe fn handle(
         }
         WM_SIZE => {
             state.borrow_mut().silent_change = true;
+            None
+        }
+        WM_WINDOWPOSCHANGED => {
+            // A window moved to another output presents on that output now: its refresh
+            // rate is the new pacing, and its chain was opened for the old output's colour
+            // space. `None` keeps the default handling, which is what places the window.
+            let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+            let mut window = state.borrow_mut();
+            if window.monitor == 0 {
+                // The first placement: nothing was read from an output yet.
+                window.monitor = monitor.0 as isize;
+            } else if window.monitor != monitor.0 as isize {
+                window.monitor = monitor.0 as isize;
+                window.display_changed = true;
+                window.silent_change = true;
+            }
             None
         }
         WM_DISPLAYCHANGE => {

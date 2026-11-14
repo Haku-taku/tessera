@@ -28,13 +28,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use ui_core::Damage;
 use ui_core::draw::DrawList;
 use ui_platform::present::{CanvasFrame, PresentStats};
 use windows::Win32::Foundation::{HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, SetEvent,
+    SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use crate::frame_pace::FramePace;
@@ -44,8 +46,13 @@ use crate::presenter::{Alpha, AtlasUpdate, Win32Presenter};
 const IDLE: u32 = u32::MAX;
 /// A chain that has no latency event is presented on this tick instead of a blank.
 const RETRY_MS: u32 = 4;
+const RETRY: Duration = Duration::from_millis(RETRY_MS as u64);
 /// `WaitForMultipleObjects` takes 64 handles; the wake event is one of them.
 const MAX_EVENTS: usize = 60;
+/// The period a surface paces at when its output reports no rate: a display nobody has
+/// asked about still shows sixty frames a second, and a chain that never blanks would
+/// otherwise let its loop run at a thousand.
+const DEFAULT_PERIOD: Duration = Duration::from_micros(16_667);
 
 /// One frame as the loop hands it over: everything the GPU needs, owned by the packet.
 pub(crate) struct FramePacket {
@@ -104,6 +111,7 @@ enum Command {
         size: (u32, u32),
         alpha: Alpha,
         uncapped: bool,
+        refresh_hz: Option<f32>,
         pace: Arc<FramePace>,
         shared: Arc<Shared>,
         reply: Sender<Result<usize, String>>,
@@ -120,6 +128,7 @@ enum Command {
     Rebuild {
         index: usize,
         reason: String,
+        refresh_hz: Option<f32>,
     },
     Dump {
         index: usize,
@@ -188,6 +197,7 @@ impl RenderThread {
         size: (u32, u32),
         alpha: Alpha,
         uncapped: bool,
+        refresh_hz: Option<f32>,
         pace: Arc<FramePace>,
     ) -> Result<Self, String> {
         let shared = Arc::new(Shared::new());
@@ -198,6 +208,7 @@ impl RenderThread {
             size,
             alpha,
             uncapped,
+            refresh_hz,
             pace,
             shared: Arc::clone(&shared),
             reply,
@@ -239,10 +250,11 @@ impl RenderThread {
     }
 
     /// Have the thread open a fresh chain, such as after the display changed.
-    pub(crate) fn rebuild(&self, reason: String) {
+    pub(crate) fn rebuild(&self, reason: String, refresh_hz: Option<f32>) {
         service().send(Command::Rebuild {
             index: self.index,
             reason,
+            refresh_hz,
         });
     }
 
@@ -328,21 +340,83 @@ struct Entry {
     size: (u32, u32),
     alpha: Alpha,
     uncapped: bool,
+    /// The output's refresh period: one frame may hold the display for this long, and a
+    /// chain that never blanks must not be presented faster than it.
+    period: Duration,
+    /// When the chain last took a frame; `None` until the first.
+    last: Option<Instant>,
     supersample: u32,
 }
 
+/// How long until this surface may present, or zero when it may now.
+fn wait_left(entry: &Entry, now: Instant) -> Duration {
+    if entry.uncapped {
+        return Duration::ZERO;
+    }
+    match entry.last {
+        // The first frame is not held back by a blank that never happened.
+        None => Duration::ZERO,
+        Some(last) => (last + entry.period).saturating_duration_since(now),
+    }
+}
+
+/// The display period a reported refresh rate implies.
+///
+/// A rate the mode could not report is not a display that can show anything: sixty hertz
+/// is the floor every monitor meets, and presenting faster only redraws what nobody sees.
+fn period(refresh_hz: Option<f32>) -> Duration {
+    match refresh_hz {
+        Some(hz) if hz >= 1.0 => Duration::from_secs_f64(1.0 / f64::from(hz)),
+        _ => DEFAULT_PERIOD,
+    }
+}
+
+/// Arm `timer` to fire once, `wait` from now.
+fn schedule(timer: HANDLE, wait: Duration) {
+    // A due time is counted in 100 ns ticks from now, and relative times are negative.
+    let due = -((wait.as_nanos() / 100).max(1) as i64);
+    // SAFETY: the timer is this thread's, and no completion routine or argument is passed.
+    let _ = unsafe { SetWaitableTimer(timer, &due, 0, None, None, false) };
+}
+
+/// A wait in whole milliseconds, never zero.
+///
+/// The wait takes milliseconds; waking early would only spin on a deadline that has not
+/// come, and `IDLE` is the wait that never times out.
+fn milliseconds(wait: Duration) -> u32 {
+    let ms = wait.as_micros().div_ceil(1_000);
+    ms.clamp(1, u128::from(IDLE) - 1) as u32
+}
+
 fn run(service: Arc<Service>) {
+    // The wait API's own timeout is measured in the system's clock tick, which is 15.6 ms
+    // unless something raises it: a 275 Hz surface paced by that would run at 64 frames a
+    // second. A high-resolution waitable timer is a deadline the wait can honour, and it
+    // sits beside every chain's event, so one surface's blank still blocks nothing else.
+    // SAFETY: no attributes, no name, no completion routine.
+    let timer = unsafe {
+        CreateWaitableTimerExW(
+            None,
+            None,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_ALL_ACCESS.0,
+        )
+    }
+    .ok();
     let mut entries: Vec<Option<Entry>> = Vec::new();
     loop {
         for command in service.drain() {
             apply(command, &mut entries);
         }
 
-        // Take every frame a chain is ready for, without waiting on any of them.
+        // Take every frame a chain is ready for and its output can show, without waiting
+        // on any of them.
+        let now = Instant::now();
         let mut due: Vec<usize> = Vec::new();
         let mut events: Vec<HANDLE> = Vec::new();
         let mut waiting: Vec<usize> = Vec::new();
         let mut untimed = false;
+        let mut timeout: Option<Duration> = None;
         for (index, entry) in entries.iter().enumerate() {
             let Some(entry) = entry else {
                 continue;
@@ -354,21 +428,32 @@ fn run(service: Arc<Service>) {
                 due.push(index);
                 continue;
             }
+            let left = wait_left(entry, now);
             match entry.presenter.as_ref().and_then(Win32Presenter::latency_event) {
                 Some(event) if events.len() < MAX_EVENTS => {
-                    events.push(event);
-                    waiting.push(index);
+                    if left.is_zero() {
+                        events.push(event);
+                        waiting.push(index);
+                    } else {
+                        // The chain would take a frame; the output cannot show one yet.
+                        // The deadline is what wakes the thread for this surface.
+                        timeout = Some(timeout.map_or(left, |wait| wait.min(left)));
+                    }
                 }
                 // A chain the driver gave no event, or more chains than the wait takes: it
                 // is presented on the retry tick instead of at its blank.
-                _ => untimed = true,
+                _ => {
+                    untimed = true;
+                    let step = if left.is_zero() { RETRY } else { left };
+                    timeout = Some(timeout.map_or(step, |wait| wait.min(step)));
+                }
             }
         }
         for index in due {
             submit(index, &mut entries);
         }
 
-        if events.is_empty() && !untimed {
+        if events.is_empty() && timeout.is_none() {
             // No frame anywhere: sleep until a loop hands one over.
             // SAFETY: the handle is the service's own wake event.
             unsafe {
@@ -376,34 +461,56 @@ fn run(service: Arc<Service>) {
             }
             continue;
         }
-        let mut handles: Vec<HANDLE> = Vec::with_capacity(events.len() + 1);
+        let mut handles: Vec<HANDLE> = Vec::with_capacity(events.len() + 2);
         handles.push(service.wake);
+        // The earliest deadline is a handle of its own when there is a timer for it; the
+        // wait's own timeout only steps in when that timer could not be had.
+        let deadline = match (timer, timeout) {
+            (Some(timer), Some(wait)) => {
+                schedule(timer, wait);
+                handles.push(timer);
+                Some(handles.len() - 1)
+            }
+            _ => None,
+        };
+        let events_base = handles.len();
         handles.extend_from_slice(&events);
-        let timeout = if untimed { RETRY_MS } else { IDLE };
+        let timeout = match (deadline, timeout) {
+            (Some(_), _) => IDLE,
+            (None, Some(wait)) => milliseconds(wait),
+            (None, None) => IDLE,
+        };
         // SAFETY: every handle is a live event owned by the service or by a chain.
         let ready = unsafe { WaitForMultipleObjects(&handles, false, timeout) };
-        if ready == WAIT_TIMEOUT {
+        let slot = ready.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+        if Some(slot) == deadline || ready == WAIT_TIMEOUT {
             if untimed {
+                // A surface the wait could not cover has no event to wake it: its deadline
+                // is the tick, and it is presented now if the deadline has come.
+                let now = Instant::now();
                 for index in 0..entries.len() {
                     let Some(entry) = &entries[index] else {
                         continue;
                     };
-                    let Some(presenter) = &entry.presenter else {
+                    if entry.pending.is_none() || !wait_left(entry, now).is_zero() {
                         continue;
-                    };
-                    if entry.pending.is_some() && presenter.latency_event().is_none() {
+                    }
+                    let timed = entry
+                        .presenter
+                        .as_ref()
+                        .is_some_and(|presenter| presenter.latency_event().is_some());
+                    if !timed {
                         submit(index, &mut entries);
                     }
                 }
             }
             continue;
         }
-        if ready == WAIT_OBJECT_0 {
+        if slot == 0 {
             // A command arrived; the next pass serves it.
             continue;
         }
-        let slot = ready.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
-        if let Some(&index) = waiting.get(slot.wrapping_sub(1)) {
+        if let Some(&index) = waiting.get(slot.wrapping_sub(events_base)) {
             submit(index, &mut entries);
         }
     }
@@ -416,6 +523,7 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
             size,
             alpha,
             uncapped,
+            refresh_hz,
             pace,
             shared,
             reply,
@@ -432,6 +540,8 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
                         size,
                         alpha,
                         uncapped,
+                        period: period(refresh_hz),
+                        last: None,
                         supersample: 1,
                     };
                     let index = match entries.iter().position(Option::is_none) {
@@ -469,8 +579,13 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
                 }
             }
         }
-        Command::Rebuild { index, reason } => {
+        Command::Rebuild {
+            index,
+            reason,
+            refresh_hz,
+        } => {
             if let Some(Some(entry)) = entries.get_mut(index) {
+                entry.period = period(refresh_hz);
                 if let Err(error) = rebuild(entry, &reason) {
                     entry.shared.store(error);
                     entry.shared.stopped.store(true, Ordering::Release);
@@ -558,6 +673,14 @@ fn submit(index: usize, entries: &mut [Option<Entry>]) {
     }
     // Whether it drew or failed, the loop must not wait on a frame nobody takes.
     entry.pace.finished();
+    // The blank this frame occupied, whichever way it went: the next one waits it out.
+    // The phase advances by whole periods rather than from this instant, so time spent
+    // drawing one frame does not push every frame after it back by as much.
+    let now = Instant::now();
+    entry.last = Some(match entry.last {
+        Some(last) if last + entry.period > now => last + entry.period,
+        _ => now,
+    });
 }
 
 /// Replace a surface's chain, and owe the next frame both atlases.
