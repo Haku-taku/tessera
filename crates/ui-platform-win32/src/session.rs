@@ -184,8 +184,8 @@ impl<A: App> Session<A> {
             return Ok(Tick::default());
         }
         self.check_render()?;
-        if self.win.take_move_request() {
-            self.run_native_move();
+        if let Some(press) = self.win.take_move_request() {
+            self.run_native_move(press);
         }
         let pointer = match self.driver.decide(&mut self.lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
@@ -221,8 +221,8 @@ impl<A: App> Session<A> {
         }
         self.check_render()?;
         let turn = self.driver.step(&mut self.lp, &mut self.win);
-        if self.win.take_move_request() {
-            self.run_native_move();
+        if let Some(press) = self.win.take_move_request() {
+            self.run_native_move(press);
         }
         let pointer = match turn {
             Turn::Draw { pointer } => pointer,
@@ -372,14 +372,14 @@ impl<A: App> Session<A> {
         }
     }
 
-    /// Start the system's title-bar move, and keep building frames inside its modal loop.
+    /// Replay the title-bar press so the system moves the window, with frames inside it.
     ///
-    /// `SendMessage(WM_SYSCOMMAND, SC_MOVE)` does not return until the window is dropped,
-    /// exactly like `DoDragDrop`, so the same timer pump keeps an animation alive while the
-    /// shell moves the window. There is no queue to serve here — the shell owns the pointer
-    /// — and a still surface has nothing to rebuild, so the pump only runs while the app is
-    /// animating.
-    fn run_native_move(&mut self) {
+    /// The replayed press does not return until the window is dropped, exactly like
+    /// `DoDragDrop`, so the same timer pump keeps an animation alive while the shell
+    /// activates, raises and moves the window. There is no queue to serve here — the shell
+    /// owns the pointer — and a still surface has nothing to rebuild, so the pump only runs
+    /// while the app is animating.
+    fn run_native_move(&mut self, press: isize) {
         let hwnd = self.win.hwnd();
         let Session {
             lp,
@@ -413,12 +413,10 @@ impl<A: App> Session<A> {
             win.set_drop_effect(lp.drop_effect());
         };
         let timer = crate::modal::arm(hwnd, &mut pump);
-        let moved = crate::window::start_system_move(hwnd);
+        crate::window::start_system_move(win, press);
         crate::modal::disarm(hwnd, timer);
-        if moved {
-            // The window may have crossed a display, which changes its scale or extent.
-            lp.request_frame();
-        }
+        // The window may have crossed a display, which changes its scale or extent.
+        lp.request_frame();
     }
 }
 

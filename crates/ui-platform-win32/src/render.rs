@@ -421,7 +421,7 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
             reply,
         } => {
             let hwnd = HWND(hwnd as *mut core::ffi::c_void);
-            match Win32Presenter::open_raw(hwnd, size, alpha, uncapped) {
+            match Win32Presenter::open_raw(hwnd, size, alpha) {
                 Ok(presenter) => {
                     let entry = Entry {
                         presenter: Some(presenter),
@@ -582,8 +582,8 @@ fn reopen(
     alpha: Alpha,
     supersample: u32,
 ) -> Result<Win32Presenter, String> {
-    let mut presenter = Win32Presenter::open_raw(hwnd, size, alpha, false)
-        .map_err(|error| error.to_string())?;
+    let mut presenter =
+        Win32Presenter::open_raw(hwnd, size, alpha).map_err(|error| error.to_string())?;
     presenter.renderer_mut().set_supersample(supersample);
     Ok(presenter)
 }

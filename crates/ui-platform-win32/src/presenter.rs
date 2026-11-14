@@ -50,8 +50,6 @@ pub struct Win32Presenter {
     /// The flags the chain was opened with: `ResizeBuffers` must repeat them exactly, and
     /// the waitable one cannot be added later.
     chain_flags: u32,
-    /// The app asked not to be paced by the display: present without waiting for a blank.
-    uncapped: bool,
     format: DXGI_FORMAT,
     /// The output the chain declares HDR for, with how that light is encoded; `None` on an
     /// 8-bit SDR surface.
@@ -89,19 +87,18 @@ impl Win32Presenter {
                 "the window has no client area to present into",
             )));
         }
-        Self::open_raw(window.visual_hwnd(), size, window.alpha(), false)
+        Self::open_raw(window.visual_hwnd(), size, window.alpha())
     }
 
     /// Build the device and open a swap chain on a raw window handle.
     ///
-    /// Nothing here touches the window, so this is what runs on a render thread; the
-    /// window must outlive the presenter. `uncapped` presents without waiting for a blank,
-    /// which is the app's own choice to run the display as fast as it will take frames.
+    /// Nothing here touches the window, so this is what runs on the GPU thread; the
+    /// window must outlive the presenter. The caller decides how the frame is paced, so
+    /// this type holds no pacing policy of its own.
     pub(crate) fn open_raw(
         hwnd: HWND,
         size: (u32, u32),
         alpha: Alpha,
-        uncapped: bool,
     ) -> Result<Self, WindowError> {
         if size.0 == 0 || size.1 == 0 {
             return Err(WindowError::Win32(String::from(
@@ -139,7 +136,6 @@ impl Win32Presenter {
             renderer,
             chain: opened.chain,
             chain_flags,
-            uncapped,
             format: opened.format,
             hdr: opened.hdr,
             _composition: opened.composition,
@@ -332,9 +328,8 @@ impl SceneTarget for Win32Presenter {
         canvases: &[CanvasFrame],
     ) -> Result<PresentStats, String> {
         self.sync_atlas(text).map_err(|error| error.to_string())?;
-        // A presenter driven in place of a loop owns its own window: the blank is paid here.
-        let interval = if self.uncapped { 0 } else { 1 };
-        self.present_uploads(scene, damage, canvases, None, None, interval)
+        // A caller that drives this itself pays the blank here; the GPU thread passes its own.
+        self.present_uploads(scene, damage, canvases, None, None, 1)
     }
 }
 
