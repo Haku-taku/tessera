@@ -15,8 +15,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey,
-    VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT,
-    VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP,
+    VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, HWND_MESSAGE, RegisterClassExW, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -184,8 +184,11 @@ fn virtual_key(key: &Key) -> Option<u32> {
         Key::Tab => VK_TAB.0,
         Key::Backspace => VK_BACK.0,
         Key::Delete => VK_DELETE.0,
+        Key::Insert => VK_INSERT.0,
         Key::Home => VK_HOME.0,
         Key::End => VK_END.0,
+        Key::PageUp => VK_PRIOR.0,
+        Key::PageDown => VK_NEXT.0,
         Key::Left => VK_LEFT.0,
         Key::Right => VK_RIGHT.0,
         Key::Up => VK_UP.0,

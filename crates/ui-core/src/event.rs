@@ -21,8 +21,14 @@ pub enum Key {
     Backspace,
     /// Forward delete: removes the character after the caret.
     Delete,
+    /// Insert: overtype in an editor that has it, and a free key for an app's own command.
+    Insert,
     Home,
     End,
+    /// Page Up: a screenful towards the start of a list or document.
+    PageUp,
+    /// Page Down: a screenful towards the end.
+    PageDown,
     Left,
     Right,
     Up,

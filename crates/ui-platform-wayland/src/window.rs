@@ -970,10 +970,13 @@ fn named_key(evdev: u32) -> Option<ui_core::Key> {
         57 => ui_core::Key::Space,
         102 => ui_core::Key::Home,
         103 => ui_core::Key::Up,
+        104 => ui_core::Key::PageUp,
         105 => ui_core::Key::Left,
         106 => ui_core::Key::Right,
         107 => ui_core::Key::End,
         108 => ui_core::Key::Down,
+        109 => ui_core::Key::PageDown,
+        110 => ui_core::Key::Insert,
         111 => ui_core::Key::Delete,
         _ => return None,
     })

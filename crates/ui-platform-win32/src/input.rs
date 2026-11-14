@@ -6,8 +6,8 @@
 use ui_core::{Key, Modifiers};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, MAPVK_VK_TO_CHAR, MapVirtualKeyW, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
-    VK_END, VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RIGHT,
-    VK_RWIN, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP,
+    VK_END, VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP,
 };
 
 /// Logical pixels one wheel notch scrolls: three lines, the platform's own default.
@@ -40,8 +40,12 @@ pub(crate) fn named(vk: u16) -> Option<Key> {
         vk if vk == VK_TAB.0 => Key::Tab,
         vk if vk == VK_BACK.0 => Key::Backspace,
         vk if vk == VK_DELETE.0 => Key::Delete,
+        // With Num Lock off the keypad's 0, 9 and 3 report as these three.
+        vk if vk == VK_INSERT.0 => Key::Insert,
         vk if vk == VK_HOME.0 => Key::Home,
         vk if vk == VK_END.0 => Key::End,
+        vk if vk == VK_PRIOR.0 => Key::PageUp,
+        vk if vk == VK_NEXT.0 => Key::PageDown,
         vk if vk == VK_LEFT.0 => Key::Left,
         vk if vk == VK_RIGHT.0 => Key::Right,
         vk if vk == VK_UP.0 => Key::Up,
