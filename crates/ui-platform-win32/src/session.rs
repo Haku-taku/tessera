@@ -81,7 +81,7 @@ impl<A: App> Session<A> {
         let render = RenderThread::open(
             win.visual_hwnd(),
             win.client_size(),
-            win.composited(),
+            win.alpha(),
             opts.uncapped,
             Arc::clone(&pace),
         )
@@ -345,6 +345,12 @@ impl<A: App> Session<A> {
             if size.0 == 0 || size.1 == 0 {
                 return;
             }
+            // A frame still in flight means the gate is shut, and the hand-over would block
+            // until the render thread takes it. This pump runs inside `DoDragDrop`, so a
+            // block here stops the gesture itself — the pointer stops moving the drag.
+            if !win.can_draw() {
+                return;
+            }
             let pointer = win.pointer();
             // A failed frame during a drag is not worth ending the surface for: the next
             // turn reports it the ordinary way.
@@ -390,6 +396,12 @@ impl<A: App> Session<A> {
             }
             let size = win.client_size();
             if size.0 == 0 || size.1 == 0 {
+                return;
+            }
+            // The move loop is modal the same way a drag is: blocking on the frame channel
+            // here would freeze the window under the pointer until the render thread
+            // took the frame.
+            if !win.can_draw() {
                 return;
             }
             let pointer = win.pointer();

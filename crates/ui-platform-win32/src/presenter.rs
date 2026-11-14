@@ -10,13 +10,13 @@ use ui_gpu_d3d11::D3d11Device;
 use ui_gpu_scene::{AtlasUpload, CanvasUpload, Device, GpuRenderer, RenderTarget, TargetId};
 use ui_platform::present::{CanvasFrame, PresentStats, SceneTarget};
 use ui_platform::text_pass::TextPass;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_ALPHA_MODE_UNSPECIFIED,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED,
     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
@@ -57,7 +57,10 @@ pub struct Win32Presenter {
     /// 8-bit SDR surface.
     hdr: Option<(HdrOutput, LinearEncoding)>,
     /// Held for the life of the surface: composed frames stop showing when it drops.
-    _composition: Option<Composition>,
+    _composition: Composition,
+    /// The chain's frame-latency event, when the driver gave it one: the handle turns
+    /// "this chain can take a frame now" into something a thread can wait on.
+    latency: Option<HANDLE>,
     /// The back buffer as a target; released before the chain resizes.
     buffer: TargetId,
     /// The persistent target the painter draws into.
@@ -86,7 +89,7 @@ impl Win32Presenter {
                 "the window has no client area to present into",
             )));
         }
-        Self::open_raw(window.visual_hwnd(), size, window.composited(), false)
+        Self::open_raw(window.visual_hwnd(), size, window.alpha(), false)
     }
 
     /// Build the device and open a swap chain on a raw window handle.
@@ -97,7 +100,7 @@ impl Win32Presenter {
     pub(crate) fn open_raw(
         hwnd: HWND,
         size: (u32, u32),
-        composited: bool,
+        alpha: Alpha,
         uncapped: bool,
     ) -> Result<Self, WindowError> {
         if size.0 == 0 || size.1 == 0 {
@@ -109,12 +112,18 @@ impl Win32Presenter {
             .map_err(|error| WindowError::Gpu(format!("D3D11 device: {error}")))?;
         let mut renderer = GpuRenderer::new(&mut device)
             .map_err(|error| WindowError::Gpu(format!("renderer: {error}")))?;
-        let opened = open_chain(device.raw_device(), hwnd, size, composited)?;
+        let opened = open_chain(device.raw_device(), hwnd, size, alpha)?;
         // One frame in flight: a present waits at the next blank, and a second queued frame
-        // would only add a display of latency to every frame after it.
+        // would only add a display of latency to every frame after it. The same event is what
+        // lets one thread present several chains without blocking on any single one.
+        let mut latency = None;
         if let (true, Ok(chain2)) = (opened.waitable, opened.chain.cast::<IDXGISwapChain2>()) {
             // A latency the chain refuses is not fatal: it only leaves the default in place.
             let _ = unsafe { chain2.SetMaximumFrameLatency(1) };
+            let handle = unsafe { chain2.GetFrameLatencyWaitableObject() };
+            if !handle.is_invalid() {
+                latency = Some(handle);
+            }
         }
         // Before the frame target exists: its format follows the destination.
         if let Some((output, encoding)) = opened.hdr {
@@ -134,6 +143,7 @@ impl Win32Presenter {
             format: opened.format,
             hdr: opened.hdr,
             _composition: opened.composition,
+            latency,
             buffer: TargetId(0),
             frame: TargetId(0),
             size,
@@ -192,6 +202,15 @@ impl Win32Presenter {
     /// The scene renderer, for knobs only the scene knows about such as supersampling.
     pub fn renderer_mut(&mut self) -> &mut GpuRenderer {
         &mut self.renderer
+    }
+
+    /// The event that says the chain can take another frame, when the driver gave one.
+    ///
+    /// A presenter that waits on this and then presents with no interval never blocks in
+    /// `Present`, so one thread can keep several windows' chains going without holding any
+    /// of them behind another's blank.
+    pub(crate) fn latency_event(&self) -> Option<HANDLE> {
+        self.latency
     }
 
     /// Why the device behind this surface went away, `None` while it still draws.
@@ -313,7 +332,9 @@ impl SceneTarget for Win32Presenter {
         canvases: &[CanvasFrame],
     ) -> Result<PresentStats, String> {
         self.sync_atlas(text).map_err(|error| error.to_string())?;
-        self.present_uploads(scene, damage, canvases, None, None)
+        // A presenter driven in place of a loop owns its own window: the blank is paid here.
+        let interval = if self.uncapped { 0 } else { 1 };
+        self.present_uploads(scene, damage, canvases, None, None, interval)
     }
 }
 
@@ -341,6 +362,7 @@ impl Win32Presenter {
         canvases: &[CanvasFrame],
         atlas: Option<AtlasUpdate>,
         color_atlas: Option<AtlasUpdate>,
+        interval: u32,
     ) -> Result<PresentStats, String> {
         if let Some(atlas) = atlas {
             self.atlas_version = atlas.version;
@@ -400,11 +422,9 @@ impl Win32Presenter {
             self.capture = false;
             self.captured = Some(self.device.read_pixels(self.buffer, self.size.0, self.size.1));
         }
-        // The frame goes at the compositor's next blank. On a render thread that block is
-        // the thread's own business: the loop keeps building while this one waits, which is
-        // what makes the surface answer input during a resize instead of after it. An
-        // uncapped app asked for no such wait and presents as soon as the frame is ready.
-        let interval = if self.uncapped { 0 } else { 1 };
+        // The interval is the caller's: a chain waited on its latency event takes the frame
+        // with no interval and does not block, which is what lets one thread present several
+        // windows; a caller that drives its own window passes 1 and pays the blank here.
         unsafe { self.chain.Present(interval, DXGI_PRESENT(0)) }
             .ok()
             .map_err(|error| format!("Present: {error}"))?;
@@ -437,21 +457,32 @@ impl RenderTarget for Frame {
     }
 }
 
-/// A window's chain, and the compositor when the surface's alpha is meant to be seen.
+/// Whether the desktop may show through a surface's frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alpha {
+    /// The frame fills the window; whatever alpha it leaves is ignored.
+    Opaque,
+    /// Premultiplied: the frame's own alpha shows the desktop through the window.
+    Premultiplied,
+}
+
+/// A window's chain, and the visual the compositor shows it through.
 struct Chain {
     chain: IDXGISwapChain1,
     format: DXGI_FORMAT,
     hdr: Option<(HdrOutput, LinearEncoding)>,
-    composition: Option<Composition>,
+    composition: Composition,
     /// Whether the chain was opened with a frame-latency waitable object.
     waitable: bool,
 }
 
-/// The DirectComposition stack a transparent surface presents through.
+/// The DirectComposition stack a surface presents through.
 ///
-/// An HWND swap chain is shown opaque: whatever the frame leaves transparent is black on the
-/// desktop. A layer has to be composed with `DXGI_ALPHA_MODE_PREMULTIPLIED` instead, which
-/// DXGI only offers off a window of its own, hence the visual holding the chain.
+/// The chain is not attached to the window: `CreateSwapChainForComposition` names no HWND, and
+/// the visual is what puts the frames on screen. That is what keeps DXGI off the window's own
+/// thread — a windowed chain makes DXGI resize the front buffer and answer the window's size
+/// messages from the thread that owns the window, so presenting from any other thread races
+/// it. A plain window composes too, with its alpha ignored.
 struct Composition {
     _device: IDCompositionDevice,
     _target: IDCompositionTarget,
@@ -466,7 +497,7 @@ fn open_chain(
     device: &ID3D11Device,
     hwnd: HWND,
     size: (u32, u32),
-    composited: bool,
+    alpha: Alpha,
 ) -> Result<Chain, WindowError> {
     let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
         .map_err(|error| WindowError::Gpu(format!("CreateDXGIFactory2: {error}")))?;
@@ -474,7 +505,7 @@ fn open_chain(
     if let Some(output) = crate::outputs::hdr_output(&factory, monitor) {
         let format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         let (chain, composition, waitable) =
-            create_chain(&factory, device, hwnd, size, format, composited)?;
+            create_chain(&factory, device, hwnd, size, format, alpha)?;
         if let Some(encoding) = declare_hdr(&chain) {
             return Ok(Chain {
                 chain,
@@ -488,7 +519,7 @@ fn open_chain(
     }
     let format = DXGI_FORMAT_B8G8R8A8_UNORM;
     let (chain, composition, waitable) =
-        create_chain(&factory, device, hwnd, size, format, composited)?;
+        create_chain(&factory, device, hwnd, size, format, alpha)?;
     Ok(Chain {
         chain,
         format,
@@ -561,26 +592,29 @@ fn create_chain(
     hwnd: HWND,
     size: (u32, u32),
     format: DXGI_FORMAT,
-    composited: bool,
-) -> Result<(IDXGISwapChain1, Option<Composition>, bool), WindowError> {
+    alpha: Alpha,
+) -> Result<(IDXGISwapChain1, Composition, bool), WindowError> {
     let waitable = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
-    match create_chain_with(factory, device, hwnd, size, format, composited, waitable) {
+    match create_chain_with(factory, device, hwnd, size, format, alpha, waitable) {
         Ok((chain, composition)) => Ok((chain, composition, true)),
-        Err(_) => create_chain_with(factory, device, hwnd, size, format, composited, 0)
+        Err(_) => create_chain_with(factory, device, hwnd, size, format, alpha, 0)
             .map(|(chain, composition)| (chain, composition, false)),
     }
 }
 
 /// One attempt at a chain, with exactly the flags it was given.
+///
+/// A composition chain is the only kind this backend opens: it names no window, so the
+/// thread that presents is the only thread DXGI's chain lives on.
 fn create_chain_with(
     factory: &IDXGIFactory2,
     device: &ID3D11Device,
     hwnd: HWND,
     size: (u32, u32),
     format: DXGI_FORMAT,
-    composited: bool,
+    alpha: Alpha,
     flags: u32,
-) -> Result<(IDXGISwapChain1, Option<Composition>), WindowError> {
+) -> Result<(IDXGISwapChain1, Composition), WindowError> {
     let descriptor = DXGI_SWAP_CHAIN_DESC1 {
         Width: size.0,
         Height: size.1,
@@ -594,25 +628,18 @@ fn create_chain_with(
         BufferCount: BUFFERS,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        AlphaMode: if composited {
-            DXGI_ALPHA_MODE_PREMULTIPLIED
-        } else {
-            DXGI_ALPHA_MODE_UNSPECIFIED
+        AlphaMode: match alpha {
+            Alpha::Opaque => DXGI_ALPHA_MODE_IGNORE,
+            Alpha::Premultiplied => DXGI_ALPHA_MODE_PREMULTIPLIED,
         },
         Flags: flags,
     };
-    if composited {
-        let chain = unsafe {
-            factory.CreateSwapChainForComposition(device, &descriptor, None::<&IDXGIOutput>)
-        }
-        .map_err(|error| WindowError::Gpu(format!("CreateSwapChainForComposition: {error}")))?;
-        let composition = compose(device, hwnd, &chain)?;
-        return Ok((chain, Some(composition)));
+    let chain = unsafe {
+        factory.CreateSwapChainForComposition(device, &descriptor, None::<&IDXGIOutput>)
     }
-    let chain =
-        unsafe { factory.CreateSwapChainForHwnd(device, hwnd, &descriptor, None, None::<&IDXGIOutput>) }
-            .map_err(|error| WindowError::Gpu(format!("CreateSwapChainForHwnd: {error}")))?;
-    Ok((chain, None))
+    .map_err(|error| WindowError::Gpu(format!("CreateSwapChainForComposition: {error}")))?;
+    let composition = compose(device, hwnd, &chain)?;
+    Ok((chain, composition))
 }
 
 /// Put `chain` on screen through a composition visual rooted in `hwnd`.

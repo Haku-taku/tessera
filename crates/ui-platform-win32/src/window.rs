@@ -156,9 +156,9 @@ pub struct Win32Window {
     drag: Rc<crate::dnd::DragQueue>,
     /// The registered drop target; withdrawal must precede the window's destruction.
     drop_target: Option<windows::Win32::System::Ole::IDropTarget>,
-    /// The surface reaches the desktop through a compositor, so the frame's own alpha
-    /// decides what is seen: a layer, not a decorated window.
-    composited: bool,
+    /// Whether the frame's own alpha reaches the desktop: a layer shows it, a decorated
+    /// window is opaque and the compositor ignores it.
+    alpha: crate::presenter::Alpha,
     /// The surface's frame window, set once its session exists. Absent for a window a
     /// caller drives directly, which is always drawable and paces on `DwmFlush`.
     pace: Option<std::sync::Arc<crate::frame_pace::FramePace>>,
@@ -285,7 +285,7 @@ impl Win32Window {
             state,
             drag,
             drop_target,
-            composited: opening.composited,
+            alpha: opening.alpha,
             pace: None,
         })
     }
@@ -319,9 +319,9 @@ impl Win32Window {
         self.visual
     }
 
-    /// Whether the frame is composed over the desktop rather than shown opaque.
-    pub fn composited(&self) -> bool {
-        self.composited
+    /// Whether the frame's own alpha is composed over the desktop.
+    pub fn alpha(&self) -> crate::presenter::Alpha {
+        self.alpha
     }
 
     /// Whether the window still exists; closing it destroys it and ends the loop.
@@ -710,7 +710,7 @@ struct Opening {
     /// A layer's keyboard request; `None` for a window the manager places.
     keyboard: Option<KeyboardMode>,
     /// Whether the desktop should see through the frame where it is transparent.
-    composited: bool,
+    alpha: crate::presenter::Alpha,
 }
 
 /// An overlapped window at the manager's default position, sized for `size` logical pixels.
@@ -739,10 +739,12 @@ fn opening_window(size: (u32, u32)) -> Result<Opening, WindowError> {
         width: frame.right - frame.left,
         height: frame.bottom - frame.top,
         style: WS_OVERLAPPEDWINDOW,
-        ex_style: WINDOW_EX_STYLE(0),
+        // The frame arrives through a composition visual, so the shell must not keep a
+        // redirection surface behind the window: it would be black, and DXGI would own it.
+        ex_style: WS_EX_NOREDIRECTIONBITMAP,
         dpi,
         keyboard: None,
-        composited: false,
+        alpha: crate::presenter::Alpha::Opaque,
     })
 }
 
@@ -837,7 +839,7 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
         ex_style,
         dpi: dpi_x.max(96),
         keyboard: Some(layer.keyboard),
-        composited: true,
+        alpha: crate::presenter::Alpha::Premultiplied,
     })
 }
 
