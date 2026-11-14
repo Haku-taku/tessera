@@ -7,6 +7,7 @@ use std::time::Duration;
 use ui_core::clipboard::ClipboardContent;
 use ui_core::geom::{Point, Rect};
 use ui_core::{CursorShape, Event};
+use ui_platform::ThemeWatcher as _;
 use ui_platform::driver::FrameHost;
 use ui_platform::present::ImeState;
 use ui_platform::window::{
@@ -15,7 +16,9 @@ use ui_platform::window::{
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Dwm::DwmFlush;
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DwmFlush, DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CombineRgn, CreateRectRgn, DEVMODEW, DeleteObject, ENUM_CURRENT_SETTINGS,
     EnumDisplaySettingsW, GetMonitorInfoW, HBRUSH, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST,
@@ -91,8 +94,6 @@ struct WindowState {
     display_changed: bool,
     /// Physical pixels per logical unit, in whole DPI.
     dpi: u32,
-    /// The system light/dark preference changed since the last poll.
-    theme_changed: bool,
     /// A layer's keyboard request; `None` for a window the manager places, which has no
     /// shape and no activation rule of its own.
     keyboard: Option<KeyboardMode>,
@@ -247,6 +248,10 @@ impl Win32Window {
                 let _ = SetForegroundWindow(hwnd);
             }
         }
+        if opening.keyboard.is_none() {
+            // Only a window the manager frames has a caption; a layer is a popup.
+            theme_caption(hwnd);
+        }
         Ok(Self {
             hwnd,
             visual,
@@ -398,11 +403,6 @@ impl Win32Window {
     /// Whether the display's mode or topology changed since the last call.
     pub fn take_display_change(&mut self) -> bool {
         std::mem::take(&mut self.state.borrow_mut().display_changed)
-    }
-
-    /// Whether the system light/dark preference changed since the last call.
-    pub fn take_theme_change(&mut self) -> bool {
-        std::mem::take(&mut self.state.borrow_mut().theme_changed)
     }
 
     /// Block until a message arrives or `timeout` passes; true when messages are waiting.
@@ -1165,10 +1165,33 @@ unsafe fn handle(
         }
         WM_ERASEBKGND => Some(LRESULT(1)),
         WM_SETTINGCHANGE => {
-            state.borrow_mut().theme_changed = true;
+            // The app polls the same registry value each frame; this is what makes a frame
+            // happen while the window sits idle, and what keeps the caption in step.
+            theme_caption(hwnd);
+            state.borrow_mut().silent_change = true;
             None
         }
         _ => None,
+    }
+}
+
+/// Paint the caption in the scheme the client area uses.
+///
+/// DWM gives a window a light caption until it asks otherwise, so a dark client area would sit
+/// under a light bar; the attribute exists from Windows 10 20H1 on.
+fn theme_caption(hwnd: HWND) {
+    let preference = crate::theme::Win32ThemeWatcher::new().preference();
+    let dark = windows::core::BOOL::from(preference.is_dark(false));
+    let size = std::mem::size_of_val(&dark) as u32;
+    if let Err(error) = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark as *const windows::core::BOOL).cast(),
+            size,
+        )
+    } {
+        log::debug!("the caption keeps the system colour: {error}");
     }
 }
 
