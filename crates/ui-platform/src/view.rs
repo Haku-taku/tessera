@@ -973,12 +973,36 @@ pub struct NativeDrag {
     /// What the drop carries.
     pub data: ui_core::DragData,
     /// The dragged node's box when the gesture started, in surface units.
-    ///
-    /// The host paints the drag image from the same pixels the pointer left, so this is
-    /// where the picture came from rather than something the engine renders again.
     pub bounds: Option<ui_core::geom::Rect>,
     /// The press point, in surface units: the image hangs from here under the pointer.
     pub origin: ui_core::geom::Point,
+    /// The element's own pixels, rendered from its subtree alone.
+    ///
+    /// A host paints this under the pointer instead of photographing the surface, so the
+    /// image holds the dragged element and nothing that happened to be around it.
+    pub image: Option<DragImage>,
+}
+
+/// One element's painting, ready to be shown under the pointer.
+#[derive(Clone)]
+pub struct DragImage {
+    /// Image size in physical pixels.
+    pub size: (u32, u32),
+    /// Straight (non-premultiplied) sRGB in BGRA byte order, top-down.
+    pub bgra: Vec<u8>,
+    /// The grab point inside the image, in image pixels.
+    pub hotspot: (i32, i32),
+}
+
+impl std::fmt::Debug for DragImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The pixels are megabytes; a report only ever wants the shape.
+        f.debug_struct("DragImage")
+            .field("size", &self.size)
+            .field("hotspot", &self.hotspot)
+            .field("bytes", &self.bgra.len())
+            .finish()
+    }
 }
 
 pub struct AppLoop<A: App> {
@@ -1095,6 +1119,9 @@ pub struct AppLoop<A: App> {
     native_source: Option<Id>,
     /// A native drag the host has not started yet.
     native_request: Option<NativeDrag>,
+    /// The part of the surface the pending drag's image shows, when it is not the source's
+    /// whole ink: a text drag carries the selected lines, not the block holding them.
+    native_crop: Option<ui_core::geom::Rect>,
     /// Hovered node and its ancestors, root first; only hover subscribers appear here.
     hovered_path: Vec<Id>,
     /// Every node under the pointer, subscribers or not; cursor inheritance walks this.
@@ -1137,6 +1164,11 @@ pub struct AppLoop<A: App> {
     selection_spans: Rc<[(Id, ui_core::TextSelection)]>,
     /// The selectable text node a pointer drag is extending.
     select_drag: Option<Id>,
+    /// A press that landed inside the selection: where it landed and the byte under it.
+    ///
+    /// Travel past the threshold carries the selected text out as a drag; a release
+    /// without travel collapses the selection there, as an editor's click does.
+    selection_drag: Option<(Id, ui_core::geom::Point, usize)>,
     /// The text input a pointer drag is selecting inside.
     editing_drag: Option<Id>,
     /// A live scrollbar drag: which scroller, where the press landed, and the offset it
@@ -1294,6 +1326,7 @@ impl<A: App> AppLoop<A> {
             selection: None,
             selection_spans: Rc::from(Vec::new()),
             select_drag: None,
+            selection_drag: None,
             editing_drag: None,
             scrollbar_drag: None,
             pan: None,
@@ -1330,6 +1363,7 @@ impl<A: App> AppLoop<A> {
             drag_session: None,
             native_source: None,
             native_request: None,
+            native_crop: None,
             drag_step: None,
             hovered_path: Vec::new(),
             pointer_path: Vec::new(),
@@ -1397,7 +1431,78 @@ impl<A: App> AppLoop<A> {
     /// The source has already heard `DragStarted`; the host reports the outcome later as
     /// `Event::Dnd(DndEvent::Finished)`.
     pub fn take_native_drag(&mut self) -> Option<NativeDrag> {
-        self.native_request.take()
+        let mut drag = self.native_request.take()?;
+        let crop = self.native_crop.take();
+        // The image is cut from the frame that just painted the source, not the one that
+        // asked for the drag: an element that changed on the drag's first frame has to look
+        // the way it does now, not the way it did before the press.
+        if drag.image.is_none()
+            && let Some(source) = self.native_source
+            && let Some(nid) = self.tree.find_by_id(source)
+        {
+            drag.image = self.paint_drag_image(nid, drag.origin, crop);
+        }
+        Some(drag)
+    }
+
+    /// Paint `source`'s own subtree into a buffer, with no surface around it.
+    ///
+    /// The edge-to-edge frame is the space the primitives already live in, so the subtree is
+    /// rasterized into a buffer of that size and the painted box is cropped out of it: no
+    /// primitive is rewritten, and clips, layers and effects keep the meaning they had. The
+    /// buffer is one frame of window size, taken once per gesture. `crop` narrows what the
+    /// host shows — a text drag takes the selected lines rather than the block around them.
+    fn paint_drag_image(
+        &mut self,
+        source: ui_core::id::NodeId,
+        origin: ui_core::geom::Point,
+        crop: Option<ui_core::geom::Rect>,
+    ) -> Option<DragImage> {
+        let (list, painted) = self.resolved.subtree(&self.tree, source);
+        let painted = match crop {
+            Some(crop) => painted.intersection(crop)?,
+            None => painted,
+        };
+        if painted.size.w <= 0.0 || painted.size.h <= 0.0 {
+            return None;
+        }
+        let scale = if self.scale.is_finite() && self.scale > 0.0 {
+            self.scale
+        } else {
+            1.0
+        };
+        let canvas = self.resolved.canvas;
+        let width = (canvas.size.w * scale).ceil().max(1.0) as u32;
+        let height = (canvas.size.h * scale).ceil().max(1.0) as u32;
+        let mut pixels = ui_paint::Pixels::new(width, height);
+        self.prepare_cpu_renderer(scale);
+        self.renderer
+            .render(&list, &mut pixels, &ui_core::Damage::Full);
+        // The crop is the painted box, clamped to the frame it was painted into.
+        let x0 = (painted.origin.x * scale).floor().max(0.0) as u32;
+        let y0 = (painted.origin.y * scale).floor().max(0.0) as u32;
+        let x1 = ((painted.origin.x + painted.size.w) * scale).ceil() as i64;
+        let y1 = ((painted.origin.y + painted.size.h) * scale).ceil() as i64;
+        let x1 = x1.clamp(0, width as i64) as u32;
+        let y1 = y1.clamp(0, height as i64) as u32;
+        let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let mut bgra = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        for row in y0..y0 + h {
+            let start = ((row as usize) * (width as usize) + x0 as usize) * 4;
+            bgra.extend_from_slice(&pixels.data[start..start + (w as usize) * 4]);
+        }
+        let hotspot = (
+            ((origin.x * scale).round() as i32) - x0 as i32,
+            ((origin.y * scale).round() as i32) - y0 as i32,
+        );
+        Some(DragImage {
+            size: (w, h),
+            bgra,
+            hotspot,
+        })
     }
 
     /// What dropping the live drag here would do, or `None` when nothing takes it.
@@ -1974,21 +2079,12 @@ impl<A: App> AppLoop<A> {
         (outcome, damage, ime, ime_changed)
     }
 
-    fn present(
-        &mut self,
-        target: &mut dyn PresentTarget,
-        pointer: Option<ui_core::geom::Point>,
-        step: Option<f32>,
-    ) -> FrameOutcome {
-        let scale = self.scale;
-        let (outcome, damage, ime, ime_changed) = self.begin_frame(target.size(), pointer, step);
-        target.set_pointer_inside(self.pointer_inside(pointer));
-        self.collect_input_areas();
-        target.set_input_region(&self.input_areas);
-        target.set_cursor(outcome.cursor);
-        target.set_ime(ime);
+    /// Give the CPU rasterizer this frame's scale and glyph atlases.
+    ///
+    /// The CPU path is not only a presenter: a drag image is cut with the same rasterizer,
+    /// so both ask for the same textures before they draw.
+    fn prepare_cpu_renderer(&mut self, scale: f32) {
         self.renderer.set_scale(scale);
-
         // Hand the atlas to the renderer only when it actually grew: copying 1 MiB
         // every frame would dominate the frame cost.
         let pass = self.text.borrow();
@@ -2014,8 +2110,22 @@ impl<A: App> AppLoop<A> {
                 });
             }
         }
+    }
 
-        drop(pass);
+    fn present(
+        &mut self,
+        target: &mut dyn PresentTarget,
+        pointer: Option<ui_core::geom::Point>,
+        step: Option<f32>,
+    ) -> FrameOutcome {
+        let scale = self.scale;
+        let (outcome, damage, ime, ime_changed) = self.begin_frame(target.size(), pointer, step);
+        target.set_pointer_inside(self.pointer_inside(pointer));
+        self.collect_input_areas();
+        target.set_input_region(&self.input_areas);
+        target.set_cursor(outcome.cursor);
+        target.set_ime(ime);
+        self.prepare_cpu_renderer(scale);
 
         // Still frames hand nothing over; an animating one must present even with no
         // damage, because the commit is what requests the callback the loop paces on.
@@ -2871,7 +2981,9 @@ impl<A: App> AppLoop<A> {
                             data: (*data).clone(),
                             bounds,
                             origin: from,
+                            image: None,
                         });
+                        self.native_crop = None;
                         self.native_source = Some(on);
                         self.drag.reset();
                     }
@@ -4102,18 +4214,9 @@ impl<A: App> AppLoop<A> {
             .map(|(_, span)| *span)
     }
 
-    /// Rebuild the covered blocks from the two ends, in the walk's reading order.
-    ///
-    /// The walk is the order hit testing and painting already agree on, so a drag covers
-    /// exactly the blocks it travelled over. Both ends outside the walk means the blocks
-    /// themselves went away, and the selection with them.
-    fn refresh_selection(&mut self) {
-        let Some(ends) = self.selection else {
-            self.selection_spans = Rc::from(Vec::new());
-            return;
-        };
-        let blocks: Vec<(Id, usize)> = self
-            .tree
+    /// Every selectable read-only block and its byte length, in the walk's reading order.
+    fn selectable_blocks(&self) -> Vec<(Id, usize)> {
+        self.tree
             .walk()
             .into_iter()
             .filter_map(|nid| {
@@ -4127,7 +4230,20 @@ impl<A: App> AppLoop<A> {
                 let len = block.runs.iter().map(|run| run.text.len()).sum();
                 Some((node.id, len))
             })
-            .collect();
+            .collect()
+    }
+
+    /// Rebuild the covered blocks from the two ends, in the walk's reading order.
+    ///
+    /// The walk is the order hit testing and painting already agree on, so a drag covers
+    /// exactly the blocks it travelled over. Both ends outside the walk means the blocks
+    /// themselves went away, and the selection with them.
+    fn refresh_selection(&mut self) {
+        let Some(ends) = self.selection else {
+            self.selection_spans = Rc::from(Vec::new());
+            return;
+        };
+        let blocks = self.selectable_blocks();
         let rank = |id: Id| blocks.iter().position(|(block, _)| *block == id);
         let (Some(anchor), Some(head)) = (rank(ends.anchor.0), rank(ends.head.0)) else {
             self.selection = None;
@@ -4135,7 +4251,10 @@ impl<A: App> AppLoop<A> {
             return;
         };
         let (first, last) = (anchor.min(head), anchor.max(head));
-        let (start, end) = match anchor <= head {
+        // Ranks alone cannot order two ends inside one block: there the offsets decide,
+        // and a drag that ran right to left has its head before its anchor.
+        let forward = anchor < head || (anchor == head && ends.anchor.1 <= ends.head.1);
+        let (start, end) = match forward {
             true => (ends.anchor.1, ends.head.1),
             false => (ends.head.1, ends.anchor.1),
         };
@@ -4255,6 +4374,126 @@ impl<A: App> AppLoop<A> {
         });
         self.refresh_selection();
         true
+    }
+
+    /// Hand the selected text to the host as a drag the operating system can carry out.
+    ///
+    /// The payload is the same text Copy would place on the clipboard, so the two can
+    /// never disagree about what "the selection" is. The image is cut from the selection's
+    /// own fragments — the selected lines, not the block around them.
+    fn begin_text_drag(&mut self, node: Id, at: ui_core::geom::Point) -> bool {
+        let Some(text) = self.selected_text() else {
+            return false;
+        };
+        let scale = self.text_scale();
+        let mut bounds: Option<Rect> = None;
+        for (id, span) in self.selection_spans.iter() {
+            let Some(prim) = self.text_prim_of(*id) else {
+                continue;
+            };
+            let fragments = self
+                .text
+                .borrow_mut()
+                .selection_fragments(&prim, span.range(), scale);
+            for fragment in fragments {
+                let rect = fragment.rect;
+                bounds = Some(bounds.map_or(rect, |union: Rect| union.union(rect)));
+            }
+        }
+        let bounds = bounds.or_else(|| {
+            self.tree
+                .find_by_id(node)
+                .and_then(|nid| self.tree.get(nid))
+                .map(|n| n.visual_rect())
+        });
+        self.native_request = Some(NativeDrag {
+            data: ui_core::DragData::bytes("text/plain", text.into_bytes()),
+            bounds,
+            origin: at,
+            image: None,
+        });
+        // The block is the drag's source, but the lines the user selected are what leaves.
+        self.native_crop = bounds;
+        self.native_source = Some(node);
+        self.drag.reset();
+        true
+    }
+
+    /// Extend a read-only selection from the keyboard, the way an input extends its own.
+    ///
+    /// Only the extend chords: a read-only block has no editable caret, so a bare arrow
+    /// still walks focus. The anchor stays wherever the last press or Ctrl+A put it, and
+    /// the head crosses into the neighbouring block when it reaches that block's edge.
+    fn extend_readonly_selection(
+        &mut self,
+        id: ui_core::ShortcutId,
+    ) -> Option<(bool, bool)> {
+        use ui_core::ShortcutId as S;
+        if self.editing.is_some() {
+            return None;
+        }
+        let ends = self.selection?;
+        let blocks = self.selectable_blocks();
+        let rank = blocks
+            .iter()
+            .position(|(block, _)| *block == ends.head.0)?;
+        let block = blocks[rank].0;
+        let value = self.text_value(block)?;
+        let head = ui_core::text_input::clamp(&value, ends.head.1);
+        let (index, block) = match id {
+            S::EXTEND_LEFT => {
+                let prev = ui_core::text_input::moved(&value, head, -1);
+                if prev == head && head == 0 && rank > 0 {
+                    let (previous, previous_len) = blocks[rank - 1];
+                    (previous_len, previous)
+                } else {
+                    (prev, block)
+                }
+            }
+            S::EXTEND_RIGHT => {
+                let next = ui_core::text_input::moved(&value, head, 1);
+                if next == head && head == value.len() && rank + 1 < blocks.len() {
+                    (0, blocks[rank + 1].0)
+                } else {
+                    (next, block)
+                }
+            }
+            S::EXTEND_WORD_LEFT => {
+                let prev = ui_core::text_input::step_word(&value, head, -1);
+                if prev == head && head == 0 && rank > 0 {
+                    let (previous, previous_len) = blocks[rank - 1];
+                    (previous_len, previous)
+                } else {
+                    (prev, block)
+                }
+            }
+            S::EXTEND_WORD_RIGHT => {
+                let next = ui_core::text_input::step_word(&value, head, 1);
+                if next == head && head == value.len() && rank + 1 < blocks.len() {
+                    (0, blocks[rank + 1].0)
+                } else {
+                    (next, block)
+                }
+            }
+            S::EXTEND_HOME => (line_bounds(&value, head).0, block),
+            S::EXTEND_END => (line_bounds(&value, head).1, block),
+            S::EXTEND_DOCUMENT_HOME => (0, blocks.first()?.0),
+            S::EXTEND_DOCUMENT_END => {
+                let (last, last_len) = *blocks.last()?;
+                (last_len, last)
+            }
+            _ => return None,
+        };
+        let ends = SelectionEnds {
+            anchor: ends.anchor,
+            head: (block, index),
+        };
+        if self.selection == Some(ends) {
+            return Some((false, false));
+        }
+        self.selection = Some(ends);
+        self.refresh_selection();
+        Some((true, false))
     }
 
     /// The text node drawing `owner`'s buffer, the one a click must be measured against.
@@ -5198,22 +5437,7 @@ impl<A: App> AppLoop<A> {
                 self.editing = Some((owner, ui_core::TextSelection::new(0, len)));
                 return Some((true, false));
             }
-            let blocks: Vec<(Id, usize)> = self
-                .tree
-                .walk()
-                .into_iter()
-                .filter_map(|nid| {
-                    let node = self.tree.get(nid)?;
-                    if !Self::is_selectable_text(node) {
-                        return None;
-                    }
-                    let ui_core::NodeData::Text { block, .. } = &node.data else {
-                        return None;
-                    };
-                    let len = block.runs.iter().map(|run| run.text.len()).sum();
-                    Some((node.id, len))
-                })
-                .collect();
+            let blocks = self.selectable_blocks();
             let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
                 return None;
             };
@@ -5221,9 +5445,15 @@ impl<A: App> AppLoop<A> {
                 anchor: (first.0, 0),
                 head: (last.0, last.1),
             });
-            self.select_drag = Some(first.0);
+            // No pointer drag is live: arming one made the next hover extend the selection.
+            self.select_drag = None;
             self.refresh_selection();
             return Some((true, false));
+        }
+        // A read-only selection takes the same extension chords an input does: the anchor
+        // stays and the head moves, crossing into the neighbouring block at an edge.
+        if let Some(result) = self.extend_readonly_selection(id) {
+            return Some(result);
         }
         let (owner, sel) = self.editing?;
         match id {
@@ -5307,6 +5537,33 @@ impl<A: App> AppLoop<A> {
         true
     }
 
+    /// What the live read-only selection holds, one paragraph per line.
+    ///
+    /// `None` when nothing is selected or the selection is collapsed. Copy and a selection
+    /// drag both read this, so what leaves the app as text and what leaves as a drag can
+    /// never disagree.
+    pub fn selected_text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        for (node, span) in self.selection_spans.iter() {
+            let Some(value) = self.text_value(*node) else {
+                continue;
+            };
+            let range = span.range();
+            let (a, b) = (
+                ui_core::text_input::clamp(&value, range.start),
+                ui_core::text_input::clamp(&value, range.end),
+            );
+            if a < b {
+                parts.push(value[a..b].to_string());
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
+    }
+
     /// Copy the live selection to the clipboard; `cut` also removes it from the input.
     ///
     /// Returns true when the frame changed, which for a cut means a new buffer.
@@ -5346,26 +5603,12 @@ impl<A: App> AppLoop<A> {
         }
         // One block contributes its bytes alone; several are the selected paragraphs, one
         // line each, in the order the reader walked them.
-        let mut parts = Vec::new();
-        for (node, span) in self.selection_spans.iter() {
-            let Some(value) = self.text_value(*node) else {
-                continue;
-            };
-            let range = span.range();
-            let (a, b) = (
-                ui_core::text_input::clamp(&value, range.start),
-                ui_core::text_input::clamp(&value, range.end),
-            );
-            if a < b {
-                parts.push(value[a..b].to_string());
-            }
-        }
-        if parts.is_empty() {
+        let Some(text) = self.selected_text() else {
             return false;
-        }
+        };
         self.clipboard
             .push(crate::clipboard::ClipboardCommand::Copy {
-                content: ui_core::clipboard::ClipboardContent::Text(parts.join("\n")),
+                content: ui_core::clipboard::ClipboardContent::Text(text),
                 kind,
             });
         true
@@ -5542,6 +5785,13 @@ impl<A: App> AppLoop<A> {
                     requested |= self.scrollbar_move(*pos);
                 } else if self.pan.is_some() {
                     requested |= self.pan_move(*pos);
+                } else if let Some((node, at, _)) = self.selection_drag {
+                    // The press landed on the selection: once it travels, the selection is
+                    // what is being dragged rather than reshaped.
+                    if ui_core::past_threshold(at, *pos) {
+                        self.selection_drag = None;
+                        requested |= self.begin_text_drag(node, at);
+                    }
                 } else if self.select_drag.is_some() {
                     // A selection drag owns the pointer: it is not a control drag.
                     requested |= self.extend_selection(*pos);
@@ -5622,7 +5872,26 @@ impl<A: App> AppLoop<A> {
                             // A selectable label takes the press for its selection only: it is
                             // not a control press, so it never splats ink or reports a click.
                             // A text view inside an input is not one: its press places the caret.
-                            requested |= self.begin_selection(node, *pos, self.modifiers.shift);
+                            let inside = !self.modifiers.shift
+                                && self
+                                    .text_index_at(node, *pos)
+                                    .is_some_and(|index| {
+                                        self.span_of(node)
+                                            .is_some_and(|span| span.covers(index))
+                                    });
+                            if inside {
+                                // A press inside the selection is how the text leaves as a
+                                // drag; a click that never travels collapses it on release.
+                                let index = self
+                                    .text_index_at(node, *pos)
+                                    .expect("the press was just tested for membership");
+                                self.selection_drag = Some((node, *pos, index));
+                                self.select_drag = None;
+                            } else {
+                                self.selection_drag = None;
+                                requested |=
+                                    self.begin_selection(node, *pos, self.modifiers.shift);
+                            }
                             self.pressed = None;
                             self.press_at = None;
                             self.pressed_path.clear();
@@ -5643,6 +5912,7 @@ impl<A: App> AppLoop<A> {
                                 requested = true;
                             }
                             self.select_drag = None;
+                            self.selection_drag = None;
                             self.pressed = hit;
                             self.press_at = Some(*pos);
                             // Pressing moves focus to the nearest node that subscribes to it; a
@@ -5789,6 +6059,16 @@ impl<A: App> AppLoop<A> {
                     // came from is already gone.
                     let now = self.clock.live();
                     requested |= self.end_pan(now);
+                    if let Some((node, _, index)) = self.selection_drag.take() {
+                        // A click inside the selection with no travel collapses it where it
+                        // landed; it was never a drag.
+                        self.selection = Some(SelectionEnds {
+                            anchor: (node, index),
+                            head: (node, index),
+                        });
+                        self.refresh_selection();
+                        requested = true;
+                    }
                     if self.select_drag.take().is_some() {
                         // A selection drag ends here; it is neither a click nor a drag.
                         self.pressed = None;

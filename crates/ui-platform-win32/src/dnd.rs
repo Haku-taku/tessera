@@ -13,15 +13,15 @@ use std::rc::Rc;
 use ui_core::Event;
 use ui_core::dnd::{DndEvent, DragData, DragItem, DropEffect};
 use ui_core::geom::{Point, Rect};
-use ui_platform::view::NativeDrag;
+use ui_platform::view::{DragImage, NativeDrag};
 use windows::Win32::Foundation::{
     COLORREF, DV_E_FORMATETC, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY, HGLOBAL, HWND, POINT, POINTL,
     S_FALSE, S_OK, SIZE,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HGDIOBJ, ReleaseDC, SRCCOPY,
-    ScreenToClient, SelectObject,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ,
+    ReleaseDC, SRCCOPY, ScreenToClient, SelectObject,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
@@ -38,6 +38,7 @@ use windows::Win32::System::SystemServices::{
     MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 use windows::Win32::UI::Shell::{
     CLSID_DragDropHelper, IDragSourceHelper, IDropTargetHelper, SHCreateMemStream, SHDRAGIMAGE,
 };
@@ -66,6 +67,11 @@ impl DragQueue {
     /// Events a drag posted since the last turn.
     pub(crate) fn take(&self) -> Vec<Event> {
         std::mem::take(&mut self.events.borrow_mut())
+    }
+
+    /// Whether anything is queued; a modal pump asks before building a frame.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.borrow().is_empty()
     }
 
     /// Publish what dropping here would do, so the OS pointer shows the negotiated effect.
@@ -139,16 +145,63 @@ fn ensure_ole() -> bool {
     })
 }
 
+/// The timer a modal gesture drives the app's frames with, in milliseconds.
+///
+/// OLE's loop dispatches window messages, so a timer this window owns is what makes the
+/// engine paint while the drag is modal — the same nested pump Qt and WPF get from their
+/// event loops. Eight milliseconds keeps a highlight and an animation alive under the
+/// pointer without presenting anything a still app would not have presented anyway.
+const MODAL_PUMP_MS: u32 = 8;
+
+/// The timer id; any id not used elsewhere on this window will do.
+pub(crate) const MODAL_PUMP_TIMER: usize = 0xD0D0;
+
+thread_local! {
+    /// The frame pump a modal gesture armed for its own duration.
+    ///
+    /// The pointer is only valid inside [`begin`]: the caller that arms it keeps the
+    /// closure alive for the whole `DoDragDrop` call, and OLE only calls back on this
+    /// thread, inside that call.
+    static MODAL_PUMP: Cell<Option<*mut dyn FnMut()>> = const { Cell::new(None) };
+    /// A frame is being built: a message it synchronously dispatches must not build another.
+    static MODAL_PUMP_BUSY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run the frame pump a modal gesture armed, if any; true when one ran.
+///
+/// The window procedure calls this from `WM_TIMER`, which OLE's own loop dispatches: that
+/// is how a drag stops freezing the surface it started from.
+pub(crate) fn pump_modal_frame() -> bool {
+    let armed = MODAL_PUMP.with(|slot| slot.get());
+    let Some(pump) = armed else {
+        return false;
+    };
+    if MODAL_PUMP_BUSY.with(Cell::get) {
+        return false;
+    }
+    MODAL_PUMP_BUSY.with(|busy| busy.set(true));
+    // SAFETY: `begin` arms the slot with a closure that outlives the whole `DoDragDrop`
+    // call it is about to make, and clears it before returning.
+    unsafe { (*pump)() };
+    MODAL_PUMP_BUSY.with(|busy| busy.set(false));
+    true
+}
+
 /// Start the drag this app owns, and stay in it until the gesture ends.
 ///
 /// `DoDragDrop` runs a modal loop on the calling thread, and that loop wakes on the mouse
 /// input the thread's window captured. A worker thread has no window the OS feeds, so its
 /// loop never observes the release: measured, `QueryContinueDrag` was never called and the
-/// call never returned. The drag therefore runs on the window's thread, inside the turn that
-/// started it; the engine paints again only once the gesture is over, which is why an
-/// outgoing drag shows its last frame rather than highlighting targets as the pointer
-/// passes them. The outcome is queued as `DndEvent::Finished` behind OLE's callbacks.
-pub(crate) fn begin(hwnd: HWND, drag: NativeDrag, queue: &DragQueue) -> bool {
+/// call never returned. The drag therefore runs on the window's thread, and `pump` is the
+/// caller's frame, run from a timer inside OLE's own loop so the app keeps painting and
+/// keeps seeing the drag it is carrying. The outcome is queued as `DndEvent::Finished`
+/// behind OLE's callbacks.
+pub(crate) fn begin(
+    hwnd: HWND,
+    drag: NativeDrag,
+    queue: &DragQueue,
+    pump: Option<&mut dyn FnMut()>,
+) -> bool {
     let formats = payload_formats(&drag.data);
     if formats.is_empty() {
         return false;
@@ -170,6 +223,27 @@ pub(crate) fn begin(hwnd: HWND, drag: NativeDrag, queue: &DragQueue) -> bool {
     attach_image(hwnd, &drag, &object);
     let source: IDropSource = DropSource.into();
     let mut effect = DROPEFFECT_NONE;
+    if let Some(pump) = pump {
+        // SAFETY: the slot is only read while this call is on the stack, on this thread,
+        // and the closure outlives it; the lifetime is erased, not the validity.
+        let erased: *mut dyn FnMut() = unsafe {
+            std::mem::transmute::<*mut dyn FnMut(), *mut dyn FnMut()>(pump)
+        };
+        MODAL_PUMP.with(|slot| slot.set(Some(erased)));
+        // SAFETY: the window is this thread's and the id is ours.
+        let timer = unsafe { SetTimer(Some(hwnd), MODAL_PUMP_TIMER, MODAL_PUMP_MS, None) };
+        // SAFETY: both interfaces are local to this call and outlive it.
+        let result = unsafe { DoDragDrop(&object, &source, allowed, &mut effect) };
+        // SAFETY: the timer was started above and the id belongs to this window.
+        unsafe {
+            let _ = KillTimer(Some(hwnd), timer);
+        }
+        MODAL_PUMP.with(|slot| slot.set(None));
+        queue.push(Event::Dnd(DndEvent::Finished {
+            dropped: result.is_ok() && effect != DROPEFFECT_NONE,
+        }));
+        return true;
+    }
     // SAFETY: both interfaces are local to this call and outlive it.
     let result = unsafe { DoDragDrop(&object, &source, allowed, &mut effect) };
     // Queued behind the callbacks OLE just made: any drop this window took is processed
@@ -182,14 +256,18 @@ pub(crate) fn begin(hwnd: HWND, drag: NativeDrag, queue: &DragQueue) -> bool {
 
 /// Carry the dragged element's own pixels under the pointer for the whole gesture.
 ///
-/// The window is composited by the GPU, so its content cannot be asked for through a DC;
-/// the screen already shows it, and the box the gesture started from is where those pixels
-/// are. OLE copies the bitmap and owns it from the moment the helper takes it.
+/// The engine renders the source's subtree into a buffer of its own, so the image is the
+/// element and nothing that shared its screen area. A host that did not get one (an older
+/// engine, or a build that could not paint the node) falls back to the screen under the
+/// element, which at least shows the right pixels when nothing overlaps. OLE copies the
+/// bitmap and owns it from the moment the helper takes it.
 fn attach_image(hwnd: HWND, drag: &NativeDrag, object: &IDataObject) {
-    let Some(bounds) = drag.bounds else {
-        return;
-    };
-    let Some((bitmap, width, height, hotspot)) = capture(hwnd, bounds, drag.origin) else {
+    let rendered = drag
+        .image
+        .as_ref()
+        .and_then(image_bitmap)
+        .or_else(|| drag.bounds.and_then(|bounds| capture(hwnd, bounds, drag.origin)));
+    let Some((bitmap, width, height, hotspot)) = rendered else {
         return;
     };
     let helper: Result<IDragSourceHelper> =
@@ -256,26 +334,9 @@ fn capture(
         unsafe { ReleaseDC(None, screen) };
         return None;
     }
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            // Negative height: rows top down, the way the screen reads.
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..BITMAPINFOHEADER::default()
-        },
-        ..BITMAPINFO::default()
-    };
-    let mut bits = std::ptr::null_mut();
-    // SAFETY: the header describes a 32-bit DIB and the out-pointer is writable.
-    let bitmap = match unsafe {
-        CreateDIBSection(Some(memory), &info, DIB_RGB_COLORS, &mut bits, None, 0)
-    } {
-        Ok(bitmap) => bitmap,
-        Err(_) => {
+    let (bitmap, bits) = match section(memory, width, height) {
+        Some(section) => section,
+        None => {
             unsafe {
                 let _ = DeleteDC(memory);
                 ReleaseDC(None, screen);
@@ -324,6 +385,71 @@ fn capture(
         (((origin.y - bounds.origin.y) * scale).round() as i32).clamp(0, height),
     );
     Some((bitmap, width, height, hotspot))
+}
+
+/// A 32-bit top-down DIB section sized `width` by `height`, and the pixels behind it.
+fn section(dc: HDC, width: i32, height: i32) -> Option<(HBITMAP, *mut std::ffi::c_void)> {
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            // Negative height: rows top down, the way both the screen and the engine read.
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..BITMAPINFOHEADER::default()
+        },
+        ..BITMAPINFO::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    // SAFETY: the header describes a 32-bit DIB and the out-pointer is writable.
+    let bitmap = unsafe {
+        CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+    }
+    .ok()?;
+    if bits.is_null() {
+        // SAFETY: the bitmap was created here and has not been handed to anyone.
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        }
+        return None;
+    }
+    Some((bitmap, bits))
+}
+
+/// The engine's rendered pixels as a drag-image bitmap.
+///
+/// OLE draws the image with premultiplied alpha; the engine's buffer is straight sRGB, so
+/// the colour channels are scaled by alpha here rather than in the renderer, where straight
+/// is what every other consumer (a window, a PPM) wants.
+fn image_bitmap(image: &DragImage) -> Option<(HBITMAP, i32, i32, (i32, i32))> {
+    let (width, height) = (image.size.0 as i32, image.size.1 as i32);
+    let length = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    if width <= 0 || height <= 0 || image.bgra.len() < length {
+        return None;
+    }
+    // A memory DC is only needed to create the section; the pixels outlive it.
+    let dc = unsafe { CreateCompatibleDC(None) };
+    if dc.0.is_null() {
+        return None;
+    }
+    let section = section(dc, width, height);
+    unsafe {
+        let _ = DeleteDC(dc);
+    }
+    let (bitmap, bits) = section?;
+    // SAFETY: the section is `width * height` pixels of four bytes, top down.
+    let pixels =
+        unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), length) };
+    for (source, pixel) in image.bgra[..length].chunks_exact(4).zip(pixels.chunks_exact_mut(4)) {
+        let alpha = u32::from(source[3]);
+        pixel[0] = (u32::from(source[0]) * alpha / 255) as u8;
+        pixel[1] = (u32::from(source[1]) * alpha / 255) as u8;
+        pixel[2] = (u32::from(source[2]) * alpha / 255) as u8;
+        pixel[3] = source[3];
+    }
+    Some((bitmap, width, height, image.hotspot))
 }
 
 /// The Windows formats a payload offers; empty when no MIME type has a Windows form.

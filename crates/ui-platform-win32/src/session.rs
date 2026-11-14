@@ -230,6 +230,18 @@ impl<A: App> Session<A> {
     }
 
     fn draw_frame(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
+        let tick = self.present_frame(pointer)?;
+        // A drag that asked to leave the app becomes OLE's; one that highlighted a drop
+        // publishes the effect the pointer should show from now on.
+        if let Some(drag) = self.lp.take_native_drag() {
+            self.run_native_drag(drag);
+        }
+        self.win.set_drop_effect(self.lp.drop_effect());
+        Ok(tick)
+    }
+
+    /// Build, layout, paint and present one frame; no drag is started here.
+    fn present_frame(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
         // A scripted pointer wins over the window's, which the driver just read.
         let pointer = self.pointer.take().or(pointer);
         let size = self.win.client_size();
@@ -265,28 +277,75 @@ impl<A: App> Session<A> {
         if !steps.is_empty() {
             self.lp.request_frame();
         }
-        // A drag that asked to leave the app becomes OLE's; one that highlighted a drop
-        // publishes the effect the pointer should show from now on.
-        if let Some(drag) = self.lp.take_native_drag() {
-            // The drag runs to its end inside this call; the frame after this one is the
-            // first that can show its outcome.
-            let started = self.win.begin_drag(drag);
-            if !started {
-                // The host refused, so the gesture ends without a drop.
-                self.lp
-                    .dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Finished {
-                        dropped: false,
-                    }));
-                self.lp.request_frame();
-            }
-        }
-        self.win.set_drop_effect(self.lp.drop_effect());
         Ok(Tick {
             drew: true,
             outcome: Some(framed.outcome),
             presented: framed.presented,
             pointer,
         })
+    }
+
+    /// Hand the gesture to OLE, and keep building frames from inside its modal loop.
+    ///
+    /// `DoDragDrop` does not return until the drag is over, so without this the surface
+    /// would hold its last frame for the whole gesture — a drop highlight that never
+    /// appears, an animation that stops. The pump OLE's timer calls is one frame of the
+    /// same work a turn does, plus the drag phases the drop target queued since the last
+    /// one; a still frame costs a build and presents nothing.
+    fn run_native_drag(&mut self, drag: ui_platform::view::NativeDrag) {
+        let hwnd = self.win.hwnd();
+        let queue = self.win.drag_queue();
+        let Session {
+            lp,
+            win,
+            presenter,
+            closed,
+            ..
+        } = self;
+        let mut pump = || {
+            // Nothing to say and nothing moving: the surface already shows the truth.
+            if queue.is_empty() && !lp.is_animating() {
+                return;
+            }
+            let Some(presenter) = presenter.as_mut() else {
+                return;
+            };
+            // The drag the app is carrying may itself be over one of its targets.
+            for event in queue.take() {
+                lp.dispatch(event);
+            }
+            let size = win.client_size();
+            if size.0 == 0 || size.1 == 0 {
+                return;
+            }
+            if presenter.resize(size, win.scale()).is_err() {
+                return;
+            }
+            let pointer = win.pointer();
+            {
+                let mut target = Target {
+                    win: &mut *win,
+                    presenter: &mut *presenter,
+                };
+                // A failed frame during a drag is not worth ending the surface for: the
+                // next turn reports it the ordinary way.
+                let _ = lp.frame_scene(&mut target, pointer);
+            }
+            *closed |= lp.take_close();
+            for (dx, dy) in lp.take_pointer_steps() {
+                win.nudge_pointer(dx, dy);
+            }
+            win.set_drop_effect(lp.drop_effect());
+        };
+        // The drag runs to its end inside this call; the frame after this one is the first
+        // that can show its outcome.
+        if !crate::dnd::begin(hwnd, drag, &queue, Some(&mut pump)) {
+            // The host refused, so the gesture ends without a drop.
+            lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Finished {
+                dropped: false,
+            }));
+            lp.request_frame();
+        }
     }
 }
 

@@ -840,6 +840,132 @@ mod contracts {
     }
 
     #[test]
+    fn a_press_inside_the_selection_carries_its_text_out_as_a_drag() {
+        // Selecting text and then dragging it is the engine's own gesture: the payload is
+        // the same text Copy would take, and the host gets an image of the selected lines
+        // instead of the block around them.
+        let y = 8.0;
+        let button = ui_core::PointerButton::Primary;
+        let mut lp = AppLoop::new(Selectable);
+        let mut target = OffscreenTarget::new(600, 120);
+        lp.frame(&mut target, None);
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: ui_core::geom::Point::new(1.0, y),
+            button,
+        });
+        lp.dispatch(ui_core::Event::PointerMoved {
+            pos: ui_core::geom::Point::new(220.0, y),
+        });
+        lp.dispatch(ui_core::Event::PointerReleased {
+            pos: ui_core::geom::Point::new(220.0, y),
+            button,
+        });
+        let selected = lp.selected_text().expect("the drag selected text");
+        let ends = lp.selection().expect("the selection survives the release");
+
+        let inside = ui_core::geom::Point::new(60.0, y);
+        lp.dispatch(ui_core::Event::PointerMoved { pos: inside });
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: inside,
+            button,
+        });
+        assert_eq!(
+            lp.selection(),
+            Some(ends),
+            "a press inside the selection leaves it alone"
+        );
+        lp.dispatch(ui_core::Event::PointerMoved {
+            pos: ui_core::geom::Point::new(inside.x + 40.0, y),
+        });
+        let drag = lp
+            .take_native_drag()
+            .expect("the selection leaves as a drag");
+        assert_eq!(
+            drag.data.text(),
+            Some(selected.as_str()),
+            "the drag carries the selected text"
+        );
+        let image = drag
+            .image
+            .as_ref()
+            .expect("the host gets an image of the selected lines");
+        let bounds = drag.bounds.expect("the selection has bounds");
+        assert!(
+            (image.size.0 as f32 - bounds.size.w).abs() <= 8.0,
+            "the image is cropped to the selection, not its block: {image:?} for {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn shift_extends_a_read_only_selection_from_the_keyboard() {
+        // A click in a selectable paragraph leaves a caret; Shift+arrow must extend from
+        // it, as it does in an input, rather than walking focus to another widget.
+        let y = 8.0;
+        let button = ui_core::PointerButton::Primary;
+        let mut lp = AppLoop::new(Selectable);
+        let mut target = OffscreenTarget::new(600, 120);
+        lp.frame(&mut target, None);
+        let at = ui_core::geom::Point::new(60.0, y);
+        lp.dispatch(ui_core::Event::PointerPressed { pos: at, button });
+        lp.dispatch(ui_core::Event::PointerReleased { pos: at, button });
+        let start = lp.selection().expect("the click placed a caret");
+        assert!(start.1.is_collapsed(), "the click leaves no range yet");
+
+        lp.dispatch(ui_core::Event::Modifiers(ui_core::Modifiers {
+            shift: true,
+            ..ui_core::Modifiers::default()
+        }));
+        lp.dispatch(ui_core::Event::KeyPressed {
+            key: ui_core::Key::Left,
+        });
+        let after = lp.selection().expect("the selection is still there");
+        assert_eq!(after.0, start.0, "the head stays in the same block");
+        let range = after.1.range();
+        let (from, to) = (range.start, range.end);
+        assert_eq!(
+            to, start.1.caret,
+            "the click stays at one end of the new range: {after:?}"
+        );
+        assert!(from < to, "the range reaches left of the click: {after:?}");
+        // If the anchor had followed the head, stepping right would leave `from..to` in
+        // place instead of closing the range at the click again.
+        lp.dispatch(ui_core::Event::KeyPressed {
+            key: ui_core::Key::Right,
+        });
+        let closed = lp.selection().expect("the caret is still there");
+        assert!(
+            closed.1.is_collapsed(),
+            "Shift+Right back to the click collapses the range: {closed:?}"
+        );
+        assert_eq!(closed.1.caret, start.1.caret);
+    }
+
+    #[test]
+    fn ctrl_a_selects_everything_without_arming_a_pointer_drag() {
+        // The chord is not a gesture: a hover afterwards must not resize what it selected.
+        let mut lp = AppLoop::new(TwoParagraphs);
+        let mut target = OffscreenTarget::new(600, 120);
+        lp.frame(&mut target, None);
+        lp.dispatch(ui_core::Event::Modifiers(ui_core::Modifiers {
+            ctrl: true,
+            ..ui_core::Modifiers::default()
+        }));
+        lp.dispatch(ui_core::Event::KeyPressed {
+            key: ui_core::Key::Char('a'),
+        });
+        let all = lp.selection().expect("select all leaves a range");
+        assert!(!all.1.is_collapsed(), "everything is selected");
+        lp.dispatch(ui_core::Event::PointerMoved {
+            pos: ui_core::geom::Point::new(10.0, 60.0),
+        });
+        assert_eq!(
+            lp.selection(),
+            Some(all),
+            "a hover with no button must not move the selection"
+        );
+    }
+
+    #[test]
     fn a_selection_drag_asks_for_every_frame_it_traverses() {
         // The pointer reports faster than the screen, and a move that changes no hover
         // owner is normally dropped. A selection drag changes what is painted without
@@ -2882,6 +3008,91 @@ mod contracts {
                 && matches!(change, ui_core::change::Change::DroppedOn(data)
                     if data.text() == Some("from elsewhere"))),
             "the payload decoded by the platform arrives at the drop: {seen:?}"
+        );
+    }
+
+    /// A card that leaves the app, stacked on a sibling that must not travel with it.
+    struct LeavingCard;
+
+    impl App for LeavingCard {
+        fn view(&mut self, _f: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            crate::from_decl(
+                Decl::container(Id::str("root"), NodeKind::Stack)
+                    .size(ui_core::layout::SizeClass::fixed(200.0, 200.0))
+                    .child(
+                        Decl::container(Id::str("under"), NodeKind::Box)
+                            .size(ui_core::layout::SizeClass::fixed(200.0, 200.0))
+                            .background(
+                                ui_core::geom::Color::rgb(0.0, 0.0, 1.0),
+                                ui_core::geom::Corners::ZERO,
+                            ),
+                    )
+                    .child(
+                        Decl::container(Id::str("source"), NodeKind::Box)
+                            .size(ui_core::layout::SizeClass::fixed(120.0, 80.0))
+                            .background(
+                                ui_core::geom::Color::rgb(1.0, 0.0, 0.0),
+                                ui_core::geom::Corners::all(20.0),
+                            )
+                            .drag_data(ui_core::DragData::bytes("text/plain", b"card".to_vec()))
+                            .drag_out(),
+                    ),
+            )
+        }
+    }
+
+    #[test]
+    fn a_drag_image_is_the_element_and_never_what_sat_behind_it() {
+        // The host must be able to draw the element alone. A surface photograph would carry
+        // the blue sibling that lies under the card's rounded corners; the rendered subtree
+        // leaves them transparent instead.
+        let mut target = OffscreenTarget::new(220, 220);
+        let mut lp = AppLoop::new(LeavingCard);
+        lp.frame(&mut target, None);
+        let nid = lp
+            .tree()
+            .find_by_id(Id::str("source"))
+            .expect("the source is laid out");
+        let rect = lp
+            .tree()
+            .get(nid)
+            .expect("the source has a node")
+            .visual_rect();
+        let at = ui_core::geom::Point::new(rect.origin.x + 60.0, rect.origin.y + 40.0);
+        lp.dispatch(ui_core::Event::PointerMoved { pos: at });
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: at,
+            button: ui_core::PointerButton::Primary,
+        });
+        lp.dispatch(ui_core::Event::PointerMoved {
+            pos: ui_core::geom::Point::new(at.x + 60.0, at.y),
+        });
+        let drag = lp
+            .take_native_drag()
+            .expect("the gesture leaves for the host");
+        let image = drag.image.expect("the host gets the element's own pixels");
+        assert_eq!(
+            image.size,
+            (120, 80),
+            "the image is the source box, not the surface"
+        );
+        let center = ((40 * 120 + 60) * 4) as usize;
+        let pixel = &image.bgra[center..center + 4];
+        assert!(
+            pixel[2] > 200 && pixel[0] < 60,
+            "the card's own fill is in the image: {pixel:?}"
+        );
+        assert!(
+            image
+                .bgra
+                .chunks_exact(4)
+                .all(|px| px[0] < 60 || px[2] > 200),
+            "nothing that sat behind the card may travel with it"
+        );
+        assert_eq!(
+            image.hotspot,
+            (60, 40),
+            "the image hangs from the grab point"
         );
     }
 

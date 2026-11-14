@@ -1415,7 +1415,9 @@ impl DrawList {
         self.prims.images.clear();
         self.prims.shadows.clear();
         self.prims.sectors.clear();
+        self.prims.maths.clear();
         self.prims.lines.clear();
+        self.prims.ellipses.clear();
         self.clips.clear();
         self.layers.clear();
         self.backdrops.clear();
@@ -1426,7 +1428,9 @@ impl DrawList {
         self.owners.images.clear();
         self.owners.shadows.clear();
         self.owners.sectors.clear();
+        self.owners.maths.clear();
         self.owners.lines.clear();
+        self.owners.ellipses.clear();
     }
 
     /// The transform in force for pushes right now, when it would change anything.
@@ -1862,6 +1866,80 @@ impl DrawList {
             }
         }
         out
+    }
+}
+
+impl DrawList {
+    /// The part of this list painted by `root` and its descendants, and the box it covers.
+    ///
+    /// Every primitive carries its owning node, so one node's painting can be taken out of
+    /// a finished frame without asking the app to build again. Clips, layers and textures
+    /// travel unchanged (the ops still index them the same way); only primitives of other
+    /// nodes are left behind. Backdrops are left behind too: a frost reads the surface it
+    /// sits on, and the surface this painting is taken out of is exactly what the caller is
+    /// separating it from. This is what a drag image is made of: the element alone.
+    pub fn subtree(&self, tree: &crate::tree::Tree, root: crate::id::NodeId) -> (DrawList, Rect) {
+        let mut out = DrawList::new(self.canvas);
+        out.clips.clone_from(&self.clips);
+        out.layers.clone_from(&self.layers);
+        out.backdrops.clone_from(&self.backdrops);
+        out.images.clone_from(&self.images);
+        let mut bounds: Option<Rect> = None;
+        // Ancestry is asked once per node rather than once per primitive: `within` walks a
+        // path back to the root, and a frame can paint dozens of prims for one node.
+        let mut inside: crate::collections::FastMap<crate::id::NodeId, bool> =
+            crate::collections::FastMap::default();
+        for op in &self.ops {
+            if matches!(op, Op::Backdrop(_)) {
+                continue;
+            }
+            let Op::Prim(prim) = *op else {
+                out.ops.push(*op);
+                continue;
+            };
+            let index = prim.index as usize;
+            let Some(owner) = self.owners.of(prim.kind, index) else {
+                continue;
+            };
+            let member = *inside
+                .entry(owner)
+                .or_insert_with(|| tree.within(owner, root));
+            if !member {
+                continue;
+            }
+            match prim.kind {
+                PrimKind::Rect => {
+                    out.push_rect(owner, self.prims.rects[index]);
+                }
+                PrimKind::Text => {
+                    out.push_text(owner, self.prims.texts[index].clone());
+                }
+                PrimKind::Glyph => {
+                    out.push_glyph(owner, self.prims.glyphs[index]);
+                }
+                PrimKind::Image => {
+                    out.push_image_prim(owner, self.prims.images[index]);
+                }
+                PrimKind::Shadow => {
+                    out.push_shadow(owner, self.prims.shadows[index]);
+                }
+                PrimKind::Sector => {
+                    out.push_sector(owner, self.prims.sectors[index]);
+                }
+                PrimKind::Math => {
+                    out.push_math(owner, self.prims.maths[index].clone());
+                }
+                PrimKind::Line => {
+                    out.push_line(owner, self.prims.lines[index]);
+                }
+                PrimKind::Ellipse => {
+                    out.push_ellipse(owner, self.prims.ellipses[index]);
+                }
+            }
+            let painted = self.prim_bounds(prim);
+            bounds = Some(bounds.map_or(painted, |union| union.union(painted)));
+        }
+        (out, bounds.unwrap_or(Rect::ZERO))
     }
 }
 

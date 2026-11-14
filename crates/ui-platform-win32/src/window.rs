@@ -56,6 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
     WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
@@ -278,6 +279,11 @@ impl Win32Window {
         self.hwnd
     }
 
+    /// What OLE's drop target queues while a drag is over this window.
+    pub(crate) fn drag_queue(&self) -> Rc<crate::dnd::DragQueue> {
+        self.drag.clone()
+    }
+
     /// The window the frame is composed into.
     pub fn visual_hwnd(&self) -> HWND {
         self.visual
@@ -418,8 +424,11 @@ impl Win32Window {
     }
 
     /// Start a drag this app carries, so another window can take the payload.
+    ///
+    /// The session's own form arms a frame pump; this one, for callers holding only a
+    /// window, lets the surface hold still for the gesture.
     pub fn begin_drag(&mut self, drag: ui_platform::view::NativeDrag) -> bool {
-        crate::dnd::begin(self.hwnd, drag, &self.drag)
+        crate::dnd::begin(self.hwnd, drag, &self.drag, None)
     }
 
     /// Whether focus, extent or scale changed without an `Event`.
@@ -1203,6 +1212,15 @@ unsafe fn handle(
             Some(LRESULT(0))
         }
         WM_ERASEBKGND => Some(LRESULT(1)),
+        WM_TIMER => {
+            // A modal gesture (OLE's drag) owns the thread's loop; its timer is the only
+            // thing that can make the engine build a frame in the meantime.
+            if crate::dnd::pump_modal_frame() {
+                Some(LRESULT(0))
+            } else {
+                None
+            }
+        }
         WM_SETTINGCHANGE => {
             // The app polls the same registry value each frame; this is what makes a frame
             // happen while the window sits idle, and what keeps the caption in step.
