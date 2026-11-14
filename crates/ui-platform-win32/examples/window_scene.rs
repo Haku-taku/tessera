@@ -52,7 +52,7 @@ fn windows_main() -> Result<(), String> {
             shapes: Vec::new(),
             data: NodeData::Text {
                 ink: colour,
-                block: std::rc::Rc::new(ui_core::TextBlock {
+                block: std::sync::Arc::new(ui_core::TextBlock {
                     runs: vec![ui_core::TextRun::new(
                         value,
                         ui_core::TextStyle::new(size),

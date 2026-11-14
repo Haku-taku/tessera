@@ -26,6 +26,7 @@ mod locale;
 mod modal;
 mod outputs;
 mod presenter;
+mod render;
 mod session;
 mod theme;
 mod tray;

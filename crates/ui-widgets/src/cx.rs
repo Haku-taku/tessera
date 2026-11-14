@@ -96,7 +96,7 @@ impl<'a, 'b> Cx<'a, 'b> {
         &self,
         block: &ui_core::text::TextBlock,
         max_width: f32,
-    ) -> Option<std::rc::Rc<ui_core::text::InlineLayout>> {
+    ) -> Option<std::sync::Arc<ui_core::text::InlineLayout>> {
         self.core.text_layout(block, max_width)
     }
 

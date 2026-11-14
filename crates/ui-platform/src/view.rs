@@ -351,7 +351,7 @@ impl ui_core::TextMeasure for PassMeasure {
         &mut self,
         block: &ui_core::TextBlock,
         max_width: f32,
-    ) -> std::rc::Rc<ui_core::InlineLayout> {
+    ) -> std::sync::Arc<ui_core::InlineLayout> {
         self.0.borrow_mut().layout(block, max_width)
     }
 
@@ -4158,7 +4158,7 @@ impl<A: App> AppLoop<A> {
                 prim = self.text_prim_of(text)?;
                 let style = prim.block.runs.first().map(|r| r.style).unwrap_or_default();
                 let composed = composed_input(&value, preedit.as_ref(), sel.caret);
-                let block = std::rc::Rc::make_mut(&mut prim.block);
+                let block = std::sync::Arc::make_mut(&mut prim.block);
                 block.runs = vec![ui_core::text::TextRun::new(composed, style)];
                 block.atoms.clear();
                 prim.layout = None;
@@ -5302,7 +5302,7 @@ impl<A: App> AppLoop<A> {
             self.list.push_text(
                 nid,
                 ui_core::draw::TextPrim {
-                    block: std::rc::Rc::new(style.block(&item.label)),
+                    block: std::sync::Arc::new(style.block(&item.label)),
                     origin: ui_core::geom::Point::new(
                         menu.rect.origin.x + style.pad_x,
                         row.origin.y + (style.row_height - style.font_size * 1.25) * 0.5,
@@ -5325,7 +5325,7 @@ impl<A: App> AppLoop<A> {
             self.list.push_text(
                 nid,
                 ui_core::draw::TextPrim {
-                    block: std::rc::Rc::new(style.shortcut_block(shortcut)),
+                    block: std::sync::Arc::new(style.shortcut_block(shortcut)),
                     origin: ui_core::geom::Point::new(slot.origin.x, chord_y),
                     max_width: f32::INFINITY,
                     layout: None,

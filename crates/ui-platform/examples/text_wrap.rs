@@ -33,7 +33,7 @@ fn text(
         shapes: Vec::new(),
         data: NodeData::Text {
             ink: color,
-            block: std::rc::Rc::new(ui_core::TextBlock {
+            block: std::sync::Arc::new(ui_core::TextBlock {
                 runs: vec![ui_core::TextRun::new(body, ui_core::TextStyle::new(size))],
                 align: ui_core::TextAlign::Start,
                 max_lines,
@@ -119,7 +119,7 @@ impl App for Demo {
                         Color::from_rgba8(180, 255, 200, 255),
                     );
                     if let NodeData::Text { block, .. } = &mut d.data {
-                        let block = std::rc::Rc::make_mut(block);
+                        let block = std::sync::Arc::make_mut(block);
                         block.align = ui_core::TextAlign::Center;
                     }
                     d
@@ -134,7 +134,7 @@ impl App for Demo {
                         Color::from_rgba8(200, 220, 255, 255),
                     );
                     if let NodeData::Text { block, .. } = &mut d.data {
-                        let block = std::rc::Rc::make_mut(block);
+                        let block = std::sync::Arc::make_mut(block);
                         block.align = ui_core::TextAlign::End;
                     }
                     d
@@ -148,7 +148,7 @@ impl App for Demo {
 fn rich() -> Decl {
     let mut d = text("rich", "", 15.0, 300.0, None, Color::WHITE);
     if let NodeData::Text { block, .. } = &mut d.data {
-        let block = std::rc::Rc::make_mut(block);
+        let block = std::sync::Arc::make_mut(block);
         block.runs = vec![
             ui_core::TextRun::new("Rich ", ui_core::TextStyle::new(20.0)),
             ui_core::TextRun::new(

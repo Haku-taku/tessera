@@ -21,7 +21,7 @@ fn text_decl(id: &'static str, text: &str, size: f32, color: Color) -> Decl {
         shapes: Vec::new(),
         data: NodeData::Text {
             ink: color,
-            block: std::rc::Rc::new(ui_core::TextBlock {
+            block: std::sync::Arc::new(ui_core::TextBlock {
                 runs: vec![ui_core::TextRun::new(text, ui_core::TextStyle::new(size))],
                 align: ui_core::TextAlign::Start,
                 max_lines: None,

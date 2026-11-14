@@ -643,7 +643,7 @@ impl Markdown {
             if let NodeData::Text { block, .. } = &mut view.data {
                 // The bytes stand where the stand-in does: a number ends at its dot in both
                 // forms, and the leading matches the body's own first line.
-                let block = std::rc::Rc::make_mut(block);
+                let block = std::sync::Arc::make_mut(block);
                 block.align = cell_align(cell.look);
                 block.line_gap = self.size * LINE_GAP_RATIO;
             }
@@ -684,7 +684,7 @@ impl Markdown {
             });
         decl.data = NodeData::Text {
             ink: self.muted,
-            block: std::rc::Rc::new(block),
+            block: std::sync::Arc::new(block),
             caret: None,
             selection: None,
             composing: None,
@@ -933,7 +933,7 @@ impl Markdown {
                     run.visibility = Visibility::Hidden;
                     decl.data = NodeData::Text {
                         ink: Color::TRANSPARENT,
-                        block: std::rc::Rc::new(TextBlock {
+                        block: std::sync::Arc::new(TextBlock {
                             runs: vec![run],
                             input_base: Some(row.span.start),
                             ..Default::default()
@@ -1168,7 +1168,7 @@ impl Markdown {
             cx,
         );
         if let NodeData::Text { block, .. } = &mut decl.data {
-            let block = std::rc::Rc::make_mut(block);
+            let block = std::sync::Arc::make_mut(block);
             block.line_gap = self.size * LINE_GAP_RATIO;
             // The body column: what a wrapped line clears, and where a row whose cells spell
             // no byte at all starts, since no run or atom carries their room.
@@ -1344,7 +1344,7 @@ impl Markdown {
         }
         text.data = NodeData::Text {
             ink,
-            block: std::rc::Rc::new(TextBlock {
+            block: std::sync::Arc::new(TextBlock {
                 runs,
                 atoms,
                 input_base: base.filter(|_| self.editable),
@@ -2039,7 +2039,7 @@ impl Markdown {
         // caret or selection of the document's.
         text.data = NodeData::Text {
             ink: self.muted,
-            block: std::rc::Rc::new(TextBlock {
+            block: std::sync::Arc::new(TextBlock {
                 runs,
                 indent,
                 hanging: indent,
@@ -2701,7 +2701,7 @@ impl Markdown {
             if self.editable {
                 decl.data = NodeData::Text {
                     ink: Color::TRANSPARENT,
-                    block: std::rc::Rc::new(TextBlock {
+                    block: std::sync::Arc::new(TextBlock {
                         runs: vec![run],
                         input_base: Some(start),
                         ..Default::default()
@@ -2778,7 +2778,7 @@ impl Markdown {
             run.visibility = Visibility::Hidden;
             decl.data = NodeData::Text {
                 ink: Color::TRANSPARENT,
-                block: std::rc::Rc::new(TextBlock {
+                block: std::sync::Arc::new(TextBlock {
                     runs: vec![run],
                     input_base: Some(source.start),
                     ..Default::default()
@@ -3094,7 +3094,7 @@ impl Markdown {
         }
         decl.data = NodeData::Text {
             ink: self.ink,
-            block: std::rc::Rc::new(TextBlock {
+            block: std::sync::Arc::new(TextBlock {
                 input_base: self.editable.then_some(base),
                 ..text
             }),
@@ -3420,7 +3420,7 @@ fn local_prefixes(
 /// A text frame carrying the members of a block value its lines share.
 fn with_structures(mut decl: Decl, structures: Vec<ui_core::text::Structure>) -> Decl {
     if let ui_core::NodeData::Text { block, .. } = &mut decl.data {
-        std::rc::Rc::make_mut(block).structures = structures;
+        std::sync::Arc::make_mut(block).structures = structures;
     }
     decl
 }

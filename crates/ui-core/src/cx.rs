@@ -354,7 +354,7 @@ impl<'a> Cx<'a> {
         &self,
         block: &crate::text::TextBlock,
         max_width: f32,
-    ) -> Option<Rc<crate::text::InlineLayout>> {
+    ) -> Option<std::sync::Arc<crate::text::InlineLayout>> {
         let measure = self.measure.as_ref()?;
         let mut measure = measure.try_borrow_mut().ok()?;
         Some(measure.layout(block, max_width))

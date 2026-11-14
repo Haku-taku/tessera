@@ -552,7 +552,7 @@ impl App for ScrolledText {
         });
         view.data = ui_core::NodeData::Text {
             ink: geom::Color::WHITE,
-            block: std::rc::Rc::new(ui_core::TextBlock {
+            block: std::sync::Arc::new(ui_core::TextBlock {
                 runs: vec![ui_core::TextRun::new(
                     self.text.as_str(),
                     ui_core::TextStyle::new(18.0),
@@ -820,7 +820,7 @@ fn tall_paragraph(index: usize) -> Decl {
         shapes: Vec::new(),
         data: NodeData::Text {
             ink: geom::Color::BLACK,
-            block: std::rc::Rc::new(TextBlock {
+            block: std::sync::Arc::new(TextBlock {
                 runs: vec![TextRun::new(
                     format!("row {index} of a column taller than its viewport"),
                     TextStyle::new(14.0),

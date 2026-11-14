@@ -30,7 +30,7 @@ pub trait TextMeasure {
         &mut self,
         block: &crate::text::TextBlock,
         max_width: f32,
-    ) -> std::rc::Rc<crate::text::InlineLayout>;
+    ) -> std::sync::Arc<crate::text::InlineLayout>;
 
     /// Size of `block` wrapped at `max_width`, honouring its own `max_lines`.
     ///
@@ -74,7 +74,7 @@ impl TextMeasure for Box<dyn TextMeasure> {
         &mut self,
         block: &crate::text::TextBlock,
         max_width: f32,
-    ) -> std::rc::Rc<crate::text::InlineLayout> {
+    ) -> std::sync::Arc<crate::text::InlineLayout> {
         (**self).layout(block, max_width)
     }
 
@@ -88,14 +88,14 @@ impl TextMeasure for MonospaceMeasure {
         &mut self,
         block: &crate::text::TextBlock,
         max_width: f32,
-    ) -> std::rc::Rc<crate::text::InlineLayout> {
+    ) -> std::sync::Arc<crate::text::InlineLayout> {
         use crate::text::{AtomBox, InlineAtom, InlineLayout, InlineLine};
         let (text, spans) = block.flatten();
         if spans.is_empty() {
             let line_h = crate::text::TextStyle::default().size * self.line_height;
             // No bidi algorithm lives in this portable fallback, so the block reads
             // left-to-right here; the real measurer sets the paragraph's own direction.
-            return std::rc::Rc::new(InlineLayout {
+            return std::sync::Arc::new(InlineLayout {
                 rtl: false,
                 lines: vec![InlineLine {
                     range: 0..0,
@@ -263,7 +263,7 @@ impl TextMeasure for MonospaceMeasure {
         }
         let height = (y - block.line_gap).max(0.0);
         let baseline = lines.first().map_or(0.0, |l| l.baseline);
-        std::rc::Rc::new(InlineLayout {
+        std::sync::Arc::new(InlineLayout {
             rtl: false,
             width: lines.iter().enumerate().fold(0.0f32, |acc, (index, line)| {
                 acc.max(line.width + edges.at(index))
@@ -1464,7 +1464,7 @@ impl<M: TextMeasure> BuiltinLayout<M> {
                         held = true;
                         if let Some(n) = tree.get_mut(nid)
                             && let NodeData::Text { block, .. } = &mut n.data
-                            && let Some(atom) = std::rc::Rc::make_mut(block).atoms.get_mut(index)
+                            && let Some(atom) = std::sync::Arc::make_mut(block).atoms.get_mut(index)
                         {
                             atom.size = res.size;
                             // A container reports no baseline; CSS gives it its bottom edge.

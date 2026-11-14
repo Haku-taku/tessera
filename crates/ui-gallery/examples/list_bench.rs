@@ -40,7 +40,7 @@ fn row(i: usize, y: f32) -> Decl {
             shapes: Vec::new(),
             data: NodeData::Text {
                 ink: Color::from_rgba8(220, 220, 226, 255),
-                block: std::rc::Rc::new(TextBlock {
+                block: std::sync::Arc::new(TextBlock {
                     runs: vec![TextRun::new(format!("item {i}"), TextStyle::new(13.0))],
                     align: TextAlign::Start,
                     max_lines: None,

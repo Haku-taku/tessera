@@ -74,9 +74,10 @@ fn windows_main() -> Result<(), String> {
     let hwnd = session.window().hwnd();
 
     // Draw until the first frame lands; its client size is what every delta below is from.
+    // `tick` waits for its own frame, so the turns below start with the frame window open.
     let mut drew = false;
     for _ in 0..20 {
-        drew |= session.step()?.drew;
+        drew |= session.tick()?.drew;
         if drew {
             break;
         }

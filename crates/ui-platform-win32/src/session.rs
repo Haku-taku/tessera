@@ -1,6 +1,6 @@
-//! One engine-owned surface on Windows: window, presenter, driver and teardown order.
+//! One engine-owned surface on Windows: window, render thread, driver and teardown order.
 
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ui_core::Damage;
@@ -10,35 +10,63 @@ use ui_platform::driver::{Driver, FrameHost as _, Turn};
 use ui_platform::present::{CanvasFrame, PresentStats, SceneTarget};
 use ui_platform::session::{HostSession, SessionOptions, Tick};
 use ui_platform::text_pass::TextPass;
-use ui_platform::view::{App, AppLoop};
+use ui_platform::view::{App, AppLoop, SceneFrameOutcome};
 
 use crate::frame_pace::FramePace;
-use crate::presenter::Win32Presenter;
+use crate::presenter::AtlasUpdate;
+use crate::render::{FramePacket, RenderThread};
 use crate::window::Win32Window;
 
-/// Window, presenter and driver, owned together so an app never orders them itself.
+/// Window, render thread and driver, owned together so an app never orders them itself.
 ///
-/// Dropped in declaration order, which is the order teardown needs: the presenter's GPU
-/// objects while the window still exists, then the loop, then the window.
+/// The frame's GPU work happens on [`RenderThread`]; this type is what a host holds, and
+/// every call on it stays on the host's own thread.
 pub struct Session<A: App> {
-    /// Absent only while a lost device is being replaced; no returned call observes it.
-    presenter: Option<Win32Presenter>,
+    /// The device, chain and presents; stopped before the window goes, in `Drop`.
+    render: RenderThread,
     driver: Driver,
     lp: AppLoop<A>,
     win: Win32Window,
-    /// The compositor's frame window, shared with the presenter, the window and the host's
-    /// wait set. The handle inside it belongs to the chain, so it is never closed here.
-    pace: Rc<FramePace>,
+    /// The surface's frame event, shared with the window and the host's wait set.
+    pace: Arc<FramePace>,
+    /// The atlas versions the render thread has been sent, so a frame carries only what
+    /// changed and a rebuilt device is given everything again.
+    atlases: Atlases,
     /// Scripted pointer for the next frame; see [`set_pointer`](Self::set_pointer).
     pointer: Option<Point>,
     /// The app asked for this surface to close.
     closed: bool,
-    /// Supersampling the app asked for, which a rebuilt renderer starts with again.
+    /// Supersampling the app asked for, sent on to a renderer rebuilt later.
     supersample: u32,
 }
 
+/// The two atlas pages' versions, as last handed to the render thread.
+///
+/// The text starts at the presenter's own `u64::MAX`: a fresh renderer holds no glyphs, so
+/// it is owed the first frame's page whatever version that frame reports.
+struct Atlases {
+    text: u64,
+    color: u64,
+}
+
+impl Atlases {
+    /// Nothing sent yet: a render thread that just opened a chain.
+    fn fresh() -> Self {
+        Self {
+            text: u64::MAX,
+            color: 0,
+        }
+    }
+
+    /// Nothing holds these bytes any more, so the next frame carries both pages.
+    fn forget(&mut self) {
+        self.text = u64::MAX;
+        self.color = u64::MAX;
+    }
+}
+
 impl<A: App> Session<A> {
-    /// Open the window, build the D3D11 device and start the loop the caller owns.
+    /// Open the window, start the render thread and build the loop the caller owns.
     pub fn open(lp: AppLoop<A>, opts: SessionOptions) -> Result<Self, String> {
         if opts.cpu_presenter {
             return Err(String::from(
@@ -49,16 +77,23 @@ impl<A: App> Session<A> {
             .map_err(|error| format!("cannot open a Win32 window: {error}"))?;
         // This loop pumps frames inside the system's move loop, so it must start the move.
         win.defer_system_move();
-        let pace = Rc::new(FramePace::new());
-        let presenter =
-            Win32Presenter::open(&win, Rc::clone(&pace)).map_err(|error| error.to_string())?;
-        win.set_frame_pace(Rc::clone(&pace));
+        let pace = Arc::new(FramePace::new());
+        let render = RenderThread::open(
+            win.visual_hwnd(),
+            win.client_size(),
+            win.composited(),
+            opts.uncapped,
+            Arc::clone(&pace),
+        )
+        .map_err(|error| format!("the D3D11 renderer could not start: {error}"))?;
+        win.set_frame_pace(Arc::clone(&pace));
         Ok(Self {
-            presenter: Some(presenter),
+            render,
             driver: Driver::new().uncapped(opts.uncapped),
             lp,
             win,
             pace,
+            atlases: Atlases::fresh(),
             pointer: None,
             closed: false,
             supersample: 1,
@@ -82,33 +117,13 @@ impl<A: App> Session<A> {
     }
 
     /// This surface's frame window, for the host's process-wide wait set.
-    pub(crate) fn frame_pace(&self) -> Rc<FramePace> {
-        Rc::clone(&self.pace)
+    pub(crate) fn frame_pace(&self) -> Arc<FramePace> {
+        Arc::clone(&self.pace)
     }
 
     /// Physical pixels per logical unit.
     pub fn scale(&self) -> f32 {
         self.win.scale()
-    }
-
-    /// The scene renderer behind the swap chain, for knobs such as supersampling.
-    ///
-    /// `None` only while a lost device is being replaced, which no call in between can see.
-    pub fn renderer_mut(&mut self) -> Option<&mut ui_gpu_scene::GpuRenderer> {
-        self.presenter
-            .as_mut()
-            .map(|presenter| presenter.renderer_mut())
-    }
-
-    /// All three at once, for host code that needs the engine and the window together.
-    pub fn split(
-        &mut self,
-    ) -> (
-        &mut AppLoop<A>,
-        &mut Win32Window,
-        Option<&mut Win32Presenter>,
-    ) {
-        (&mut self.lp, &mut self.win, self.presenter.as_mut())
     }
 
     /// The renderer in use, for the app's own report.
@@ -145,25 +160,18 @@ impl<A: App> Session<A> {
 
     /// Frames presented since the last call: the rate the compositor actually took.
     pub fn take_frame_callbacks(&mut self) -> u32 {
-        self.presenter
-            .as_mut()
-            .map_or(0, Win32Presenter::take_presented)
+        self.render.take_presented()
     }
 
-    /// Write the last composited frame as a PPM.
+    /// Write the last presented frame as a PPM.
     pub fn dump_frame_ppm(&mut self, path: &std::path::Path) -> Result<(), String> {
-        let presenter = self
-            .presenter
-            .as_mut()
-            .ok_or("the surface has no presenter to read back from")?;
-        presenter.dump_frame_ppm(path)
+        self.render.dump_frame_ppm(path.to_path_buf())
     }
 
-    /// Drain the GPU; how long this takes is the backlog teardown would otherwise inherit.
+    /// Drain the GPU and stop the render thread; how long this takes is the backlog that
+    /// teardown would otherwise inherit. A no-op after the first call.
     pub fn finish(&mut self) {
-        if let Some(presenter) = &mut self.presenter {
-            presenter.finish();
-        }
+        self.render.finish();
     }
 
     /// One non-blocking turn: take the thread's messages, then draw if a frame is due.
@@ -175,6 +183,7 @@ impl<A: App> Session<A> {
         if self.finished() {
             return Ok(Tick::default());
         }
+        self.check_render()?;
         if self.win.take_move_request() {
             self.run_native_move();
         }
@@ -187,9 +196,9 @@ impl<A: App> Session<A> {
 
     /// When the loop must wake with nothing arriving: the engine's own deadlines.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        // A frame the compositor has not opened a window for is not a deadline of ours:
-        // the frame-latency waitable wakes the host. Saying "now" here would spin the loop
-        // through a zero-length sleep for the whole of a long frame.
+        // A frame the render thread has not finished is not a deadline of ours: its event
+        // wakes the host. Saying "now" here would spin the loop through a zero-length sleep
+        // for the whole of a long frame.
         if !self.win.can_draw() {
             return self.driver.deadline();
         }
@@ -210,6 +219,7 @@ impl<A: App> Session<A> {
         if self.finished() {
             return Ok(Tick::default());
         }
+        self.check_render()?;
         let turn = self.driver.step(&mut self.lp, &mut self.win);
         if self.win.take_move_request() {
             self.run_native_move();
@@ -223,41 +233,28 @@ impl<A: App> Session<A> {
         Ok(tick)
     }
 
-    fn draw(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
-        let failed = match self.draw_frame(pointer) {
-            Ok(tick) => return Ok(tick),
-            Err(failed) => failed,
-        };
-        // A driver update or a lost adapter takes the device and chain with it; the surface
-        // rebuilds them and draws again rather than closing the window.
-        let Some(reason) = self
-            .presenter
-            .as_ref()
-            .and_then(Win32Presenter::device_loss)
-        else {
-            return Err(failed);
-        };
-        self.rebuild_presenter(&reason)?;
-        self.draw_frame(pointer)
-            .map_err(|error| format!("{failed}; rebuilt the device ({reason}): {error}"))
+    /// Report what the render thread refused, if anything, before a turn tries to draw.
+    fn check_render(&self) -> Result<(), String> {
+        if self.render.stopped() {
+            return Err(self
+                .render
+                .error()
+                .unwrap_or_else(|| String::from("the surface's render thread ended")));
+        }
+        match self.render.error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
-    /// Replace the device and swap chain with a fresh stack.
-    ///
-    /// Two things ask for it: a device DXGI no longer answers for, and a display change that
-    /// can leave the chain in a colour space its new output does not present.
-    fn rebuild_presenter(&mut self, reason: &str) -> Result<(), String> {
-        // A window holds one flip chain at a time, so the old stack goes before the new one
-        // is built; this is the only moment the surface has no presenter.
-        self.presenter = None;
-        let mut presenter = Win32Presenter::open(&self.win, Rc::clone(&self.pace)).map_err(
-            |error| format!("the presenter could not be rebuilt after {reason}: {error}"),
-        )?;
-        presenter.renderer_mut().set_supersample(self.supersample);
-        self.presenter = Some(presenter);
-        // The new chain holds no frame: the compositor's window for it is open already.
-        self.pace.opened();
-        Ok(())
+    fn draw(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
+        let tick = self.draw_frame(pointer)?;
+        // The render thread presents asynchronously: a refused frame is reported here, one
+        // turn late, rather than closing the window from a driver error nobody can see.
+        match self.render.error() {
+            Some(error) => Err(error),
+            None => Ok(tick),
+        }
     }
 
     fn draw_frame(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
@@ -271,32 +268,32 @@ impl<A: App> Session<A> {
         Ok(tick)
     }
 
-    /// Build, layout, paint and present one frame; no drag is started here.
+    /// Build, layout, paint and hand one frame to the render thread; no drag starts here.
     fn present_frame(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
         // A scripted pointer wins over the window's, which the driver just read.
         let pointer = self.pointer.take().or(pointer);
-        let size = self.win.client_size();
-        if size.0 == 0 || size.1 == 0 {
+        if self.win.client_size().0 == 0 || self.win.client_size().1 == 0 {
             // Minimized: there is no client area to draw into, and the turn ends in a wait.
             return Ok(Tick::default());
         }
         if self.win.take_display_change() {
-            self.rebuild_presenter("the display changed")?;
+            // Resolution, a monitor or its HDR state changed: the chain's format and colour
+            // space were decided from the old output, so the render thread opens a new one.
+            self.render
+                .rebuild(String::from("the display changed"));
         }
-        let presenter = self
-            .presenter
-            .as_mut()
-            .ok_or("the surface has no presenter")?;
-        presenter
-            .resize(size, self.win.scale())
-            .map_err(|error| error.to_string())?;
-        let framed = {
-            let mut target = Target {
-                win: &mut self.win,
-                presenter,
-            };
-            self.lp.frame_scene(&mut target, pointer)?
-        };
+        if self.render.take_atlas_request() {
+            self.atlases.forget();
+        }
+        let Session {
+            lp,
+            win,
+            render,
+            pace,
+            atlases,
+            ..
+        } = self;
+        let framed = present_once(lp, win, render, pace, atlases, pointer)?;
         // A close the build asked for takes effect in this turn, not the next one.
         self.closed |= self.lp.take_close();
         // A build may ask to move the pointer, which only the window can do.
@@ -329,7 +326,9 @@ impl<A: App> Session<A> {
         let Session {
             lp,
             win,
-            presenter,
+            render,
+            pace,
+            atlases,
             closed,
             ..
         } = self;
@@ -338,9 +337,6 @@ impl<A: App> Session<A> {
             if queue.is_empty() && !lp.is_animating() {
                 return;
             }
-            let Some(presenter) = presenter.as_mut() else {
-                return;
-            };
             // The drag the app is carrying may itself be over one of its targets.
             for event in queue.take() {
                 lp.dispatch(event);
@@ -349,19 +345,10 @@ impl<A: App> Session<A> {
             if size.0 == 0 || size.1 == 0 {
                 return;
             }
-            if presenter.resize(size, win.scale()).is_err() {
-                return;
-            }
             let pointer = win.pointer();
-            {
-                let mut target = Target {
-                    win: &mut *win,
-                    presenter: &mut *presenter,
-                };
-                // A failed frame during a drag is not worth ending the surface for: the
-                // next turn reports it the ordinary way.
-                let _ = lp.frame_scene(&mut target, pointer);
-            }
+            // A failed frame during a drag is not worth ending the surface for: the next
+            // turn reports it the ordinary way.
+            let _ = present_once(lp, win, render, pace, atlases, pointer);
             *closed |= lp.take_close();
             for (dx, dy) in lp.take_pointer_steps() {
                 win.nudge_pointer(dx, dy);
@@ -391,7 +378,9 @@ impl<A: App> Session<A> {
         let Session {
             lp,
             win,
-            presenter,
+            render,
+            pace,
+            atlases,
             closed,
             ..
         } = self;
@@ -399,24 +388,12 @@ impl<A: App> Session<A> {
             if !lp.is_animating() {
                 return;
             }
-            let Some(presenter) = presenter.as_mut() else {
-                return;
-            };
             let size = win.client_size();
             if size.0 == 0 || size.1 == 0 {
                 return;
             }
-            if presenter.resize(size, win.scale()).is_err() {
-                return;
-            }
             let pointer = win.pointer();
-            {
-                let mut target = Target {
-                    win: &mut *win,
-                    presenter: &mut *presenter,
-                };
-                let _ = lp.frame_scene(&mut target, pointer);
-            }
+            let _ = present_once(lp, win, render, pace, atlases, pointer);
             *closed |= lp.take_close();
             for (dx, dy) in lp.take_pointer_steps() {
                 win.nudge_pointer(dx, dy);
@@ -431,6 +408,41 @@ impl<A: App> Session<A> {
             lp.request_frame();
         }
     }
+}
+
+impl<A: App> Drop for Session<A> {
+    fn drop(&mut self) {
+        // The chain belongs to the render thread and the window to this type: the thread
+        // must let go of the chain before the window it presents through is destroyed.
+        self.finish();
+    }
+}
+
+/// Build one frame and hand it to the render thread.
+///
+/// The sink behind the target packages what the renderer needs; the text pass stays here,
+/// because it belongs to the loop, and only the atlas bytes it changed cross over.
+fn present_once<A: App>(
+    lp: &mut AppLoop<A>,
+    win: &mut Win32Window,
+    render: &RenderThread,
+    pace: &Arc<FramePace>,
+    atlases: &mut Atlases,
+    pointer: Option<Point>,
+) -> Result<SceneFrameOutcome, String> {
+    let size = win.client_size();
+    let scale = win.scale();
+    let mut target = Target {
+        win,
+        sink: Sink {
+            render,
+            pace,
+            atlases,
+            size,
+            scale,
+        },
+    };
+    lp.frame_scene(&mut target, pointer)
 }
 
 /// The Win32 answer to the surface an app is written against; see [`HostSession`].
@@ -510,9 +522,7 @@ impl<A: App> HostSession<A> for Session<A> {
 
     fn set_supersample(&mut self, factor: u32) {
         self.supersample = factor;
-        if let Some(presenter) = &mut self.presenter {
-            presenter.renderer_mut().set_supersample(factor);
-        }
+        self.render.set_supersample(factor);
     }
 
     fn frame_callbacks(&mut self) -> u32 {
@@ -562,16 +572,71 @@ fn process_cpu_seconds() -> Option<f64> {
     Some((ticks(kernel) + ticks(user)) as f64 / 1e7)
 }
 
-/// The presenter and the window as one scene target: the frame goes to the swap chain, and
-/// what is window state rather than pixel state — the pointer shape — reaches the window.
+/// The frame work that stays on the loop's thread, as the engine's scene target.
+///
+/// A frame is packaged and handed over here; the window learns what is window state rather
+/// than pixel state — the pointer shape, the input region, the input method.
 struct Target<'a> {
     win: &'a mut Win32Window,
-    presenter: &'a mut Win32Presenter,
+    sink: Sink<'a>,
+}
+
+/// What the render thread is handed: the packet's source and the version bookkeeping.
+struct Sink<'a> {
+    render: &'a RenderThread,
+    pace: &'a Arc<FramePace>,
+    atlases: &'a mut Atlases,
+    size: (u32, u32),
+    scale: f32,
+}
+
+impl Sink<'_> {
+    fn packet(
+        &mut self,
+        scene: &DrawList,
+        text: &TextPass,
+        damage: &Damage,
+        canvases: &[CanvasFrame],
+    ) -> FramePacket {
+        let mut packet = FramePacket {
+            scene: scene.clone(),
+            damage: damage.clone(),
+            canvases: canvases.to_vec(),
+            atlas: None,
+            color_atlas: None,
+            size: self.size,
+            scale: self.scale,
+        };
+        if text.version() != self.atlases.text {
+            self.atlases.text = text.version();
+            let (width, height) = text.dimensions();
+            packet.atlas = Some(AtlasUpdate {
+                version: text.version(),
+                width,
+                height,
+                data: text.atlas().to_vec(),
+            });
+        }
+        // The colour page is tracked separately: a new text glyph must not re-upload it.
+        if text.color_version() != self.atlases.color {
+            self.atlases.color = text.color_version();
+            if !text.color_atlas().is_empty() {
+                let (width, height) = text.color_dimensions();
+                packet.color_atlas = Some(AtlasUpdate {
+                    version: text.color_version(),
+                    width,
+                    height,
+                    data: text.color_atlas().to_vec(),
+                });
+            }
+        }
+        packet
+    }
 }
 
 impl SceneTarget for Target<'_> {
     fn size(&self) -> (u32, u32) {
-        self.presenter.size()
+        self.sink.size
     }
 
     fn present_scene(
@@ -581,7 +646,17 @@ impl SceneTarget for Target<'_> {
         damage: &Damage,
         canvases: &[CanvasFrame],
     ) -> Result<PresentStats, String> {
-        self.presenter.present_scene(scene, text, damage, canvases)
+        let packet = self.sink.packet(scene, text, damage, canvases);
+        // Close the gate before the packet can be finished with: the render thread may
+        // signal the moment it has the frame, and a gate closed afterwards would never open.
+        self.sink.pace.presented();
+        if let Err(error) = self.sink.render.send_frame(packet) {
+            self.sink.pace.release();
+            return Err(error);
+        }
+        // The last frame's counts: presentation is the render thread's now, and these feed
+        // diagnostics only.
+        Ok(self.sink.render.stats())
     }
 
     fn set_cursor(&mut self, shape: ui_core::CursorShape) {

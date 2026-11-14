@@ -672,7 +672,7 @@ mod layout {
         decl.size_class.width = crate::layout::AxisSize::fixed(100.0);
         if let crate::NodeData::Text { block, nowrap, .. } = &mut decl.data {
             *nowrap = true;
-            std::rc::Rc::make_mut(block).align = crate::TextAlign::End;
+            std::sync::Arc::make_mut(block).align = crate::TextAlign::End;
         }
         let mut tree = Tree::new();
         tree.apply(&Decl::container(Id::str("root"), NodeKind::Column).child(decl));
@@ -730,7 +730,7 @@ mod layout {
             shapes: Vec::new(),
             data: crate::NodeData::Text {
                 ink: crate::geom::Color::WHITE,
-                block: std::rc::Rc::new(block),
+                block: std::sync::Arc::new(block),
                 caret: None,
                 selection: None,
                 composing: None,
@@ -859,7 +859,7 @@ mod layout {
             shapes: Vec::new(),
             data: NodeData::Text {
                 ink: crate::geom::Color::WHITE,
-                block: std::rc::Rc::new(crate::text::TextBlock {
+                block: std::sync::Arc::new(crate::text::TextBlock {
                     runs: vec![crate::text::TextRun::new(
                         body,
                         crate::text::TextStyle::new(size),
@@ -1757,7 +1757,7 @@ mod layout {
         let mut tree = Tree::new();
         let mut math = Decl::container(Id::str("math"), NodeKind::Math);
         math.data = crate::NodeData::Math {
-            formula: std::rc::Rc::new(crate::math::Formula {
+            formula: std::sync::Arc::new(crate::math::Formula {
                 width: 80.0,
                 ascent: 12.0,
                 descent: 4.0,

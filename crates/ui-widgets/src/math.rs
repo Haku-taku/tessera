@@ -267,7 +267,7 @@ impl Math {
     fn formula_decl(&self, id: Id, formula: ui_core::Formula, family: String) -> Decl {
         let mut decl = Decl::container(id, NodeKind::Math);
         decl.data = NodeData::Math {
-            formula: std::rc::Rc::new(formula),
+            formula: std::sync::Arc::new(formula),
             family: family.into(),
             ink: self.ink,
         };

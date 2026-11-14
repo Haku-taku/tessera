@@ -159,9 +159,9 @@ pub struct Win32Window {
     /// The surface reaches the desktop through a compositor, so the frame's own alpha
     /// decides what is seen: a layer, not a decorated window.
     composited: bool,
-    /// The presenter's frame window, set once the swap chain exists. Absent for a window
-    /// without one, which is always drawable and paces on `DwmFlush`.
-    pace: Option<Rc<crate::frame_pace::FramePace>>,
+    /// The surface's frame window, set once its session exists. Absent for a window a
+    /// caller drives directly, which is always drawable and paces on `DwmFlush`.
+    pace: Option<std::sync::Arc<crate::frame_pace::FramePace>>,
 }
 
 impl Win32Window {
@@ -489,20 +489,19 @@ impl Win32Window {
         let _ = self.wait_until(None);
     }
 
-    /// Adopt the frame window of the swap chain this window presents through.
+    /// Adopt the frame window of the surface this window presents through.
     ///
-    /// The presenter calls this as it opens or rebuilds its chain; the handle itself is the
-    /// chain's, so replacing it here never closes the previous one.
-    pub(crate) fn set_frame_pace(&mut self, pace: Rc<crate::frame_pace::FramePace>) {
+    /// The session sets this once its render thread has a chain; the event belongs to the
+    /// pace, so replacing it here never closes the previous one.
+    pub(crate) fn set_frame_pace(&mut self, pace: std::sync::Arc<crate::frame_pace::FramePace>) {
         self.pace = Some(pace);
     }
 
     /// Wait for the desktop compositor to take the next frame.
     ///
-    /// With a frame-latency waitable this is the compositor's own window, and the wait
-    /// also ends on input: a resize or a title-bar drag is dispatched by the loop's next
-    /// turn instead of waiting behind the frame in flight. A chain without one falls back
-    /// to `DwmFlush`, which waits for composition without any input in between.
+    /// The signal is the render thread's, and it arrives when that thread has finished the
+    /// frame it took; the wait also ends on input, so a resize or a title-bar drag is
+    /// dispatched by the loop's next turn instead of waiting behind the frame in flight.
     pub fn wait_for_frame(&mut self) {
         let Some(pace) = self.pace.as_ref() else {
             wait_for_composition();
@@ -516,9 +515,8 @@ impl Win32Window {
         while !pace.can_draw() {
             let now = Instant::now();
             if now >= deadline {
-                // A compositor that never answers must not deadlock the app; the next
-                // present either works or reports its own failure.
-                pace.opened();
+                // A render thread that never answers must not deadlock the app; the next
+                // turn either draws or reports the thread's own failure.
                 return;
             }
             let millis = bounded_millis(Some(deadline - now));
@@ -526,8 +524,7 @@ impl Win32Window {
                 MsgWaitForMultipleObjectsEx(Some(&[handle]), millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
             };
             if result == WAIT_OBJECT_0 {
-                // The wait consumed the auto-reset object: this is the window.
-                pace.opened();
+                // The wait consumed the auto-reset object: the frame is finished.
                 return;
             }
             if result.0 == WAIT_OBJECT_0.0 + 1 {

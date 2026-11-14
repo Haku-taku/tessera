@@ -50,7 +50,7 @@ fn text_node(tag: &'static str, block: TextBlock, width: f32) -> Decl {
     let mut decl = Decl::container(id, NodeKind::Text);
     decl.data = ui_core::NodeData::Text {
         ink: Color::from_rgba8(228, 232, 240, 255),
-        block: std::rc::Rc::new(block),
+        block: std::sync::Arc::new(block),
         caret: None,
         selection: None,
         composing: None,
@@ -74,7 +74,7 @@ fn hug_text(tag: &'static str, body: &str, size: f32) -> Decl {
     );
     decl.data = ui_core::NodeData::Text {
         ink: Color::from_rgba8(228, 232, 240, 255),
-        block: std::rc::Rc::new(TextBlock::plain(body, TextStyle::new(size))),
+        block: std::sync::Arc::new(TextBlock::plain(body, TextStyle::new(size))),
         caret: None,
         selection: None,
         composing: None,
@@ -129,7 +129,7 @@ fn deco_sample() -> Decl {
     let mut decl = Decl::container(Id::of(("inline-deco", Page::Inline.tag())), NodeKind::Text);
     decl.data = ui_core::NodeData::Text {
         ink: Color::from_rgba8(228, 232, 240, 255),
-        block: std::rc::Rc::new(block),
+        block: std::sync::Arc::new(block),
         caret: None,
         selection: None,
         composing: None,
@@ -175,7 +175,7 @@ fn holder_sample() -> Decl {
     );
     decl.data = ui_core::NodeData::Text {
         ink: Color::from_rgba8(228, 232, 240, 255),
-        block: std::rc::Rc::new(block),
+        block: std::sync::Arc::new(block),
         caret: None,
         selection: None,
         composing: None,
@@ -221,7 +221,7 @@ fn justify_sample() -> Decl {
     );
     decl.data = ui_core::NodeData::Text {
         ink: Color::from_rgba8(228, 232, 240, 255),
-        block: std::rc::Rc::new(block),
+        block: std::sync::Arc::new(block),
         caret: None,
         selection: None,
         composing: None,

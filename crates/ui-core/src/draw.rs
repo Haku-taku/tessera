@@ -774,15 +774,19 @@ impl Transform {
 }
 
 /// One run of text.
+///
+/// The block and its layout are shared with the tree that declared them, so they are reached
+/// through `Arc`: a draw list is the frame contract, and a presenter may draw it on a thread
+/// of its own.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextPrim {
     /// Styled runs plus paragraph properties; rich text adds runs here.
-    pub block: std::rc::Rc<crate::text::TextBlock>,
+    pub block: std::sync::Arc<crate::text::TextBlock>,
     pub origin: crate::geom::Point,
     /// Wrap width in logical units; `f32::INFINITY` means one line.
     pub max_width: f32,
     /// The lines layout wrapped this block into; `None` makes the painter wrap it itself.
-    pub layout: Option<std::rc::Rc<crate::text::InlineLayout>>,
+    pub layout: Option<std::sync::Arc<crate::text::InlineLayout>>,
     /// The node's own box height; `0.0` when the caller does not know it.
     ///
     /// A symbol is centred by its ink inside this box; text ignores it.
@@ -811,11 +815,11 @@ impl TextPrim {
     /// Equality with a pointer fast path: a frame that rebuilt nothing hands over the same
     /// paragraph, and comparing its runs byte by byte is the cost this sharing exists to save.
     pub fn same_as(&self, other: &Self) -> bool {
-        (std::rc::Rc::ptr_eq(&self.block, &other.block) || self.block == other.block)
+        (std::sync::Arc::ptr_eq(&self.block, &other.block) || self.block == other.block)
             && self.origin == other.origin
             && self.max_width == other.max_width
             && match (&self.layout, &other.layout) {
-                (Some(a), Some(b)) => std::rc::Rc::ptr_eq(a, b) || a == b,
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b) || a == b,
                 (a, b) => a == b,
             }
             && self.height == other.height
@@ -831,9 +835,9 @@ impl TextPrim {
 /// A laid-out formula, waiting for the text pass to rasterize its glyphs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MathPrim {
-    pub formula: std::rc::Rc<crate::math::Formula>,
+    pub formula: std::sync::Arc<crate::math::Formula>,
     /// The face the formula's glyph ids belong to; another face would draw other glyphs.
-    pub family: std::rc::Rc<str>,
+    pub family: std::sync::Arc<str>,
     /// Top-left of the formula's box, so its baseline sits at `origin.y + formula.ascent`.
     pub origin: crate::geom::Point,
     /// Ink for items that carry no colour of their own.
@@ -1244,7 +1248,7 @@ impl LayerEntry {
 }
 
 /// Typed primitive banks.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Primitives {
     pub rects: Vec<RectPrim>,
     pub texts: Vec<TextPrim>,
@@ -1290,7 +1294,10 @@ pub struct Batch {
 }
 
 /// The per-frame draw list.
-#[derive(Debug)]
+///
+/// `Clone` exists for a presenter that draws on a thread of its own: the loop hands over a
+/// copy and keeps building while the renderer works.
+#[derive(Clone, Debug)]
 pub struct DrawList {
     pub ops: Vec<Op>,
     pub prims: Primitives,
@@ -1324,7 +1331,7 @@ pub struct DrawList {
 }
 
 /// Per-kind ownership tables, parallel to `Primitives`.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Owners {
     pub rects: Vec<NodeId>,
     pub texts: Vec<NodeId>,

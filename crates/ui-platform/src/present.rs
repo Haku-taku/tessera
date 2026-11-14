@@ -57,6 +57,7 @@ pub struct PresentStats {
 /// One canvas as a presenter receives it: its primitives already resolved to glyphs, in the
 /// canvas's own pixels. Only a changed canvas carries a list; an unchanged one names the
 /// target the presenter already holds.
+#[derive(Clone)]
 pub struct CanvasFrame {
     pub id: ui_core::draw::CanvasId,
     pub size: (u32, u32),

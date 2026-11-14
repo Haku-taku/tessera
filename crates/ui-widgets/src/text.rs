@@ -234,7 +234,7 @@ impl Text {
             shapes: Vec::new(),
             data: NodeData::Text {
                 ink: self.ink,
-                block: std::rc::Rc::new(TextBlock {
+                block: std::sync::Arc::new(TextBlock {
                     runs: vec![TextRun::new(
                         self.body.clone(),
                         TextStyle::new(self.size)

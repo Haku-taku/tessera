@@ -149,7 +149,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(marked.clone()),
+                block: std::sync::Arc::new(marked.clone()),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -234,7 +234,7 @@ mod contracts {
             list.push_text(
                 NodeId::from_raw(1, 0),
                 TextPrim {
-                    block: std::rc::Rc::new(text),
+                    block: std::sync::Arc::new(text),
                     origin: ui_core::geom::Point::new(0.0, 0.0),
                     ink: Color::WHITE,
                     max_width: f32::INFINITY,
@@ -270,7 +270,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(2, 0),
             TextPrim {
-                block: std::rc::Rc::new(ended),
+                block: std::sync::Arc::new(ended),
                 origin: ui_core::geom::Point::new(0.0, 0.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -375,7 +375,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(block),
+                block: std::sync::Arc::new(block),
                 origin: ui_core::geom::Point::new(10.0, 0.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -453,7 +453,7 @@ mod contracts {
             list.push_text(
                 NodeId::from_raw(1, 0),
                 TextPrim {
-                    block: std::rc::Rc::new(block.clone()),
+                    block: std::sync::Arc::new(block.clone()),
                     origin: ui_core::geom::Point::new(10.0, 20.0),
                     ink: Color::WHITE,
                     max_width: f32::INFINITY,
@@ -510,7 +510,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(block),
+                block: std::sync::Arc::new(block),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -556,7 +556,7 @@ mod contracts {
             list.push_text(
                 NodeId::from_raw(1, 0),
                 TextPrim {
-                    block: std::rc::Rc::new(block),
+                    block: std::sync::Arc::new(block),
                     origin: ui_core::geom::Point::new(10.0, 20.0),
                     ink: Color::WHITE,
                     max_width: 600.0,
@@ -626,7 +626,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(block),
+                block: std::sync::Arc::new(block),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -674,7 +674,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(block),
+                block: std::sync::Arc::new(block),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -741,7 +741,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(block),
+                block: std::sync::Arc::new(block),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -835,7 +835,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(block),
+                block: std::sync::Arc::new(block),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -894,7 +894,7 @@ mod contracts {
         let style = ui_core::TextStyle::new(24.0);
         let width = 320.0;
         let prim = |text: &str, align| TextPrim {
-            block: std::rc::Rc::new(ui_core::TextBlock {
+            block: std::sync::Arc::new(ui_core::TextBlock {
                 runs: vec![ui_core::TextRun::new(text, style)],
                 align,
                 ..Default::default()
@@ -1016,7 +1016,7 @@ mod contracts {
             list.push_text(
                 NodeId::from_raw(1, 0),
                 TextPrim {
-                    block: std::rc::Rc::new(block),
+                    block: std::sync::Arc::new(block),
                     origin: ui_core::geom::Point::new(10.0, 20.0),
                     ink: Color::WHITE,
                     max_width: f32::INFINITY,
@@ -1201,7 +1201,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(ui_core::TextBlock::plain(text, style)),
+                block: std::sync::Arc::new(ui_core::TextBlock::plain(text, style)),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -1241,7 +1241,7 @@ mod contracts {
         list.push_math(
             NodeId::from_raw(2, 0),
             ui_core::draw::MathPrim {
-                formula: std::rc::Rc::new(formula),
+                formula: std::sync::Arc::new(formula),
                 family: family.into(),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
@@ -1364,7 +1364,7 @@ mod contracts {
         }
         let len = block.flatten().0.len();
         let prim = TextPrim {
-            block: std::rc::Rc::new(block),
+            block: std::sync::Arc::new(block),
             origin: ui_core::geom::Point::new(10.0, 20.0),
             ink: Color::WHITE,
             max_width: natural * 0.5,
@@ -1414,7 +1414,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(ui_core::TextBlock {
+                block: std::sync::Arc::new(ui_core::TextBlock {
                     runs: vec![ui_core::TextRun::new("", style)],
                     ..Default::default()
                 }),
@@ -1459,7 +1459,7 @@ mod contracts {
         }
         let len = block.flatten().0.len();
         let prim = TextPrim {
-            block: std::rc::Rc::new(block),
+            block: std::sync::Arc::new(block),
             origin: ui_core::geom::Point::new(0.0, 0.0),
             ink: Color::WHITE,
             max_width: f32::INFINITY,
@@ -1602,7 +1602,7 @@ mod contracts {
         list.push_math(
             NodeId::from_raw(1, 0),
             ui_core::draw::MathPrim {
-                formula: std::rc::Rc::new(formula.clone()),
+                formula: std::sync::Arc::new(formula.clone()),
                 family: family.clone().into(),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
@@ -1655,7 +1655,7 @@ mod contracts {
             NodeId::from_raw(2, 0),
             ui_core::draw::MathPrim {
                 origin: ui_core::geom::Point::new(10.0, 20.0),
-                formula: std::rc::Rc::new(sub.clone()),
+                formula: std::sync::Arc::new(sub.clone()),
                 family: family.into(),
                 ink: Color::WHITE,
                 zoom: None,
@@ -1718,7 +1718,7 @@ mod contracts {
             list.push_text(
                 NodeId::from_raw(4, 0),
                 TextPrim {
-                    block: std::rc::Rc::new(block),
+                    block: std::sync::Arc::new(block),
                     origin: ui_core::geom::Point::new(10.0, 20.0),
                     ink: Color::WHITE,
                     max_width: f32::INFINITY,
@@ -1769,7 +1769,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(1, 0),
             TextPrim {
-                block: std::rc::Rc::new(block),
+                block: std::sync::Arc::new(block),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
                 max_width: f32::INFINITY,
@@ -1810,7 +1810,7 @@ mod contracts {
             list.push_text(
                 NodeId::from_raw(2 + offset as u32, 0),
                 TextPrim {
-                    block: std::rc::Rc::new(blank.clone()),
+                    block: std::sync::Arc::new(blank.clone()),
                     origin: ui_core::geom::Point::new(10.0, 20.0),
                     ink: Color::WHITE,
                     max_width: f32::INFINITY,
@@ -1883,7 +1883,7 @@ mod contracts {
         list.push_text(
             NodeId::from_raw(9, 0),
             TextPrim {
-                block: std::rc::Rc::new(block),
+                block: std::sync::Arc::new(block),
                 origin: ui_core::geom::Point::new(10.0, 20.0),
                 ink: Color::WHITE,
                 max_width,

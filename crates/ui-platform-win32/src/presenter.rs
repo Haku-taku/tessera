@@ -1,7 +1,5 @@
 //! The swap chain and the scene that fills it: the engine's [`SceneTarget`] on Windows.
 
-use std::rc::Rc;
-
 use ui_core::Damage;
 use ui_core::colour::{
     Chromaticities, Destination, Domain, LinearEncoding, ToneMapping, WhiteAdaptation,
@@ -31,7 +29,6 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::core::Interface as _;
 
-use crate::frame_pace::FramePace;
 use crate::outputs::HdrOutput;
 use crate::window::Win32Window;
 use crate::WindowError;
@@ -53,8 +50,8 @@ pub struct Win32Presenter {
     /// The flags the chain was opened with: `ResizeBuffers` must repeat them exactly, and
     /// the waitable one cannot be added later.
     chain_flags: u32,
-    /// The compositor's frame window, shared with the window and the host's wait set.
-    pace: Rc<FramePace>,
+    /// The app asked not to be paced by the display: present without waiting for a blank.
+    uncapped: bool,
     format: DXGI_FORMAT,
     /// The output the chain declares HDR for, with how that light is encoded; `None` on an
     /// 8-bit SDR surface.
@@ -78,20 +75,31 @@ pub struct Win32Presenter {
 }
 
 impl Win32Presenter {
-    /// Build the device and open a swap chain on `window`, with a frame window of its own.
+    /// Build the device and open a swap chain on `window`, paced by its own presents.
     ///
-    /// Callers that drive a loop themselves use this; the session shares one with the
-    /// window and the host's wait set through [`open`](Self::open).
+    /// Callers that drive a loop themselves use this; the session hands the same work to a
+    /// render thread through [`open_raw`](Self::open_raw).
     pub fn new(window: &Win32Window) -> Result<Self, WindowError> {
-        Self::open(window, Rc::new(FramePace::new()))
+        let size = window.client_size();
+        if size.0 == 0 || size.1 == 0 {
+            return Err(WindowError::Win32(String::from(
+                "the window has no client area to present into",
+            )));
+        }
+        Self::open_raw(window.visual_hwnd(), size, window.composited(), false)
     }
 
-    /// Build the device and open a swap chain on `window`, paced through `pace`.
+    /// Build the device and open a swap chain on a raw window handle.
     ///
-    /// The chain's waitable object goes into `pace`, and every successful present closes
-    /// it until the compositor takes the frame.
-    pub(crate) fn open(window: &Win32Window, pace: Rc<FramePace>) -> Result<Self, WindowError> {
-        let size = window.client_size();
+    /// Nothing here touches the window, so this is what runs on a render thread; the
+    /// window must outlive the presenter. `uncapped` presents without waiting for a blank,
+    /// which is the app's own choice to run the display as fast as it will take frames.
+    pub(crate) fn open_raw(
+        hwnd: HWND,
+        size: (u32, u32),
+        composited: bool,
+        uncapped: bool,
+    ) -> Result<Self, WindowError> {
         if size.0 == 0 || size.1 == 0 {
             return Err(WindowError::Win32(String::from(
                 "the window has no client area to present into",
@@ -101,22 +109,12 @@ impl Win32Presenter {
             .map_err(|error| WindowError::Gpu(format!("D3D11 device: {error}")))?;
         let mut renderer = GpuRenderer::new(&mut device)
             .map_err(|error| WindowError::Gpu(format!("renderer: {error}")))?;
-        let opened = open_chain(
-            device.raw_device(),
-            window.visual_hwnd(),
-            size,
-            window.composited(),
-        )?;
-        // The waitable object is what makes `Present(0)` return instead of blocking the
-        // loop: one frame in flight, and the next draw waits for the compositor's window.
-        // A chain opened without the flag has none, and the loop keeps its old pacing.
+        let opened = open_chain(device.raw_device(), hwnd, size, composited)?;
+        // One frame in flight: a present waits at the next blank, and a second queued frame
+        // would only add a display of latency to every frame after it.
         if let (true, Ok(chain2)) = (opened.waitable, opened.chain.cast::<IDXGISwapChain2>()) {
             // A latency the chain refuses is not fatal: it only leaves the default in place.
             let _ = unsafe { chain2.SetMaximumFrameLatency(1) };
-            let handle = unsafe { chain2.GetFrameLatencyWaitableObject() };
-            pace.set_handle((!handle.0.is_null()).then_some(handle));
-        } else {
-            pace.set_handle(None);
         }
         // Before the frame target exists: its format follows the destination.
         if let Some((output, encoding)) = opened.hdr {
@@ -132,7 +130,7 @@ impl Win32Presenter {
             renderer,
             chain: opened.chain,
             chain_flags,
-            pace,
+            uncapped,
             format: opened.format,
             hdr: opened.hdr,
             _composition: opened.composition,
@@ -315,6 +313,61 @@ impl SceneTarget for Win32Presenter {
         canvases: &[CanvasFrame],
     ) -> Result<PresentStats, String> {
         self.sync_atlas(text).map_err(|error| error.to_string())?;
+        self.present_uploads(scene, damage, canvases, None, None)
+    }
+}
+
+/// A glyph atlas the loop copied out of its text pass for the render thread.
+///
+/// The text pass itself belongs to the loop — it is `Rc`-based, shaped per frame, and never
+/// leaves the thread that owns the app — so a frame crossing to the renderer carries the
+/// bytes and the version they identify instead.
+pub(crate) struct AtlasUpdate {
+    pub version: u64,
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+impl Win32Presenter {
+    /// Render and present a frame whose atlases are already on the loop's side.
+    ///
+    /// `atlas` and `color_atlas` are present only when the loop found newer data than the
+    /// renderer holds; a rebuilt device asks for both again through the session.
+    pub(crate) fn present_uploads(
+        &mut self,
+        scene: &DrawList,
+        damage: &Damage,
+        canvases: &[CanvasFrame],
+        atlas: Option<AtlasUpdate>,
+        color_atlas: Option<AtlasUpdate>,
+    ) -> Result<PresentStats, String> {
+        if let Some(atlas) = atlas {
+            self.atlas_version = atlas.version;
+            self.renderer
+                .set_atlas(
+                    &mut self.device,
+                    AtlasUpload {
+                        width: atlas.width,
+                        height: atlas.height,
+                        data: atlas.data,
+                    },
+                )
+                .map_err(|error| format!("atlas upload: {error}"))?;
+        }
+        if let Some(atlas) = color_atlas {
+            self.color_atlas_version = atlas.version;
+            self.renderer
+                .set_color_atlas(
+                    &mut self.device,
+                    AtlasUpload {
+                        width: atlas.width,
+                        height: atlas.height,
+                        data: atlas.data,
+                    },
+                )
+                .map_err(|error| format!("colour atlas upload: {error}"))?;
+        }
         let uploads: Vec<CanvasUpload<'_>> = canvases
             .iter()
             .map(|canvas| CanvasUpload {
@@ -347,15 +400,14 @@ impl SceneTarget for Win32Presenter {
             self.capture = false;
             self.captured = Some(self.device.read_pixels(self.buffer, self.size.0, self.size.1));
         }
-        // With a waitable object the frame is queued without waiting for the compositor:
-        // the loop draws the next one only when that object names a window, so the wait
-        // happens in a message-aware sleep instead of here. Without one, present at the
-        // next vblank as before.
-        let interval = if self.pace.handle().is_some() { 0 } else { 1 };
+        // The frame goes at the compositor's next blank. On a render thread that block is
+        // the thread's own business: the loop keeps building while this one waits, which is
+        // what makes the surface answer input during a resize instead of after it. An
+        // uncapped app asked for no such wait and presents as soon as the frame is ready.
+        let interval = if self.uncapped { 0 } else { 1 };
         unsafe { self.chain.Present(interval, DXGI_PRESENT(0)) }
             .ok()
             .map_err(|error| format!("Present: {error}"))?;
-        self.pace.presented();
         if self.presented == 0 {
             // The window is on screen; the programs it did not draw compile from here, so the
             // one that first draws glass does not wait for it.

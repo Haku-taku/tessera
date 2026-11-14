@@ -329,7 +329,7 @@ pub struct TextPass {
     /// Text primitives this pass could not resolve, reported instead of dropped.
     unresolved: usize,
     /// Wrapped blocks, keyed by a hash of the block, the wrap width and the font set.
-    measured: FastMap<u64, std::rc::Rc<ui_core::InlineLayout>>,
+    measured: FastMap<u64, std::sync::Arc<ui_core::InlineLayout>>,
     /// Min-content widths, keyed like `measured` but without a width of their own.
     min_widths: FastMap<u64, f32>,
     /// Slice widths, keyed like `shaped_spans`: a page's labels repeat, and every line
@@ -433,7 +433,7 @@ struct Prepared {
     flat: String,
     spans: Vec<ui_core::Span>,
     /// The lines layout already sized; paint draws these instead of wrapping again.
-    layout: std::rc::Rc<ui_core::InlineLayout>,
+    layout: std::sync::Arc<ui_core::InlineLayout>,
 }
 
 /// One char boundary on a line, and where it sits on the surface.
@@ -1787,7 +1787,7 @@ impl TextPass {
         let (flat, spans) = text.block.flatten();
         // Layout already wrapped this block; a prim built outside layout gets it here once.
         let layout = match &text.layout {
-            Some(layout) => std::rc::Rc::clone(layout),
+            Some(layout) => std::sync::Arc::clone(layout),
             None => self.layout(&text.block, text.max_width),
         };
         Prepared {
@@ -2205,17 +2205,17 @@ impl TextPass {
         &mut self,
         block: &ui_core::TextBlock,
         max_width: f32,
-    ) -> std::rc::Rc<ui_core::InlineLayout> {
+    ) -> std::sync::Arc<ui_core::InlineLayout> {
         let key = measure_key(block, max_width, self.fonts_version);
         if let Some(hit) = self.measured.get(&key) {
-            return std::rc::Rc::clone(hit);
+            return std::sync::Arc::clone(hit);
         }
-        let computed = std::rc::Rc::new(timed!("measure", self.layout_uncached(block, max_width)));
+        let computed = std::sync::Arc::new(timed!("measure", self.layout_uncached(block, max_width)));
         self.measure_misses += 1;
         if self.measured.len() >= MEASURE_CACHE_MAX {
             self.measured.clear();
         }
-        self.measured.insert(key, std::rc::Rc::clone(&computed));
+        self.measured.insert(key, std::sync::Arc::clone(&computed));
         computed
     }
 
@@ -3231,7 +3231,7 @@ fn text_key(text: &TextPrim, scale: f32, fonts_version: u64) -> u64 {
     // The layout allocation, kept alive by the cached entry, so the address cannot be reused.
     text.layout
         .as_ref()
-        .map_or(0, |l| std::rc::Rc::as_ptr(l) as usize)
+        .map_or(0, |l| std::sync::Arc::as_ptr(l) as usize)
         .hash(&mut h);
     h.finish()
 }

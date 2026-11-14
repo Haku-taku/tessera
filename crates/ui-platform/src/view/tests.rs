@@ -580,7 +580,7 @@ mod contracts {
             shapes: Vec::new(),
             data: NodeData::Text {
                 ink: Color::BLACK,
-                block: std::rc::Rc::new(ui_core::TextBlock {
+                block: std::sync::Arc::new(ui_core::TextBlock {
                     runs: vec![ui_core::TextRun::new(
                         "drag across this paragraph to select it",
                         ui_core::TextStyle::new(14.0),
@@ -1038,7 +1038,7 @@ mod contracts {
                 ..
             } = &mut text
             {
-                let block = std::rc::Rc::make_mut(block);
+                let block = std::sync::Arc::make_mut(block);
                 block.input_base = Some(0);
                 block.runs = vec![ui_core::TextRun::new(
                     self.text.clone(),
@@ -1134,7 +1134,7 @@ mod contracts {
                 ..
             } = &mut text
             {
-                let block = std::rc::Rc::make_mut(block);
+                let block = std::sync::Arc::make_mut(block);
                 block.input_base = Some(0);
                 block.runs = vec![ui_core::TextRun::new(
                     self.text.clone(),
@@ -1277,7 +1277,7 @@ mod contracts {
                 });
             text.data = ui_core::NodeData::Text {
                 ink: Color::WHITE,
-                block: std::rc::Rc::new(ui_core::TextBlock {
+                block: std::sync::Arc::new(ui_core::TextBlock {
                     runs: vec![
                         ui_core::TextRun::new("**", style).hidden(),
                         ui_core::TextRun::new("bold", style),
@@ -1405,7 +1405,7 @@ mod contracts {
         });
         node.data = ui_core::NodeData::Text {
             ink: Color::WHITE,
-            block: std::rc::Rc::new(ui_core::TextBlock {
+            block: std::sync::Arc::new(ui_core::TextBlock {
                 runs: vec![ui_core::TextRun::new(text, ui_core::TextStyle::new(20.0))],
                 input_base: Some(base),
                 ..Default::default()
@@ -3415,7 +3415,7 @@ mod contracts {
             let mut label = Decl::container(Id::str("label"), ui_core::NodeKind::Text);
             label.data = ui_core::NodeData::Text {
                 ink: Color::from_rgba8(20, 20, 20, 255),
-                block: std::rc::Rc::new(ui_core::TextBlock {
+                block: std::sync::Arc::new(ui_core::TextBlock {
                     runs: vec![
                         ui_core::TextRun::new("see ", ui_core::TextStyle::new(14.0)),
                         ui_core::TextRun::new("here", ui_core::TextStyle::new(14.0)).inked(link),

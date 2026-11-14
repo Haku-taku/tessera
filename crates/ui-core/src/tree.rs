@@ -514,7 +514,8 @@ pub enum NodeData {
     /// Styled runs; rich text grows by adding runs, not fields.
     /// Text carries its ink because the component chose the role, not the type ramp.
     Text {
-        block: Rc<crate::text::TextBlock>,
+        /// Shared with the draw list, which a presenter may draw on another thread.
+        block: std::sync::Arc<crate::text::TextBlock>,
         ink: crate::geom::Color,
         /// Insertion caret at a byte offset, drawn by the text pass.
         caret: Option<crate::draw::Caret>,
@@ -528,10 +529,10 @@ pub enum NodeData {
     },
     /// A formula laid out by `ui-math`: a display list the text pass rasterizes.
     Math {
-        formula: Rc<crate::math::Formula>,
+        formula: std::sync::Arc<crate::math::Formula>,
         /// Family the formula was laid out with. Glyph ids are per face, so the painter must
         /// use this face and no other.
-        family: Rc<str>,
+        family: std::sync::Arc<str>,
         ink: crate::geom::Color,
     },
 }
@@ -631,7 +632,7 @@ pub struct Node {
     /// A `nowrap` line never wraps, but the box is still what its alignment stands in.
     pub wrap_width: f32,
     /// Lines layout wrapped this text node into; paint draws exactly these.
-    pub inline: Option<Rc<crate::text::InlineLayout>>,
+    pub inline: Option<std::sync::Arc<crate::text::InlineLayout>>,
     /// First baseline from the node's top edge; 0 for anything without text on its first line.
     pub baseline: f32,
     /// True when layout must be redone for this subtree.

@@ -120,7 +120,7 @@ fn hand_written() -> Decl {
             shapes: Vec::new(),
             data: NodeData::Text {
                 ink: color,
-                block: std::rc::Rc::new(TextBlock {
+                block: std::sync::Arc::new(TextBlock {
                     runs: vec![TextRun::new(body, TextStyle::new(size).weight(weight))],
                     align: TextAlign::Start,
                     max_lines: None,
