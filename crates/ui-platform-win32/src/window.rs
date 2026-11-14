@@ -28,7 +28,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
 };
 use windows::Win32::UI::Shell::{
     ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE,
@@ -36,18 +36,22 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
-    HTCLIENT, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT,
+    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO,
+    IDC_SIZEALL, IDC_SIZENESW,
     IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IsWindow, LoadCursorW, MA_ACTIVATE,
     MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE,
     PeekMessageW, QS_ALLINPUT, RegisterClassExW, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+    SM_CXMINTRACK, SM_CYMINTRACK, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
     WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
     WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP,
@@ -107,6 +111,18 @@ struct WindowState {
     input: Option<Vec<Rect>>,
     /// The window that held the foreground when the pointer arrived on a consumed area.
     previous: Option<HWND>,
+    /// A sizing drag this window runs itself; see `begin_sizing`.
+    sizing: Option<Sizing>,
+}
+
+/// A border drag: the hit test that began it, and where the pointer and window were then.
+#[derive(Clone, Copy)]
+struct Sizing {
+    edge: u32,
+    /// Screen pixels, which is what a non-client press carries.
+    cursor: POINT,
+    /// The window's rectangle on screen, restored when the drag is cancelled.
+    rect: RECT,
 }
 
 /// A window the window manager places, decorates and stacks.
@@ -914,6 +930,19 @@ unsafe fn handle(
             state.borrow().keyboard?;
             Some(LRESULT(HTCLIENT as isize))
         }
+        WM_NCLBUTTONDOWN => {
+            // The sizing border is the one drag `DefWindowProcW` runs in a modal loop, which
+            // blocks the app loop until the button comes up and leaves DWM to stretch the
+            // last frame. This window sizes itself instead, one message at a time, so a
+            // frame follows every move. A title-bar drag stays with Windows: that loop is
+            // where snapping lives, and a move needs no new frames.
+            let edge = (wparam.0 as u32) & 0xFFFF;
+            if !sizing_edge(edge) {
+                return None;
+            }
+            begin_sizing(state, hwnd, edge, packed_point(lparam));
+            Some(LRESULT(0))
+        }
         WM_MOUSEACTIVATE => {
             let command = match state.borrow().keyboard {
                 // A window the manager places activates the ordinary way.
@@ -928,6 +957,11 @@ unsafe fn handle(
             Some(LRESULT(command as isize))
         }
         WM_MOUSEMOVE => {
+            // A sizing drag owns the pointer until the button comes up, and the client area
+            // under it is not what it tracks.
+            if sizing_step(state, hwnd, packed_point(lparam)) {
+                return Some(LRESULT(0));
+            }
             let pos = logical(state, lparam);
             let mut window = state.borrow_mut();
             window.pointer = Some(pos);
@@ -973,6 +1007,9 @@ unsafe fn handle(
             Some(LRESULT(0))
         }
         WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
+            if message == WM_LBUTTONUP && end_sizing(state) {
+                return Some(LRESULT(0));
+            }
             let button = button(message);
             let pos = logical(state, lparam);
             let mut window = state.borrow_mut();
@@ -1009,7 +1046,15 @@ unsafe fn handle(
                 .push(Event::Scroll { pos, delta });
             Some(LRESULT(0))
         }
+        WM_CAPTURECHANGED => {
+            // Another window took the mouse: the drag ends where the edges already are.
+            state.borrow_mut().sizing = None;
+            None
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if (wparam.0 & 0xFFFF) as u16 == VK_ESCAPE.0 && cancel_sizing(state, hwnd) {
+                return Some(LRESULT(0));
+            }
             if tsf_key(state, true, wparam, lparam) {
                 return Some(LRESULT(0));
             }
@@ -1081,6 +1126,14 @@ unsafe fn handle(
             Some(LRESULT(0))
         }
         WM_SETCURSOR => {
+            // The pointer has left the client area for a border it is dragging, and the
+            // edge's own cursor is what the drag shows until the button comes up.
+            if let Some(edge) = state.borrow().sizing.map(|sizing| sizing.edge) {
+                unsafe {
+                    SetCursor(Some(load_cursor(sizing_cursor(edge))));
+                }
+                return Some(LRESULT(1));
+            }
             if (lparam.0 as u32) & 0xFFFF != HTCLIENT {
                 return None;
             }
@@ -1157,6 +1210,145 @@ fn key(state: &RefCell<WindowState>, vk: u16, down: bool) {
             });
         }
     }
+}
+
+/// Whether a hit-test code names a border or a corner, which is what a sizing drag moves.
+fn sizing_edge(edge: u32) -> bool {
+    matches!(
+        edge,
+        HTLEFT
+            | HTRIGHT
+            | HTTOP
+            | HTBOTTOM
+            | HTTOPLEFT
+            | HTTOPRIGHT
+            | HTBOTTOMLEFT
+            | HTBOTTOMRIGHT
+    )
+}
+
+/// The cursor a dragged edge shows: the axis the edge moves along.
+fn sizing_cursor(edge: u32) -> CursorShape {
+    match edge {
+        HTLEFT | HTRIGHT => CursorShape::ResizeHorizontal,
+        HTTOP | HTBOTTOM => CursorShape::ResizeVertical,
+        HTTOPLEFT | HTBOTTOMRIGHT => CursorShape::ResizeDiagonalDownRight,
+        _ => CursorShape::ResizeDiagonalUpRight,
+    }
+}
+
+/// Start a border drag at the press position, which a non-client message gives in screen pixels.
+fn begin_sizing(state: &RefCell<WindowState>, hwnd: HWND, edge: u32, at: POINT) {
+    let mut rect = RECT::default();
+    if let Err(error) = unsafe { GetWindowRect(hwnd, &mut rect) } {
+        log::warn!("win32: a sizing drag could not read the window's rectangle: {error}");
+        return;
+    }
+    state.borrow_mut().sizing = Some(Sizing {
+        edge,
+        cursor: at,
+        rect,
+    });
+    unsafe { SetCapture(hwnd) };
+    // `DefWindowProc` is what raises the window for a border click, and this drag is the one
+    // path that does not reach it.
+    if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        log::warn!("win32: a sizing drag could not bring its window to the foreground");
+    }
+}
+
+/// Resize to follow the pointer; false when no drag is running.
+fn sizing_step(state: &RefCell<WindowState>, hwnd: HWND, at: POINT) -> bool {
+    let Some(sizing) = state.borrow().sizing else {
+        return false;
+    };
+    // A mouse move carries client pixels, and the origin they are relative to is moving.
+    let mut at = at;
+    if !unsafe { ClientToScreen(hwnd, &mut at) }.as_bool() {
+        return true;
+    }
+    let (dx, dy) = (at.x - sizing.cursor.x, at.y - sizing.cursor.y);
+    let (mut left, mut top) = (sizing.rect.left, sizing.rect.top);
+    let (mut right, mut bottom) = (sizing.rect.right, sizing.rect.bottom);
+    match sizing.edge {
+        HTLEFT | HTTOPLEFT | HTBOTTOMLEFT => left += dx,
+        HTRIGHT | HTTOPRIGHT | HTBOTTOMRIGHT => right += dx,
+        _ => {}
+    }
+    match sizing.edge {
+        HTTOP | HTTOPLEFT | HTTOPRIGHT => top += dy,
+        HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT => bottom += dy,
+        _ => {}
+    }
+    // The modal loop is what applies the system's minimum tracking size, so this drag
+    // applies it itself; the window sets no constraints of its own.
+    let minimum = unsafe { (GetSystemMetrics(SM_CXMINTRACK), GetSystemMetrics(SM_CYMINTRACK)) };
+    if right - left < minimum.0 {
+        match sizing.edge {
+            HTLEFT | HTTOPLEFT | HTBOTTOMLEFT => left = right - minimum.0,
+            _ => right = left + minimum.0,
+        }
+    }
+    if bottom - top < minimum.1 {
+        match sizing.edge {
+            HTTOP | HTTOPLEFT | HTTOPRIGHT => top = bottom - minimum.1,
+            _ => bottom = top + minimum.1,
+        }
+    }
+    if let Err(error) = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            left,
+            top,
+            right - left,
+            bottom - top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    } {
+        log::warn!("win32: a sizing drag could not resize the window: {error}");
+    }
+    true
+}
+
+/// End the drag where it stands; true when one was running.
+fn end_sizing(state: &RefCell<WindowState>) -> bool {
+    let running = state.borrow_mut().sizing.take().is_some();
+    if running
+        && let Err(error) = unsafe { ReleaseCapture() }
+    {
+        // Losing the capture to another window already ended the drag.
+        log::warn!("win32: a sizing drag could not release the mouse: {error}");
+    }
+    running
+}
+
+/// Put the window back where the drag began; true when one was running.
+fn cancel_sizing(state: &RefCell<WindowState>, hwnd: HWND) -> bool {
+    let Some(sizing) = state.borrow_mut().sizing.take() else {
+        return false;
+    };
+    if let Err(error) = unsafe { ReleaseCapture() } {
+        log::warn!("win32: a cancelled drag could not release the mouse: {error}");
+    }
+    let (width, height) = (
+        sizing.rect.right - sizing.rect.left,
+        sizing.rect.bottom - sizing.rect.top,
+    );
+    if let Err(error) = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            sizing.rect.left,
+            sizing.rect.top,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    } {
+        log::warn!("win32: a cancelled drag could not restore the window: {error}");
+    }
+    true
 }
 
 /// A message's position: two signed shorts packed into one parameter, in screen or client
