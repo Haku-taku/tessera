@@ -434,6 +434,11 @@ impl Win32Window {
 
     /// Take every message waiting for this thread; true when there was one.
     pub fn pump(&mut self) -> bool {
+        // Inside a modal gesture the shell's own loop dispatches this thread's messages;
+        // taking them here as well would remove them from under the gesture.
+        if crate::modal::inside() {
+            return false;
+        }
         pump_messages()
     }
 

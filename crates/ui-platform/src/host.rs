@@ -638,16 +638,28 @@ impl Host {
         // Before anything answers a command: a status reply or a pin placement must not use
         // yesterday's outputs.
         self.outputs = self.backend.outputs();
-        for (id, surface) in &mut self.surfaces {
-            match surface.step() {
+        // A step may start a modal gesture — a title-bar move, an OLE drag — whose message
+        // loop does not return until the pointer is released. The surface is taken out of
+        // the list while its step runs, so the gesture's own timer can reach the rest of
+        // the process through [`modal::pump_others`](crate::modal::pump_others).
+        let mut index = 0;
+        while index < self.surfaces.len() {
+            let (id, mut surface) = self.surfaces.remove(index);
+            let mut others = || self.pump_others();
+            crate::modal::arm(&mut others);
+            let stepped = surface.step();
+            crate::modal::disarm();
+            match stepped {
                 Ok(step) => {
                     if step.drew {
                         self.stats.frames += 1;
                     }
                     copies.extend(surface.take_copies());
                 }
-                Err(reason) => retired.push((*id, reason)),
+                Err(reason) => retired.push((id, reason)),
             }
+            self.surfaces.insert(index, (id, surface));
+            index += 1;
         }
         for copy in copies {
             self.backend.set_clipboard_copy(copy);
@@ -668,6 +680,37 @@ impl Host {
         self.serve_channel();
         self.serve_turn();
         Ok(())
+    }
+
+    /// Step every surface but the one a modal gesture is running for.
+    ///
+    /// The gesture's own message loop dispatches this thread's messages, so the only thing
+    /// missing is the engine's turn: this is that turn without waiting and without the
+    /// gesture's surface, which the platform draws from its own timer. Copies still reach
+    /// the clipboard; a failing surface is retired here exactly as a turn would retire it.
+    fn pump_others(&mut self) {
+        let mut copies = Vec::new();
+        let mut retired = Vec::new();
+        for (id, surface) in &mut self.surfaces {
+            match surface.step() {
+                Ok(step) => {
+                    if step.drew {
+                        self.stats.frames += 1;
+                    }
+                    copies.extend(surface.take_copies());
+                }
+                Err(reason) => retired.push((*id, reason)),
+            }
+        }
+        for copy in copies {
+            self.backend.set_clipboard_copy(copy);
+        }
+        for (id, reason) in &retired {
+            log::warn!("ui-platform: surface {id:?} was retired: {reason}");
+        }
+        self.surfaces.retain(|(id, surface)| {
+            !retired.iter().any(|(retired, _)| retired == id) && !surface.is_closed()
+        });
     }
 
     /// Hand every hotkey the backend queued to the application's handler.

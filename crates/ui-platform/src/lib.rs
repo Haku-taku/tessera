@@ -14,6 +14,7 @@ pub mod ipc;
 pub mod jobs;
 pub mod locale;
 pub mod menu;
+pub mod modal;
 pub mod output;
 pub mod present;
 pub mod session;

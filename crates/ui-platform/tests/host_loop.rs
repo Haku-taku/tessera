@@ -25,7 +25,7 @@ impl App for Blank {
     }
 }
 
-/// One scripted step: draw, publish a copy, close, or fail.
+/// One scripted step: draw, publish a copy, close, fail, or run a modal pump.
 #[derive(Clone)]
 enum Act {
     Idle,
@@ -33,6 +33,8 @@ enum Act {
     Copy(&'static str, u32),
     Close,
     Fail(&'static str),
+    /// Enter a modal gesture: pump the rest of the loop, recording what it reached.
+    Modal(Rc<Cell<usize>>, Rc<RefCell<Option<(bool, usize)>>>),
 }
 
 struct Scripted {
@@ -67,6 +69,10 @@ impl SurfaceHandle for Scripted {
             }),
             Act::Close => self.closed = true,
             Act::Fail(reason) => return Err(reason.to_string()),
+            Act::Modal(other, seen) => {
+                let pumped = ui_platform::modal::pump_others();
+                *seen.borrow_mut() = Some((pumped, other.get()));
+            }
         }
         Ok(SurfaceStep::default())
     }
@@ -296,6 +302,34 @@ fn a_failing_surface_is_retired_while_the_others_draw_on() {
         log.borrow().served,
         3,
         "the loop turned on past the failure"
+    );
+}
+
+/// A modal gesture borrows the thread's message loop, so the host's own turn is suspended
+/// for its duration. The platform's timer pumps the rest of the process through it; without
+/// that every other window holds its last frame until the gesture ends.
+#[test]
+fn a_modal_gesture_pumps_the_other_surfaces() {
+    let (other, other_steps) = scripted(&[Act::Idle, Act::Idle, Act::Idle, Act::Close]);
+    let seen = Rc::new(RefCell::new(None));
+    let (gesture, _) = scripted(&[
+        Act::Modal(Rc::clone(&other_steps), Rc::clone(&seen)),
+        Act::Close,
+    ]);
+    let (mut host, _log) = host(vec![gesture, other], usize::MAX);
+    host.open(spec("gesture"), Blank, OpenOptions::default())
+        .expect("the surface that starts the gesture");
+    host.open(spec("other"), Blank, OpenOptions::default())
+        .expect("the surface that must keep drawing");
+
+    host.run_until(None)
+        .expect("the loop ends when both surfaces close");
+
+    let (pumped, stepped) = seen.borrow().expect("the gesture's pump ran");
+    assert!(pumped, "a surface's step must reach the rest of the loop");
+    assert_eq!(
+        stepped, 1,
+        "the pump stepped the other surface while the gesture's step was on the stack"
     );
 }
 

@@ -35,6 +35,12 @@ thread_local! {
 ///
 /// A gesture whose timer fails still runs; it simply keeps the last frame.
 pub(crate) fn arm(hwnd: HWND, pump: &mut dyn FnMut()) -> usize {
+    if PUMP.with(Cell::get).is_some() {
+        // A gesture's timer is already armed on this thread and serves the pump it has.
+        // Overwriting the slot would leave the outer gesture without frames, and this
+        // gesture simply runs without one — it still moves, the way it did before the pump.
+        return 0;
+    }
     // SAFETY: the slot is only read while the modal call is on the stack, on this thread,
     // and the closure outlives it; the lifetime is erased, not the validity.
     let erased: *mut dyn FnMut() = unsafe {
@@ -42,18 +48,34 @@ pub(crate) fn arm(hwnd: HWND, pump: &mut dyn FnMut()) -> usize {
     };
     PUMP.with(|slot| slot.set(Some(erased)));
     // SAFETY: the window is this thread's and the id is ours.
-    unsafe { SetTimer(Some(hwnd), TIMER_ID, TICK_MS, None) }
+    let timer = unsafe { SetTimer(Some(hwnd), TIMER_ID, TICK_MS, None) };
+    if timer == 0 {
+        // No timer means no callback, so the slot would outlive the closure that filled it.
+        PUMP.with(|slot| slot.set(None));
+    }
+    timer
 }
 
 /// Stop the timer [`arm`] started and drop its pump.
+///
+/// A zero is a call that never armed — a refused nested gesture — and owns no slot to clear.
 pub(crate) fn disarm(hwnd: HWND, timer: usize) {
-    PUMP.with(|slot| slot.set(None));
-    if timer != 0 {
-        // SAFETY: the id came back from `SetTimer` on this window.
-        unsafe {
-            let _ = KillTimer(Some(hwnd), timer);
-        }
+    if timer == 0 {
+        return;
     }
+    PUMP.with(|slot| slot.set(None));
+    // SAFETY: the id came back from `SetTimer` on this window.
+    unsafe {
+        let _ = KillTimer(Some(hwnd), timer);
+    }
+}
+
+/// Whether this thread is inside a modal gesture's tick.
+///
+/// The tick runs from the shell's own message loop, so the platform must not pump this
+/// thread's messages again: they are the gesture's.
+pub(crate) fn inside() -> bool {
+    BUSY.with(Cell::get)
 }
 
 /// Run the frame pump a modal gesture armed, if any; true when one ran.
@@ -72,6 +94,10 @@ pub(crate) fn pump_frame() -> bool {
     // SAFETY: `arm` stores a closure that outlives the whole modal call, and `disarm`
     // clears the slot before the borrow of the caller's frame ends.
     unsafe { (*pump)() };
+    // The shell's loop dispatches this thread's messages, but it cannot step the rest of
+    // the engine: the host's turn is suspended for the gesture. Its surfaces draw from the
+    // same timer, so one window's move or drag does not hold the others at their last frame.
+    let _ = ui_platform::modal::pump_others();
     BUSY.with(|busy| busy.set(false));
     true
 }
