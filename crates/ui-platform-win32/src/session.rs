@@ -40,8 +40,10 @@ impl<A: App> Session<A> {
                 "the Win32 backend presents through D3D11 only; it has no CPU presenter",
             ));
         }
-        let win = Win32Window::new(opts.surface)
+        let mut win = Win32Window::new(opts.surface)
             .map_err(|error| format!("cannot open a Win32 window: {error}"))?;
+        // This loop pumps frames inside the system's move loop, so it must start the move.
+        win.defer_system_move();
         let presenter = Win32Presenter::new(&win).map_err(|error| error.to_string())?;
         Ok(Self {
             presenter: Some(presenter),
@@ -159,6 +161,9 @@ impl<A: App> Session<A> {
         if self.finished() {
             return Ok(Tick::default());
         }
+        if self.win.take_move_request() {
+            self.run_native_move();
+        }
         let pointer = match self.driver.decide(&mut self.lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
             Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
@@ -185,7 +190,11 @@ impl<A: App> Session<A> {
         if self.finished() {
             return Ok(Tick::default());
         }
-        let pointer = match self.driver.step(&mut self.lp, &mut self.win) {
+        let turn = self.driver.step(&mut self.lp, &mut self.win);
+        if self.win.take_move_request() {
+            self.run_native_move();
+        }
+        let pointer = match turn {
             Turn::Draw { pointer } => pointer,
             Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
         };
@@ -344,6 +353,59 @@ impl<A: App> Session<A> {
             lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Finished {
                 dropped: false,
             }));
+            lp.request_frame();
+        }
+    }
+
+    /// Start the system's title-bar move, and keep building frames inside its modal loop.
+    ///
+    /// `SendMessage(WM_SYSCOMMAND, SC_MOVE)` does not return until the window is dropped,
+    /// exactly like `DoDragDrop`, so the same timer pump keeps an animation alive while the
+    /// shell moves the window. There is no queue to serve here — the shell owns the pointer
+    /// — and a still surface has nothing to rebuild, so the pump only runs while the app is
+    /// animating.
+    fn run_native_move(&mut self) {
+        let hwnd = self.win.hwnd();
+        let Session {
+            lp,
+            win,
+            presenter,
+            closed,
+            ..
+        } = self;
+        let mut pump = || {
+            if !lp.is_animating() {
+                return;
+            }
+            let Some(presenter) = presenter.as_mut() else {
+                return;
+            };
+            let size = win.client_size();
+            if size.0 == 0 || size.1 == 0 {
+                return;
+            }
+            if presenter.resize(size, win.scale()).is_err() {
+                return;
+            }
+            let pointer = win.pointer();
+            {
+                let mut target = Target {
+                    win: &mut *win,
+                    presenter: &mut *presenter,
+                };
+                let _ = lp.frame_scene(&mut target, pointer);
+            }
+            *closed |= lp.take_close();
+            for (dx, dy) in lp.take_pointer_steps() {
+                win.nudge_pointer(dx, dy);
+            }
+            win.set_drop_effect(lp.drop_effect());
+        };
+        let timer = crate::modal::arm(hwnd, &mut pump);
+        let moved = crate::window::start_system_move(hwnd);
+        crate::modal::disarm(hwnd, timer);
+        if moved {
+            // The window may have crossed a display, which changes its scale or extent.
             lp.request_frame();
         }
     }

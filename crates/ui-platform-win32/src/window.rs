@@ -31,7 +31,8 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_ESCAPE, VK_LBUTTON,
 };
 use windows::Win32::UI::Shell::{
     ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE,
@@ -41,12 +42,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
-    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_CROSS, IDC_HAND,
-    IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IsWindow,
+    HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_CROSS,
+    IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+    IsWindow,
     LoadCursorW, MA_ACTIVATE, MA_NOACTIVATE, MINMAXINFO, MSG, MWMO_INPUTAVAILABLE,
     MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
-    RegisterClassExW, SM_CXMINTRACK, SM_CYMINTRACK, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW,
+    RegisterClassExW, SC_MOVE, SM_CXMINTRACK, SM_CYMINTRACK, SW_SHOW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow,
+    SetWindowLongPtrW,
     SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED,
     WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
     WM_GETMINMAXINFO,
@@ -55,7 +59,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
     WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_TIMER,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP,
@@ -117,6 +122,12 @@ struct WindowState {
     previous: Option<HWND>,
     /// A sizing drag this window runs itself; see `begin_sizing`.
     sizing: Option<Sizing>,
+    /// A title-bar press the host loop must start as the system's move: `DefWindowProc`
+    /// would run that loop inside message dispatch, where the engine cannot paint.
+    move_request: bool,
+    /// The loop driving this window services [`move_request`]. Without that promise the
+    /// press keeps its default handling, or a direct `Win32Window` user could not move it.
+    deferred_move: bool,
 }
 
 /// A border drag: the hit test that began it, and where the pointer and window were then.
@@ -282,6 +293,20 @@ impl Win32Window {
     /// What OLE's drop target queues while a drag is over this window.
     pub(crate) fn drag_queue(&self) -> Rc<crate::dnd::DragQueue> {
         self.drag.clone()
+    }
+
+    /// Whether a title-bar press is waiting for [`start_system_move`].
+    pub(crate) fn take_move_request(&mut self) -> bool {
+        std::mem::take(&mut self.state.borrow_mut().move_request)
+    }
+
+    /// Promise that the loop will start a title-bar move itself, with a pump armed.
+    ///
+    /// `Session` makes this promise and services it after every pump. A loop that never
+    /// asks for the request leaves the press to `DefWindowProc`, which moves the window
+    /// without the engine's frames — but moves it.
+    pub(crate) fn defer_system_move(&mut self) {
+        self.state.borrow_mut().deferred_move = true;
     }
 
     /// The window the frame is composed into.
@@ -988,17 +1013,24 @@ unsafe fn handle(
             Some(LRESULT(HTCLIENT as isize))
         }
         WM_NCLBUTTONDOWN => {
-            // The sizing border is the one drag `DefWindowProcW` runs in a modal loop, which
-            // blocks the app loop until the button comes up and leaves DWM to stretch the
-            // last frame. This window sizes itself instead, one message at a time, so a
-            // frame follows every move. A title-bar drag stays with Windows: that loop is
-            // where snapping lives, and a move needs no new frames.
+            // The sizing border is a drag `DefWindowProcW` would run in a modal loop that
+            // blocks the app loop until the button comes up; this window sizes itself
+            // instead, one message at a time, so a frame follows every move. A title-bar
+            // move still belongs to Windows — that loop is where snapping lives — but it
+            // is started from the host loop rather than from here, so the engine can pump
+            // frames inside it; see `start_system_move`. Every other non-client part keeps
+            // the default behaviour.
             let edge = (wparam.0 as u32) & 0xFFFF;
-            if !sizing_edge(edge) {
-                return None;
+            if sizing_edge(edge) {
+                begin_sizing(state, hwnd, edge, packed_point(lparam));
+                return Some(LRESULT(0));
             }
-            begin_sizing(state, hwnd, edge, packed_point(lparam));
-            Some(LRESULT(0))
+            let deferred = state.borrow().deferred_move;
+            if edge == HTCAPTION && deferred {
+                state.borrow_mut().move_request = true;
+                return Some(LRESULT(0));
+            }
+            None
         }
         WM_MOUSEACTIVATE => {
             let command = match state.borrow().keyboard {
@@ -1213,9 +1245,10 @@ unsafe fn handle(
         }
         WM_ERASEBKGND => Some(LRESULT(1)),
         WM_TIMER => {
-            // A modal gesture (OLE's drag) owns the thread's loop; its timer is the only
-            // thing that can make the engine build a frame in the meantime.
-            if crate::dnd::pump_modal_frame() {
+            // A modal gesture (OLE's drag, the system's title-bar move) owns the thread's
+            // loop; its timer is the only thing that can make the engine build a frame in
+            // the meantime.
+            if crate::modal::pump_frame() {
                 Some(LRESULT(0))
             } else {
                 None
@@ -1334,6 +1367,31 @@ fn key(state: &RefCell<WindowState>, vk: u16, down: bool) {
 }
 
 /// Whether a hit-test code names a border or a corner, which is what a sizing drag moves.
+/// Start the system's move loop for a title-bar press, and stay in it until it ends.
+///
+/// The window procedure records the press instead of passing it to `DefWindowProc`, whose
+/// modal loop would begin inside message dispatch, where the host cannot reach the surface
+/// to keep painting. Sending `SC_MOVE` runs the same loop a title-bar drag runs — snapping
+/// included — and returns when the window is dropped. A press whose button was already
+/// released is not a move: the loop would then wait for the keyboard.
+pub(crate) fn start_system_move(hwnd: HWND) -> bool {
+    // SAFETY: the virtual-key state is process-wide and takes no handles.
+    if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
+        return false;
+    }
+    // SAFETY: the window is this thread's; the call returns when the loop ends.
+    unsafe {
+        let _ = ReleaseCapture();
+        let _ = SendMessageW(
+            hwnd,
+            WM_SYSCOMMAND,
+            Some(WPARAM((SC_MOVE + HTCAPTION) as usize)),
+            Some(LPARAM(0)),
+        );
+    }
+    true
+}
+
 fn sizing_edge(edge: u32) -> bool {
     matches!(
         edge,

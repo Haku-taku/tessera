@@ -38,7 +38,6 @@ use windows::Win32::System::SystemServices::{
     MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 use windows::Win32::UI::Shell::{
     CLSID_DragDropHelper, IDragSourceHelper, IDropTargetHelper, SHCreateMemStream, SHDRAGIMAGE,
 };
@@ -147,46 +146,6 @@ fn ensure_ole() -> bool {
 
 /// The timer a modal gesture drives the app's frames with, in milliseconds.
 ///
-/// OLE's loop dispatches window messages, so a timer this window owns is what makes the
-/// engine paint while the drag is modal — the same nested pump Qt and WPF get from their
-/// event loops. Eight milliseconds keeps a highlight and an animation alive under the
-/// pointer without presenting anything a still app would not have presented anyway.
-const MODAL_PUMP_MS: u32 = 8;
-
-/// The timer id; any id not used elsewhere on this window will do.
-pub(crate) const MODAL_PUMP_TIMER: usize = 0xD0D0;
-
-thread_local! {
-    /// The frame pump a modal gesture armed for its own duration.
-    ///
-    /// The pointer is only valid inside [`begin`]: the caller that arms it keeps the
-    /// closure alive for the whole `DoDragDrop` call, and OLE only calls back on this
-    /// thread, inside that call.
-    static MODAL_PUMP: Cell<Option<*mut dyn FnMut()>> = const { Cell::new(None) };
-    /// A frame is being built: a message it synchronously dispatches must not build another.
-    static MODAL_PUMP_BUSY: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Run the frame pump a modal gesture armed, if any; true when one ran.
-///
-/// The window procedure calls this from `WM_TIMER`, which OLE's own loop dispatches: that
-/// is how a drag stops freezing the surface it started from.
-pub(crate) fn pump_modal_frame() -> bool {
-    let armed = MODAL_PUMP.with(|slot| slot.get());
-    let Some(pump) = armed else {
-        return false;
-    };
-    if MODAL_PUMP_BUSY.with(Cell::get) {
-        return false;
-    }
-    MODAL_PUMP_BUSY.with(|busy| busy.set(true));
-    // SAFETY: `begin` arms the slot with a closure that outlives the whole `DoDragDrop`
-    // call it is about to make, and clears it before returning.
-    unsafe { (*pump)() };
-    MODAL_PUMP_BUSY.with(|busy| busy.set(false));
-    true
-}
-
 /// Start the drag this app owns, and stay in it until the gesture ends.
 ///
 /// `DoDragDrop` runs a modal loop on the calling thread, and that loop wakes on the mouse
@@ -224,21 +183,10 @@ pub(crate) fn begin(
     let source: IDropSource = DropSource.into();
     let mut effect = DROPEFFECT_NONE;
     if let Some(pump) = pump {
-        // SAFETY: the slot is only read while this call is on the stack, on this thread,
-        // and the closure outlives it; the lifetime is erased, not the validity.
-        let erased: *mut dyn FnMut() = unsafe {
-            std::mem::transmute::<*mut dyn FnMut(), *mut dyn FnMut()>(pump)
-        };
-        MODAL_PUMP.with(|slot| slot.set(Some(erased)));
-        // SAFETY: the window is this thread's and the id is ours.
-        let timer = unsafe { SetTimer(Some(hwnd), MODAL_PUMP_TIMER, MODAL_PUMP_MS, None) };
+        let timer = crate::modal::arm(hwnd, pump);
         // SAFETY: both interfaces are local to this call and outlive it.
         let result = unsafe { DoDragDrop(&object, &source, allowed, &mut effect) };
-        // SAFETY: the timer was started above and the id belongs to this window.
-        unsafe {
-            let _ = KillTimer(Some(hwnd), timer);
-        }
-        MODAL_PUMP.with(|slot| slot.set(None));
+        crate::modal::disarm(hwnd, timer);
         queue.push(Event::Dnd(DndEvent::Finished {
             dropped: result.is_ok() && effect != DROPEFFECT_NONE,
         }));

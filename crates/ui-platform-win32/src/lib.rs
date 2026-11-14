@@ -22,6 +22,7 @@ mod ime;
 mod input;
 mod ipc;
 mod locale;
+mod modal;
 mod outputs;
 mod presenter;
 mod session;
