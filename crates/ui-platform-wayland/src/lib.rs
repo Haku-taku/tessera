@@ -9,6 +9,7 @@ pub mod colour;
 pub(crate) mod conn;
 pub(crate) mod cursor_shape;
 pub mod dmabuf;
+pub(crate) mod dnd;
 #[cfg(feature = "gpu")]
 pub mod gpu_window;
 pub mod input;

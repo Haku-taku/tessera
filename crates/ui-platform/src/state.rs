@@ -15,6 +15,8 @@ pub struct WidgetState {
     pub dropped: bool,
     /// The node this drag was released onto, when that node accepts drops.
     pub drop_target: Option<ui_core::Id>,
+    /// A live drag is over this node and it takes what the drag offers.
+    pub drag_over: bool,
     pub focused: bool,
     /// Focus arrived by keyboard, so a focus ring may be drawn; pointer focus may not.
     pub focus_visible: bool,
@@ -60,6 +62,7 @@ impl WidgetState {
             clicked: core.clicked_within(id),
             dropped: core.dropped_within(id),
             drop_target: core.drop_target(),
+            drag_over: core.drag_over_within(id),
             focused: core.focused() == Some(id),
             focus_visible: core.focus_visible() && core.focused() == Some(id),
             activated: core.activated_within(id),

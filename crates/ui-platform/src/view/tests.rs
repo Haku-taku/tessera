@@ -96,6 +96,9 @@ mod contracts {
             grid: ui_core::GridItem::default(),
             placement: ui_core::layout::Placement::default(),
             env: None,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             children: Vec::new(),
         }
     }
@@ -134,6 +137,9 @@ mod contracts {
                     grid: ui_core::GridItem::default(),
                     placement: ui_core::layout::Placement::default(),
                     env: None,
+                    drag: None,
+                    drag_out: false,
+                    drop_types: None,
                     children: Vec::new(),
                 });
             }
@@ -612,6 +618,9 @@ mod contracts {
             grid: ui_core::GridItem::default(),
             placement: ui_core::layout::Placement::default(),
             env: None,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             children: Vec::new(),
         }
     }
@@ -2685,6 +2694,197 @@ mod contracts {
         );
     }
 
+    /// A source carrying `text/plain`, and a zone that takes what `accepts` names.
+    struct Carrying {
+        seen: Vec<(Id, ui_core::change::Change)>,
+        accepts: &'static [&'static str],
+    }
+
+    impl App for Carrying {
+        fn view(&mut self, _f: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            let decl = Decl::container(Id::str("root"), NodeKind::Column)
+                .size(ui_core::layout::SizeClass::fixed(200.0, 200.0))
+                .child(
+                    Decl::container(Id::str("source"), NodeKind::Column)
+                        .size(ui_core::layout::SizeClass::fixed(60.0, 60.0))
+                        .sense(ui_core::Sense::HOVER)
+                        .drag_data(ui_core::DragData::bytes(
+                            "text/plain",
+                            b"hello".to_vec(),
+                        )),
+                )
+                .child(
+                    Decl::container(Id::str("zone"), NodeKind::Column)
+                        .size(ui_core::layout::SizeClass::fixed(120.0, 80.0))
+                        .accept_drop(self.accepts.iter().copied())
+                        .child(
+                            Decl::container(Id::str("inner"), NodeKind::Column)
+                                .size(ui_core::layout::SizeClass::fixed(40.0, 30.0)),
+                        ),
+                );
+            crate::from_decl(decl)
+        }
+
+        fn changed(&mut self, id: Id, change: ui_core::change::Change) -> bool {
+            self.seen.push((id, change));
+            true
+        }
+    }
+
+    fn drag_across(lp: &mut AppLoop<Carrying>, to: ui_core::geom::Point) {
+        let from = ui_core::geom::Point::new(20.0, 20.0);
+        lp.dispatch(ui_core::Event::PointerMoved { pos: from });
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: from,
+            button: ui_core::PointerButton::Primary,
+        });
+        lp.dispatch(ui_core::Event::PointerMoved { pos: to });
+    }
+
+    #[test]
+    fn a_payload_crosses_to_the_node_that_takes_it() {
+        // The whole point of the abstraction: the source never names the target, and the
+        // target never names the source; the declared types decide, and the payload arrives
+        // once on release.
+        let mut target = OffscreenTarget::new(220, 220);
+        let mut lp = AppLoop::new(Carrying {
+            seen: Vec::new(),
+            accepts: &["text/plain"],
+        });
+        lp.frame(&mut target, None);
+        drag_across(&mut lp, ui_core::geom::Point::new(50.0, 80.0));
+        let entered = lp.app_mut().seen.iter().find_map(|(id, change)| match change {
+            ui_core::change::Change::DragEntered { types } => Some((*id, types.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            entered,
+            Some((Id::str("zone"), vec!["text/plain".to_string()])),
+            "the zone under the pointer hears what it is about to receive"
+        );
+
+        let at = ui_core::geom::Point::new(50.0, 80.0);
+        lp.dispatch(ui_core::Event::PointerReleased {
+            pos: at,
+            button: ui_core::PointerButton::Primary,
+        });
+        let dropped = lp.app_mut().seen.iter().find_map(|(id, change)| match change {
+            ui_core::change::Change::DroppedOn(data) => Some((*id, data.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            dropped.as_ref().map(|(id, _)| *id),
+            Some(Id::str("zone")),
+            "the drop lands on the accepting zone"
+        );
+        assert_eq!(
+            dropped.and_then(|(_, data)| data.text().map(str::to_owned)),
+            Some("hello".to_owned()),
+            "the payload's bytes arrive intact"
+        );
+        assert!(
+            lp.app_mut().seen.iter().any(|(id, change)| *id == Id::str("source")
+                && matches!(change, ui_core::change::Change::Dropped(Some(zone)) if *zone == Id::str("zone"))),
+            "the source learns where its payload went"
+        );
+    }
+
+    #[test]
+    fn a_target_that_takes_another_type_is_never_highlighted_or_dropped_on() {
+        // The types are the contract: a zone that only takes images must not light up for
+        // text, and the drop must land nowhere rather than hand it the wrong bytes.
+        let mut target = OffscreenTarget::new(220, 220);
+        let mut lp = AppLoop::new(Carrying {
+            seen: Vec::new(),
+            accepts: &["image/png"],
+        });
+        lp.frame(&mut target, None);
+        drag_across(&mut lp, ui_core::geom::Point::new(50.0, 80.0));
+        let at = ui_core::geom::Point::new(50.0, 80.0);
+        lp.dispatch(ui_core::Event::PointerReleased {
+            pos: at,
+            button: ui_core::PointerButton::Primary,
+        });
+        assert!(
+            !lp.app_mut()
+                .seen
+                .iter()
+                .any(|(_, change)| matches!(change, ui_core::change::Change::DragEntered { .. }
+                    | ui_core::change::Change::DroppedOn(_))),
+            "no highlight, no payload: {:?}",
+            lp.app_mut()
+                .seen
+                .iter()
+                .map(|(id, c)| (*id, std::mem::discriminant(c)))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            lp.app_mut().seen.iter().any(|(id, change)| *id == Id::str("source")
+                && matches!(change, ui_core::change::Change::Dropped(None))),
+            "the source hears that its payload landed nowhere"
+        );
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_target_takes_its_highlight_down() {
+        let mut target = OffscreenTarget::new(220, 220);
+        let mut lp = AppLoop::new(Carrying {
+            seen: Vec::new(),
+            accepts: &["text/plain"],
+        });
+        lp.frame(&mut target, None);
+        drag_across(&mut lp, ui_core::geom::Point::new(50.0, 80.0));
+        lp.dispatch(ui_core::Event::PointerMoved {
+            pos: ui_core::geom::Point::new(400.0, 400.0),
+        });
+        assert!(
+            lp.app_mut()
+                .seen
+                .iter()
+                .any(|(id, change)| *id == Id::str("zone")
+                    && matches!(change, ui_core::change::Change::DragExited)),
+            "leaving the zone ends its hover"
+        );
+    }
+
+    #[test]
+    fn a_system_drag_reaches_the_target_with_its_decoded_payload() {
+        // A drag from another application never passes through the press machinery: the
+        // platform reports it, and the target must still see the same enter and drop.
+        let mut target = OffscreenTarget::new(220, 220);
+        let mut lp = AppLoop::new(Carrying {
+            seen: Vec::new(),
+            accepts: &["text/*"],
+        });
+        lp.frame(&mut target, None);
+        let at = ui_core::geom::Point::new(50.0, 80.0);
+        lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Entered {
+            pos: at,
+            types: vec!["text/plain".to_string()],
+        }));
+        lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Dropped {
+            pos: at,
+            data: ui_core::DragData::bytes("text/plain", b"from elsewhere".to_vec()),
+        }));
+        let seen: Vec<_> = lp
+            .app_mut()
+            .seen
+            .iter()
+            .map(|(id, change)| (*id, change))
+            .collect();
+        assert!(
+            seen.iter().any(|(id, change)| *id == Id::str("zone")
+                && matches!(change, ui_core::change::Change::DragEntered { .. })),
+            "the system drag highlights the zone: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|(id, change)| *id == Id::str("zone")
+                && matches!(change, ui_core::change::Change::DroppedOn(data)
+                    if data.text() == Some("from elsewhere"))),
+            "the payload decoded by the platform arrives at the drop: {seen:?}"
+        );
+    }
+
     /// A red block offset by `dx`, with a green sibling that must not move.
     struct Offset {
         dx: f32,
@@ -4152,6 +4352,9 @@ mod layer_emission_tests {
             grid: ui_core::GridItem::default(),
             placement: ui_core::layout::Placement::default(),
             env: None,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             children: Vec::new(),
         }
     }
@@ -4435,6 +4638,9 @@ mod sense_subscription_tests {
             grid: ui_core::GridItem::default(),
             placement: ui_core::layout::Placement::default(),
             env: None,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             children: Vec::new(),
         }
     }

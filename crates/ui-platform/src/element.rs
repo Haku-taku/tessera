@@ -283,6 +283,26 @@ impl Container {
         self
     }
 
+    /// What a drag from this element carries, and makes the element draggable.
+    pub fn drag_data(mut self, data: impl Into<std::rc::Rc<ui_core::DragData>>) -> Self {
+        self.own = self.own.drag_data(data);
+        self
+    }
+
+    /// Let this element's drag leave the app as an operating-system drag.
+    pub fn drag_out(mut self) -> Self {
+        self.own = self.own.drag_out();
+        self
+    }
+
+    /// The MIME patterns this element takes from a drag, making it a drop target.
+    ///
+    /// Patterns may be exact types, a family (`text/*`), or `*` for anything.
+    pub fn accept_drop(mut self, types: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.own = self.own.accept_drop(types);
+        self
+    }
+
     pub fn cursor(mut self, shape: ui_core::CursorShape) -> Self {
         self.own = self.own.cursor(shape);
         self

@@ -82,6 +82,13 @@ pub trait HostSession<A: App>: Sized {
     /// Put text on the clipboard; false when the host cannot carry this content.
     fn write_clipboard(&mut self, content: ClipboardContent) -> bool;
 
+    /// Start an operating-system drag carrying `data`, so another window can take it.
+    ///
+    /// The engine has already told the source its drag began. The host reports the outcome
+    /// as [`Event::Dnd(DndEvent::Finished)`](ui_core::DndEvent::Finished); false means the
+    /// host could not start one, and the engine cancels the gesture.
+    fn begin_drag(&mut self, data: ui_core::DragData) -> bool;
+
     /// Read the clipboard as a paste event; false when it holds no text.
     fn request_paste(&mut self) -> bool;
 

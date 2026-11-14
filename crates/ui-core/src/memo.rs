@@ -30,6 +30,10 @@ pub enum Dep {
     ClickedWithin(Id, bool),
     ActivatedWithin(Id, bool),
     DroppedWithin(Id, bool),
+    /// A live drag is over this node or a descendant and the node takes what it offers.
+    DragOverWithin(Id, bool),
+    /// The MIME types the live drag offers.
+    DragTypes(Option<Rc<Vec<String>>>),
     DraggingWithin(Id, bool),
     DragStarted(Id, bool),
     Disabled(Id, bool),

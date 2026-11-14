@@ -72,6 +72,9 @@ fn row(i: usize, y: f32) -> Decl {
             grid: Default::default(),
             placement: Default::default(),
             env: None,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             children: Vec::new(),
         })
 }

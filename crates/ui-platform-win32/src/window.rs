@@ -139,6 +139,10 @@ pub struct Win32Window {
     /// clicked can be shaped differently.
     visual: HWND,
     state: Rc<RefCell<WindowState>>,
+    /// What OLE's drop target posts while a drag crosses this window.
+    drag: Rc<crate::dnd::DragQueue>,
+    /// The registered drop target; withdrawal must precede the window's destruction.
+    drop_target: Option<windows::Win32::System::Ole::IDropTarget>,
     /// The surface reaches the desktop through a compositor, so the frame's own alpha
     /// decides what is seen: a layer, not a decorated window.
     composited: bool,
@@ -255,10 +259,16 @@ impl Win32Window {
             // Only a window the manager frames has a caption; a layer is a popup.
             theme_caption(hwnd);
         }
+        // OLE hands every drag over this window to the target; its callbacks only queue
+        // events, so nothing here needs the engine to exist yet.
+        let drag = Rc::new(crate::dnd::DragQueue::new(hwnd));
+        let drop_target = crate::dnd::register(hwnd, Rc::clone(&drag));
         Ok(Self {
             hwnd,
             visual,
             state,
+            drag,
+            drop_target,
             composited: opening.composited,
         })
     }
@@ -395,7 +405,21 @@ impl Win32Window {
     pub fn take_events(&mut self) -> Vec<Event> {
         self.pump();
         self.drain_tsf();
-        std::mem::take(&mut self.state.borrow_mut().events)
+        let mut events = std::mem::take(&mut self.state.borrow_mut().events);
+        // OLE callbacks run inside the pump above and only queue; appending keeps the
+        // pointer events of the turn ahead of the drag state they produced.
+        events.extend(self.drag.take());
+        events
+    }
+
+    /// Publish what dropping the drag under the pointer would do, for OLE's own answer.
+    pub fn set_drop_effect(&self, effect: Option<ui_core::DropEffect>) {
+        self.drag.set_effect(effect);
+    }
+
+    /// Start a drag this app carries, so another window can take the payload.
+    pub fn begin_drag(&mut self, data: ui_core::DragData) -> bool {
+        crate::dnd::begin(self.hwnd, data)
     }
 
     /// Whether focus, extent or scale changed without an `Event`.
@@ -798,6 +822,10 @@ impl Span {
 impl Drop for Win32Window {
     fn drop(&mut self) {
         if self.alive() {
+            // OLE keeps the window on its drop-target list; the registration must go
+            // before the window it names does.
+            crate::dnd::unregister(self.hwnd);
+            self.drop_target = None;
             let _ = unsafe { DestroyWindow(self.hwnd) };
         }
     }
@@ -887,6 +915,17 @@ unsafe fn handle(
         WM_DESTROY => {
             state.borrow_mut().close_requested = true;
             None
+        }
+        crate::dnd::WM_DND_FINISHED => {
+            // The worker thread that ran `DoDragDrop` posts the outcome; the engine tells
+            // the source whether a target took its payload.
+            state
+                .borrow_mut()
+                .events
+                .push(Event::Dnd(ui_core::DndEvent::Finished {
+                    dropped: wparam.0 != 0,
+                }));
+            Some(LRESULT(0))
         }
         WM_SIZE => {
             state.borrow_mut().silent_change = true;

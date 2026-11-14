@@ -39,6 +39,10 @@ pub struct FrameInfo {
     dropped_path: Vec<Id>,
     /// The node that release landed on, when it accepts drops.
     drop_target: Option<Id>,
+    /// The node a live drag is over, when it accepts what the drag offers, and its chain.
+    drag_path: Vec<Id>,
+    /// The MIME types the live drag offers, best first.
+    drag_types: Option<Rc<Vec<String>>>,
     /// Whether the live press has travelled past the click threshold.
     pub drag_started: bool,
     /// Pointer movement since the previous event while a drag is live.
@@ -938,6 +942,31 @@ struct ShortcutFact {
     focus: Option<(Id, ui_core::TextSelection, String)>,
 }
 
+/// A drag crossing one surface.
+///
+/// One shape for both directions: a drag this app started (its `data` is known from the
+/// press) and one the system is carrying, whose payload it reveals on release.
+struct DragSession {
+    /// The node the press started on, when this app's own gesture began the drag.
+    source: Option<Id>,
+    /// What the drag carries, when this app knows it before the release.
+    data: Option<Rc<ui_core::DragData>>,
+    /// What it offers, best first; empty for a gesture that carries nothing.
+    types: Rc<Vec<String>>,
+    /// The node under the pointer that takes it.
+    target: Option<Id>,
+}
+
+impl DragSession {
+    /// Whether the offered types decide what takes the drag.
+    ///
+    /// A gesture-only drag started here has nothing to match, so any `DROP` node takes it,
+    /// exactly as it did before payloads existed.
+    fn types_decide(&self) -> bool {
+        self.data.is_some() || self.source.is_none()
+    }
+}
+
 pub struct AppLoop<A: App> {
     app: A,
     tree: Tree,
@@ -1044,6 +1073,14 @@ pub struct AppLoop<A: App> {
     drag_step: Option<ui_core::geom::Point>,
     /// That node's ancestor chain, root first; rebuilt with the frame.
     dropped_path: Vec<Id>,
+    /// The live drag's target and its ancestors, root first; rebuilt with the frame.
+    drag_path: Vec<Id>,
+    /// A drag crossing this surface, whether this app started it or the system did.
+    drag_session: Option<DragSession>,
+    /// The node that started the native drag the host is running, until it finishes.
+    native_source: Option<Id>,
+    /// A native drag the host has not started yet.
+    native_request: Option<(Id, ui_core::DragData)>,
     /// Hovered node and its ancestors, root first; only hover subscribers appear here.
     hovered_path: Vec<Id>,
     /// Every node under the pointer, subscribers or not; cursor inheritance walks this.
@@ -1275,6 +1312,10 @@ impl<A: App> AppLoop<A> {
             dropped: None,
             drop_target: None,
             dropped_path: Vec::new(),
+            drag_path: Vec::new(),
+            drag_session: None,
+            native_source: None,
+            native_request: None,
             drag_step: None,
             hovered_path: Vec::new(),
             pointer_path: Vec::new(),
@@ -1335,6 +1376,37 @@ impl<A: App> AppLoop<A> {
     /// Pointer steps the last build asked for, oldest first; takes them.
     pub fn take_pointer_steps(&mut self) -> Vec<(f32, f32)> {
         std::mem::take(&mut self.pointer_steps)
+    }
+
+    /// The payload of a drag that asked to leave the app, waiting for the host to start it.
+    ///
+    /// The source has already heard `DragStarted`; the host reports the outcome later as
+    /// `Event::Dnd(DndEvent::Finished)`.
+    pub fn take_native_drag(&mut self) -> Option<ui_core::DragData> {
+        self.native_request.take().map(|(_, data)| data)
+    }
+
+    /// What dropping the live drag here would do, or `None` when nothing takes it.
+    ///
+    /// The host publishes this to the operating system so the pointer shows the effect the
+    /// target negotiated instead of a generic drag cursor.
+    pub fn drop_effect(&self) -> Option<ui_core::DropEffect> {
+        let session = self.drag_session.as_ref()?;
+        session.target?;
+        Some(
+            session
+                .data
+                .as_ref()
+                .map_or(ui_core::DropEffect::Copy, |data| data.effect),
+        )
+    }
+
+    /// The MIME types the drag over this surface offers, when one is live.
+    pub fn drag_types(&self) -> Option<&[String]> {
+        self.drag_session
+            .as_ref()
+            .filter(|session| session.types_decide())
+            .map(|session| session.types.as_slice())
     }
 
     /// Drop every cached declaration; the app calls this when it changed state silently.
@@ -2079,6 +2151,13 @@ impl<A: App> AppLoop<A> {
         Self::fill_ancestors(&self.tree, &mut self.clicked_path, self.clicked);
         Self::fill_ancestors(&self.tree, &mut self.activated_path, self.activated);
         Self::fill_ancestors(&self.tree, &mut self.dropped_path, self.dropped);
+        // The drag's own route is derived from its live target, not from a one-frame fact:
+        // a drag stays over a node for many frames and every one of them paints the hover.
+        Self::fill_ancestors(
+            &self.tree,
+            &mut self.drag_path,
+            self.drag_session.as_ref().and_then(|s| s.target),
+        );
         // A caret that just moved is solid at once: restart the cycle before anything
         // decides whether to draw it, so the frame the user typed into shows it.
         let fact = self.caret_fact();
@@ -2099,6 +2178,12 @@ impl<A: App> AppLoop<A> {
             clicked_path: self.clicked_path.clone(),
             dropped_path: self.dropped_path.clone(),
             drop_target: self.drop_target,
+            drag_path: self.drag_path.clone(),
+            drag_types: self
+                .drag_session
+                .as_ref()
+                .filter(|s| s.types_decide())
+                .map(|s| Rc::clone(&s.types)),
             drag_step: self.drag_step,
             press_origin: self.press_at,
             focused: self.focused,
@@ -2265,6 +2350,9 @@ impl<A: App> AppLoop<A> {
                 clicked_path: info.clicked_path.clone(),
                 dropped_path: info.dropped_path.clone(),
                 drop_target: info.drop_target,
+                drag_target: info.drag_path.last().copied(),
+                drag_path: info.drag_path.clone(),
+                drag_types: info.drag_types.clone(),
                 focused: info.focused,
                 focus_visible: info.focus_visible,
                 activated_path: info.activated_path.clone(),
@@ -2521,6 +2609,9 @@ impl<A: App> AppLoop<A> {
                 clicked_path: info.clicked_path.clone(),
                 dropped_path: info.dropped_path.clone(),
                 drop_target: info.drop_target,
+                drag_target: info.drag_path.last().copied(),
+                drag_path: info.drag_path.clone(),
+                drag_types: info.drag_types.clone(),
                 focused: info.focused,
                 focus_visible: info.focus_visible,
                 activated_path: info.activated_path.clone(),
@@ -2738,6 +2829,7 @@ impl<A: App> AppLoop<A> {
     fn report_drag(&mut self, event: ui_core::DragEvent) -> bool {
         use ui_core::DragEvent;
         use ui_core::change::Change;
+        let mut requested = false;
         let (id, change) = match event {
             // A drag start carries no value yet: the first `Moved` says where the pointer
             // is inside the control, and that is what a control maps to a value.
@@ -2745,6 +2837,36 @@ impl<A: App> AppLoop<A> {
                 // A new gesture starts with no movement banked: the previous drag's slice
                 // must not be added to this one if both fall inside a single frame.
                 self.drag_step = None;
+                let (data, native) = self
+                    .tree
+                    .find_by_id(on)
+                    .and_then(|nid| self.tree.get(nid))
+                    .map(|n| (n.drag.clone(), n.drag_out))
+                    .unwrap_or((None, false));
+                match data {
+                    // A native drag hands the gesture to the host: this loop only hears
+                    // how it ended.
+                    Some(data) if native => {
+                        self.native_request = Some((on, (*data).clone()));
+                        self.native_source = Some(on);
+                        self.drag.reset();
+                    }
+                    data => {
+                        let types = data
+                            .as_ref()
+                            .map(|data| data.types().map(str::to_owned).collect())
+                            .unwrap_or_default();
+                        self.drag_session = Some(DragSession {
+                            source: Some(on),
+                            data,
+                            types: Rc::new(types),
+                            target: None,
+                        });
+                        // The target hears before the source does: a highlight that reads
+                        // the source's state sees it already settled.
+                        requested |= self.refresh_drag_target();
+                    }
+                }
                 (on, Change::DragStarted)
             }
             DragEvent::Moved {
@@ -2756,6 +2878,7 @@ impl<A: App> AppLoop<A> {
                     Some(prev) => ui_core::geom::Point::new(prev.x + step.x, prev.y + step.y),
                     None => step,
                 });
+                requested |= self.refresh_drag_target();
                 (
                     on,
                     Change::Moved {
@@ -2767,11 +2890,151 @@ impl<A: App> AppLoop<A> {
             DragEvent::Dropped { on, target } => {
                 self.dropped = Some(on);
                 self.drop_target = target;
+                if let Some(session) = self.drag_session.take() {
+                    match (session.data, target) {
+                        // The target takes the payload; no exit is sent, because the drop
+                        // itself ends the hover.
+                        (Some(data), Some(target)) => {
+                            requested |=
+                                self.app_changed(target, Change::DroppedOn((*data).clone()));
+                        }
+                        _ => {
+                            // Released over nothing (or over another node): whatever was
+                            // highlighted comes down.
+                            if let Some(stale) = session.target.filter(|t| Some(*t) != target) {
+                                requested |= self.app_changed(stale, Change::DragExited);
+                            }
+                        }
+                    }
+                }
                 (on, Change::Dropped(target))
             }
-            DragEvent::Cancelled { on } => (on, Change::Cancelled),
+            DragEvent::Cancelled { on } => {
+                if let Some(session) = self.drag_session.take()
+                    && let Some(target) = session.target
+                {
+                    requested |= self.app_changed(target, Change::DragExited);
+                }
+                (on, Change::Cancelled)
+            }
         };
-        self.app_changed(id, change)
+        requested | self.app_changed(id, change)
+    }
+
+    /// Recompute what the live drag is over and announce a change of target.
+    fn refresh_drag_target(&mut self) -> bool {
+        let Some(session) = self.drag_session.as_ref() else {
+            return false;
+        };
+        let decide = session.types_decide();
+        let types = Rc::clone(&session.types);
+        let next = self.pointer.and_then(|pos| {
+            self.drag_target_at(pos, if decide { Some(types.as_slice()) } else { None })
+        });
+        self.set_drag_target(next)
+    }
+
+    /// Move the live drag's target, reporting the exit and the entry it causes.
+    fn set_drag_target(&mut self, next: Option<Id>) -> bool {
+        let Some(session) = self.drag_session.as_mut() else {
+            return false;
+        };
+        if session.target == next {
+            return false;
+        }
+        let previous = std::mem::replace(&mut session.target, next);
+        let types = session.types.to_vec();
+        let mut requested = false;
+        if let Some(previous) = previous {
+            requested |= self.app_changed(previous, ui_core::change::Change::DragExited);
+        }
+        if let Some(next) = next {
+            requested |= self.app_changed(next, ui_core::change::Change::DragEntered { types });
+        }
+        requested
+    }
+
+    /// Fold one phase of an operating-system drag into the loop.
+    fn dnd_event(&mut self, event: ui_core::DndEvent) -> bool {
+        use ui_core::DndEvent;
+        use ui_core::change::Change;
+        match event {
+            DndEvent::Entered { pos, types } => {
+                self.pointer = Some(pos);
+                self.drag_session = Some(DragSession {
+                    source: None,
+                    data: None,
+                    types: Rc::new(types),
+                    target: None,
+                });
+                self.refresh_drag_target()
+            }
+            DndEvent::Over { pos } => {
+                self.pointer = Some(pos);
+                self.refresh_drag_target()
+            }
+            DndEvent::Left => {
+                self.pointer = None;
+                let target = self.drag_session.take().and_then(|s| s.target);
+                target
+                    .map(|target| self.app_changed(target, Change::DragExited))
+                    .unwrap_or(false)
+            }
+            DndEvent::Dropped { pos, data } => {
+                self.pointer = Some(pos);
+                let types: Vec<String> = data.types().map(str::to_owned).collect();
+                // Some platforms report the release without an enter; the drop still has
+                // to find its target against the payload it carries.
+                match self.drag_session.as_mut() {
+                    Some(session) => {
+                        if session.source.is_none() {
+                            session.types = Rc::new(types.clone());
+                        }
+                    }
+                    None => {
+                        self.drag_session = Some(DragSession {
+                            source: None,
+                            data: None,
+                            types: Rc::new(types.clone()),
+                            target: None,
+                        });
+                    }
+                }
+                let target = self.drag_target_at(pos, Some(&types));
+                self.drop_target = target;
+                let mut requested = false;
+                if let Some(target) = target {
+                    requested |= self.app_changed(target, Change::DroppedOn(data));
+                }
+                if let Some(session) = self.drag_session.take()
+                    && let Some(stale) = session.target.filter(|t| Some(*t) != target)
+                {
+                    requested |= self.app_changed(stale, Change::DragExited);
+                }
+                requested
+            }
+            DndEvent::Finished { dropped } => {
+                // The operating system owned the pointer for the whole gesture, so the
+                // release this loop would have seen never arrived. Settle the press here,
+                // or the source stays pressed (and inked) after the drag has ended.
+                self.pressed = None;
+                self.press_at = None;
+                self.pressed_path.clear();
+                self.pan_candidate = None;
+                self.end_splat();
+                let Some(source) = self.native_source.take() else {
+                    return false;
+                };
+                // Another application took the payload (or none did); this loop never saw
+                // where it landed, so the source learns only that the gesture ended.
+                let change = if dropped {
+                    Change::Dropped(None)
+                } else {
+                    Change::Cancelled
+                };
+                self.app_changed(source, change)
+            }
+        }
     }
 
     /// Forward a change to the app; any app state may have moved, so the cache is dropped.
@@ -5190,6 +5453,12 @@ impl<A: App> AppLoop<A> {
             // A drag keeps its capture across leave: the button is still down, and
             // dropping the gesture here would strand the app mid-move.
         }
+        // An operating-system drag is its own input: it never moves the ordinary hover,
+        // and it owns the pointer until it drops or leaves.
+        if let ui_core::Event::Dnd(dnd) = &event {
+            let requested = self.dnd_event(dnd.clone());
+            return requested || before != (self.hovered, self.pressed, self.focused);
+        }
         // An open menu owns the pointer until it closes: a pick, or a dismissal.
         if self.menu.is_some()
             && let Some(handled) = self.menu_event(&event)
@@ -7434,16 +7703,32 @@ impl<A: App> AppLoop<A> {
         None
     }
 
-    /// The nearest ancestor-or-self of the pointer that accepts a drop.
+    /// The nearest ancestor-or-self of the pointer that accepts the live drag.
     fn drop_target(&self) -> Option<Id> {
-        let nid = self.pointer.and_then(|p| self.hit.topmost_consumer(p))?;
+        let pos = self.pointer?;
+        let types = self
+            .drag_session
+            .as_ref()
+            .map(|session| (session.types_decide(), Rc::clone(&session.types)));
+        let types = types.filter(|(decide, _)| *decide).map(|(_, types)| types);
+        self.drag_target_at(pos, types.as_deref().map(Vec::as_slice))
+    }
+
+    /// The nearest ancestor-or-self of `pos` that takes a drag offering `types`.
+    ///
+    /// `None` for the types means a drag that carries nothing: any `DROP` node takes it,
+    /// which is the behaviour a plain gesture had before payloads existed.
+    fn drag_target_at(&self, pos: ui_core::geom::Point, types: Option<&[String]>) -> Option<Id> {
+        let nid = self.hit.topmost_consumer(pos)?;
         // Declared once on the node; the ancestor walk covers containers full of children.
         self.ancestor_matching(nid, |id| {
             self.tree
                 .find_by_id(id)
                 .and_then(|n| self.tree.get(n))
-                .map(|n| n.sense.contains(ui_core::Sense::DROP))
-                .unwrap_or(false)
+                .is_some_and(|n| match types {
+                    Some(types) => n.accepts_drop(types.iter().map(String::as_str)),
+                    None => n.sense.contains(ui_core::Sense::DROP),
+                })
         })
     }
 

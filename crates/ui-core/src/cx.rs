@@ -110,6 +110,12 @@ pub struct Routing {
     pub dropped_path: Vec<Id>,
     /// The node under the pointer that accepts drops, when a drag ended this frame.
     pub drop_target: Option<Id>,
+    /// The node a live drag is over: it accepts what the drag offers.
+    pub drag_target: Option<Id>,
+    /// That node's ancestors, root first; empty when no drag is over the surface.
+    pub drag_path: Vec<Id>,
+    /// The MIME types the live drag offers, best first.
+    pub drag_types: Option<Rc<Vec<String>>>,
     pub focused: Option<Id>,
     /// True when focus came from the keyboard, which is what a focus ring keys on.
     pub focus_visible: bool,
@@ -168,6 +174,12 @@ pub struct Cx<'a> {
     dropped_path: Vec<Id>,
     /// The node a drag was released onto, when it accepts drops.
     drop_target: Option<Id>,
+    /// The node a live drag is over, when it accepts what the drag offers.
+    drag_target: Option<Id>,
+    /// That node's ancestors, root first.
+    drag_path: Vec<Id>,
+    /// The MIME types the live drag offers.
+    drag_types: Option<Rc<Vec<String>>>,
     /// Every node folded as inert this frame; normally empty.
     disabled: Vec<Id>,
     hovered: Option<Id>,
@@ -273,6 +285,9 @@ impl<'a> Cx<'a> {
             activated_path: Vec::new(),
             dropped_path: Vec::new(),
             drop_target: None,
+            drag_target: None,
+            drag_path: Vec::new(),
+            drag_types: None,
             focused: None,
             focus_visible: false,
             dismissed: None,
@@ -627,6 +642,8 @@ impl<'a> Cx<'a> {
             Dep::ClickedWithin(id, v) => self.clicked_path.contains(id) == *v,
             Dep::ActivatedWithin(id, v) => self.activated_path.contains(id) == *v,
             Dep::DroppedWithin(id, v) => self.dropped_path.contains(id) == *v,
+            Dep::DragOverWithin(id, v) => self.drag_path.contains(id) == *v,
+            Dep::DragTypes(v) => self.drag_types == *v,
             Dep::DraggingWithin(id, v) => (self.drag_owner == Some(*id)) == *v,
             Dep::DragStarted(id, v) => self.drag_started_within_now(*id) == *v,
             Dep::Disabled(id, v) => self.disabled.contains(id) == *v,
@@ -663,6 +680,9 @@ impl<'a> Cx<'a> {
         self.activated_path = r.activated_path;
         self.dropped_path = r.dropped_path;
         self.drop_target = r.drop_target;
+        self.drag_target = r.drag_target;
+        self.drag_path = r.drag_path;
+        self.drag_types = r.drag_types;
         self.focused = r.focused;
         self.focus_visible = r.focus_visible;
         self.dismissed = r.dismissed;
@@ -696,6 +716,28 @@ impl<'a> Cx<'a> {
     /// cleared on the frame that turns it false, so that dependency already covers it.
     pub fn drop_target(&self) -> Option<Id> {
         self.drop_target
+    }
+
+    /// Whether a live drag is over this node or a descendant that accepts it.
+    pub fn drag_over_within(&self, id: Id) -> bool {
+        let v = self.drag_path.contains(&id);
+        self.record(Dep::DragOverWithin(id, v));
+        v
+    }
+
+    /// The node a live drag is over, when it accepts what the drag offers.
+    ///
+    /// Not recorded, for the same reason as [`Cx::drop_target`]: the ancestor path answers
+    /// it, and that read is what the cache holds.
+    pub fn drag_over(&self) -> Option<Id> {
+        self.drag_target
+    }
+
+    /// The MIME types a live drag offers, best first; `None` when no drag is over the
+    /// surface.
+    pub fn drag_types(&self) -> Option<&[String]> {
+        self.record(Dep::DragTypes(self.drag_types.clone()));
+        self.drag_types.as_deref().map(Vec::as_slice)
     }
 
     /// Whether this node or a descendant was activated by the keyboard this frame; a snackbar
@@ -1187,6 +1229,9 @@ impl<'a> Cx<'a> {
             activated_path: self.activated_path.clone(),
             dropped_path: self.dropped_path.clone(),
             drop_target: self.drop_target,
+            drag_target: self.drag_target,
+            drag_path: self.drag_path.clone(),
+            drag_types: self.drag_types.clone(),
             focused: self.focused,
             focus_visible: self.focus_visible,
             dismissed: self.dismissed,

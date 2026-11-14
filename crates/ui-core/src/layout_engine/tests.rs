@@ -841,6 +841,9 @@ mod layout {
             grid: crate::tree::GridItem::default(),
             placement: crate::layout::Placement::default(),
             env: None,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             children: Vec::new(),
         }
     }
@@ -891,6 +894,9 @@ mod layout {
             grid: crate::tree::GridItem::default(),
             placement: crate::layout::Placement::default(),
             env: None,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             children: Vec::new(),
         }
     }

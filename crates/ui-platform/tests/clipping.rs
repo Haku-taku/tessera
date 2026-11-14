@@ -39,6 +39,9 @@ fn fixed_box(id: &'static str, w: f32, h: f32, color: Color) -> Decl {
         grid: Default::default(),
         placement: Default::default(),
         env: None,
+        drag: None,
+        drag_out: false,
+        drop_types: None,
         children: Vec::new(),
     }
 }
@@ -83,6 +86,9 @@ impl App for Rounded {
                 grid: Default::default(),
                 placement: Default::default(),
                 env: None,
+                drag: None,
+                drag_out: false,
+                drop_types: None,
                 children: vec![
                     fixed_box("child", 80.0, 80.0, Color::from_rgba8(255, 0, 0, 255)).into(),
                 ],
@@ -150,6 +156,9 @@ impl App for Lifted {
             grid: Default::default(),
             placement: Default::default(),
             env: None,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             children: vec![
                 fixed_box("lifted", 30.0, 30.0, Color::from_rgba8(255, 0, 0, 255))
                     .offset(80.0, 80.0)
@@ -224,6 +233,9 @@ impl App for ClippedShadow {
             grid: Default::default(),
             placement: Default::default(),
             env: None,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             children: vec![
                 fixed_box("child", 200.0, 200.0, Color::from_rgba8(255, 0, 0, 255)).into(),
             ],

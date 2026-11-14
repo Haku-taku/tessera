@@ -606,6 +606,12 @@ pub struct Node {
     pub cursor: Option<crate::cursor::CursorShape>,
     /// What interactions this node subscribes to, as declared this frame.
     pub sense: crate::sense::Sense,
+    /// What a drag that starts on this node carries, when it declares a payload.
+    pub drag: Option<Rc<crate::dnd::DragData>>,
+    /// Start an operating-system drag so another window can take the payload.
+    pub drag_out: bool,
+    /// MIME patterns this node takes as a drop target; `None` takes anything it is offered.
+    pub drop_types: Option<Rc<Vec<String>>>,
     /// Inert, folded from this declaration and every ancestor's.
     pub disabled: bool,
     /// Grid placement and cell alignment declared by this node.
@@ -669,6 +675,20 @@ impl Node {
     pub fn visual_rect(&self) -> Rect {
         self.rect.translate(self.paint_offset())
     }
+
+    /// Whether this node takes a drag offering `types`.
+    ///
+    /// A target that named no patterns takes anything, which is what a plain
+    /// `Sense::DROP` container means.
+    pub fn accepts_drop<'a>(&self, types: impl Iterator<Item = &'a str>) -> bool {
+        if !self.sense.contains(crate::sense::Sense::DROP) {
+            return false;
+        }
+        match &self.drop_types {
+            None => true,
+            Some(accepted) => crate::dnd::offered_matches(accepted, types),
+        }
+    }
 }
 
 /// The static scale a node declares; a leaf paints as laid out.
@@ -697,6 +717,14 @@ pub struct Decl {
     pub cursor: Option<crate::cursor::CursorShape>,
     /// What interactions this node subscribes to; the router reads only this.
     pub sense: crate::sense::Sense,
+    /// What a drag that starts here carries. A node that declares one is a drag source.
+    pub drag: Option<Rc<crate::dnd::DragData>>,
+    /// Start an operating-system drag at the threshold, so the payload can leave this app.
+    /// Ignored without [`drag`](Self::drag).
+    pub drag_out: bool,
+    /// MIME patterns this node takes as a drop target; `None` takes anything offered.
+    /// A node that sets this accepts drops even without [`Sense::DROP`](crate::Sense::DROP).
+    pub drop_types: Option<Rc<Vec<String>>>,
     /// Inert: neither this node nor its subtree takes input, focus or hover.
     ///
     /// Inherited downward, like a disabled fieldset: a child cannot re-enable itself.
@@ -739,6 +767,9 @@ impl Decl {
             && self.offset == other.offset
             && self.cursor == other.cursor
             && self.sense == other.sense
+            && self.drag == other.drag
+            && self.drag_out == other.drag_out
+            && self.drop_types == other.drop_types
             && self.disabled == other.disabled
             && self.grid == other.grid
             && self.placement == other.placement
@@ -763,6 +794,9 @@ impl PartialEq for Decl {
             && self.offset == other.offset
             && self.cursor == other.cursor
             && self.sense == other.sense
+            && self.drag == other.drag
+            && self.drag_out == other.drag_out
+            && self.drop_types == other.drop_types
             && self.grid == other.grid
             && self.placement == other.placement
             && self.shapes == other.shapes
@@ -789,6 +823,9 @@ impl Decl {
             offset: crate::geom::Point::new(0.0, 0.0),
             cursor: None,
             sense: crate::sense::Sense::NONE,
+            drag: None,
+            drag_out: false,
+            drop_types: None,
             disabled: false,
             grid: GridItem::default(),
             placement: crate::layout::Placement::default(),
@@ -904,6 +941,34 @@ impl Decl {
     /// Subscribe to interactions; compile the set with `|` where the node is declared.
     pub fn sense(mut self, sense: crate::sense::Sense) -> Self {
         self.sense = sense;
+        self
+    }
+
+    /// Declare the payload a drag that starts on this node carries.
+    ///
+    /// Also subscribes to [`Sense::DRAG`](crate::Sense::DRAG): a node with a payload is a
+    /// drag source by construction, and asking for it twice is the easy mistake.
+    pub fn drag_data(mut self, data: impl Into<Rc<crate::dnd::DragData>>) -> Self {
+        self.drag = Some(data.into());
+        self.sense |= crate::sense::Sense::DRAG;
+        self
+    }
+
+    /// Begin an operating-system drag at the threshold instead of an in-app one, so the
+    /// payload can be taken by another window. Meaningless without
+    /// [`drag_data`](Self::drag_data).
+    pub fn drag_out(mut self) -> Self {
+        self.drag_out = true;
+        self
+    }
+
+    /// Take drops whose offered type matches one of `types`; `text/*` and `*` are patterns.
+    ///
+    /// Also subscribes to [`Sense::DROP`](crate::Sense::DROP): declaring what you take is
+    /// what makes a node a drop target.
+    pub fn accept_drop(mut self, types: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.drop_types = Some(Rc::new(types.into_iter().map(Into::into).collect()));
+        self.sense |= crate::sense::Sense::DROP;
         self
     }
 
@@ -1808,6 +1873,9 @@ impl Tree {
                     // A node property, copied every frame like `cursor`: it follows the
                     // declaration instead of sticking to whatever it was first set to.
                     n.sense = decl.sense;
+                    n.drag = decl.drag.clone();
+                    n.drag_out = decl.drag_out;
+                    n.drop_types = decl.drop_types.clone();
                     // Same folding on the reuse path: inherited disabled wins over own false.
                     n.disabled = decl.disabled || inherited_disabled;
                     // `None` means "inherit": the folded value is only replaced when this
@@ -1996,6 +2064,9 @@ impl Tree {
             presence_scale: 1.0,
             cursor: decl.cursor,
             sense: decl.sense,
+            drag: decl.drag.clone(),
+            drag_out: decl.drag_out,
+            drop_types: decl.drop_types.clone(),
             // A disabled ancestor disables everything below it, so the flag is folded here.
             disabled: decl.disabled
                 || parent

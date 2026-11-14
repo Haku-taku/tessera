@@ -17,7 +17,7 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
-use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_TEXT, CF_UNICODETEXT};
 use windows::Win32::UI::Shell::{DROPFILES, DragQueryFileW, HDROP};
 use windows::core::PCWSTR;
 
@@ -320,13 +320,151 @@ fn block(format: u32) -> Option<Vec<u8>> {
 fn formats(content: &ClipboardContent) -> Option<Vec<(u32, Vec<u8>)>> {
     match content {
         ClipboardContent::Text(text) => Some(vec![(CF_UNICODETEXT.0 as u32, utf16_bytes(text))]),
-        ClipboardContent::Bytes { mime, data } => match mime.as_str() {
-            "image/png" => png_formats(data),
-            "text/html" => html_formats(data),
-            "text/uri-list" => uri_formats(data),
-            // No other MIME type has a Windows format this backend can produce.
-            _ => None,
-        },
+        ClipboardContent::Bytes { mime, data } => item_formats(mime, data),
+    }
+}
+
+/// The Windows formats one MIME payload becomes, for the clipboard and for a drag.
+pub(crate) fn item_formats(mime: &str, data: &[u8]) -> Option<Vec<(u32, Vec<u8>)>> {
+    match mime {
+        "image/png" => png_formats(data),
+        "text/html" => html_formats(data),
+        "text/uri-list" => uri_formats(data),
+        // A typed string is offered as `CF_UNICODETEXT`, the format every text target reads.
+        "text/plain" => Some(vec![(
+            CF_UNICODETEXT.0 as u32,
+            utf16_bytes(std::str::from_utf8(data).ok()?),
+        )]),
+        // No other MIME type has a Windows format this backend can produce.
+        _ => None,
+    }
+}
+
+/// The formats a drop may offer, in the order the engine prefers them.
+pub(crate) fn drop_formats() -> Vec<u32> {
+    let mut formats = vec![
+        CF_HDROP.0 as u32,
+        CF_UNICODETEXT.0 as u32,
+        CF_TEXT.0 as u32,
+        CF_DIBV5.0 as u32,
+        CF_DIB.0 as u32,
+    ];
+    if let Some(png) = registered("PNG") {
+        formats.insert(1, png);
+    }
+    formats
+}
+
+/// The MIME type one Windows format carries, when the engine has a name for it.
+pub(crate) fn mime_of(format: u32) -> Option<&'static str> {
+    if format == CF_HDROP.0 as u32 {
+        Some("text/uri-list")
+    } else if format == CF_UNICODETEXT.0 as u32 || format == CF_TEXT.0 as u32 {
+        Some("text/plain")
+    } else if format == CF_DIBV5.0 as u32
+        || format == CF_DIB.0 as u32
+        || Some(format) == registered("PNG")
+    {
+        Some("image/png")
+    } else {
+        None
+    }
+}
+
+/// The engine's payload for one Windows format, decoded from the block that carries it.
+///
+/// `None` for a format the engine does not understand, or bytes that do not decode.
+pub(crate) fn decode(format: u32, bytes: &[u8]) -> Option<(String, Vec<u8>)> {
+    if format == CF_HDROP.0 as u32 {
+        return Some(("text/uri-list".to_owned(), uri_list(hdrop_paths(bytes)?)));
+    }
+    if format == CF_UNICODETEXT.0 as u32 {
+        return Some(("text/plain".to_owned(), utf16_text(bytes)?.into_bytes()));
+    }
+    if format == CF_TEXT.0 as u32 {
+        return Some(("text/plain".to_owned(), ansi_text(bytes)?.into_bytes()));
+    }
+    if Some(format) == registered("PNG") {
+        return Some(("image/png".to_owned(), bytes.to_vec()));
+    }
+    if format == CF_DIBV5.0 as u32 || format == CF_DIB.0 as u32 {
+        return Some(("image/png".to_owned(), dib_to_png(bytes).ok()?));
+    }
+    None
+}
+
+/// The paths a `CF_HDROP` block names, read from the block itself.
+///
+/// The same layout `hdrop` writes: a `DROPFILES` header, then NUL-separated paths.
+fn hdrop_paths(bytes: &[u8]) -> Option<Vec<String>> {
+    let offset = field(bytes, 0)? as usize;
+    let wide = field(bytes, 16)? != 0;
+    let rest = bytes.get(offset..)?;
+    let mut paths = Vec::new();
+    if wide {
+        let units: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let mut start = 0;
+        for (index, unit) in units.iter().enumerate() {
+            if *unit == 0 {
+                // An empty entry after a path is the list's own terminator.
+                if index == start {
+                    break;
+                }
+                paths.push(String::from_utf16_lossy(&units[start..index]));
+                start = index + 1;
+            }
+        }
+    } else {
+        for part in rest.split(|byte| *byte == 0) {
+            if part.is_empty() {
+                break;
+            }
+            paths.push(ansi_text(part)?);
+        }
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// A `CF_UNICODETEXT` block as a string; the block may or may not end with a NUL.
+fn utf16_text(bytes: &[u8]) -> Option<String> {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// A `CF_TEXT` block decoded in the ANSI code page Windows is running under.
+fn ansi_text(bytes: &[u8]) -> Option<String> {
+    use windows::Win32::Globalization::{
+        CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar,
+    };
+    let bytes = match bytes.iter().position(|byte| *byte == 0) {
+        Some(end) => &bytes[..end],
+        None => bytes,
+    };
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    // SAFETY: the source slice is `length` bytes and the destination is sized for the
+    // worst case, one UTF-16 unit per byte.
+    unsafe {
+        let needed = MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, None);
+        if needed <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; needed as usize];
+        let written = MultiByteToWideChar(
+            CP_ACP,
+            MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0),
+            bytes,
+            Some(&mut wide),
+        );
+        (written > 0).then(|| String::from_utf16_lossy(&wide[..written as usize]))
     }
 }
 
@@ -636,6 +774,22 @@ mod tests {
         assert_eq!(
             decoded(&dib_to_png(dib(CF_DIB.0 as u32)).expect("the DIB decodes")),
             opaque
+        );
+    }
+
+    /// A file list written for the clipboard is the same block a drop delivers, so the
+    /// reader that turns a dropped `CF_HDROP` into MIME must read what the writer produced.
+    #[test]
+    fn a_file_list_reads_back_through_the_drop_decoder() {
+        let block = hdrop(&[
+            r"C:\one.png".to_owned(),
+            r"\\build\share\two.png".to_owned(),
+        ]);
+        let (mime, bytes) = decode(CF_HDROP.0 as u32, &block).expect("the block decodes");
+        assert_eq!(mime, "text/uri-list");
+        assert_eq!(
+            String::from_utf8(bytes).expect("a URI list is text"),
+            "file:///C:/one.png\r\nfile://build/share/two.png\r\n"
         );
     }
 

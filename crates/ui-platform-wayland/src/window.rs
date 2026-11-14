@@ -169,6 +169,8 @@ pub(crate) struct WindowState {
     input: InputState,
     /// The seat's clipboard: the data device, the offer, and the pipes in flight.
     pub(crate) clipboard: crate::clipboard::Clipboard,
+    /// The seat's drag and drop: an incoming drag, and one this window started.
+    pub(crate) dnd: crate::dnd::Drag,
     /// Format/modifier pairs the compositor advertised for dma-buf import.
     dmabuf_formats: DmaBufFormats,
     /// dma-buf buffers the compositor still holds; each is released on `wl_buffer.release`.
@@ -304,6 +306,7 @@ impl WindowState {
             scale_quarters: 100,
             input: InputState::new(),
             clipboard: crate::clipboard::Clipboard::new(),
+            dnd: crate::dnd::Drag::default(),
             colour_failed: None,
             entered_output: None,
             colour_dirty: true,
@@ -331,6 +334,12 @@ impl WindowState {
     fn note_serial(&mut self, serial: u32) {
         self.clipboard.note_serial(serial);
         self.warp_serial.set(serial);
+    }
+
+    /// Record a platform event for the loop to dispatch, and ask for the frame it implies.
+    pub(crate) fn push_event(&mut self, event: ui_core::Event) {
+        self.events.push(event);
+        self.redraw_requested = true;
     }
 
     /// The events a press of `evdev` produces under the modifiers held now.
@@ -1941,6 +1950,27 @@ impl WaylandWindow {
         self.state.clipboard.copy(contents, &self._conn, &self.qh)
     }
 
+    /// Start an operating-system drag carrying `data`; false when the seat cannot.
+    ///
+    /// The engine has already told the source its drag began. How it ended arrives as
+    /// `Event::Dnd(DndEvent::Finished)` once the compositor reports it.
+    pub fn begin_drag(&mut self, data: ui_core::DragData) -> bool {
+        let Some((manager, device)) = self.state.clipboard.device() else {
+            return false;
+        };
+        let serial = self.state.clipboard.serial();
+        let qh = self.qh.clone();
+        self.state.dnd.begin(
+            &data,
+            &manager,
+            &device,
+            &self.surface,
+            serial,
+            &qh,
+            &self._conn,
+        )
+    }
+
     /// The serial a `set_selection` needs: the latest input event this window saw.
     pub fn input_serial(&self) -> u32 {
         self.state.clipboard.serial()
@@ -1956,20 +1986,27 @@ impl WaylandWindow {
         self.service_clipboard();
     }
 
-    /// When a paste transfer in flight must be serviced again.
+    /// When a clipboard or drag transfer in flight must be serviced again.
     pub fn paste_deadline(&self) -> Option<std::time::Instant> {
-        self.state
-            .clipboard
-            .timeout()
+        let clipboard = self.state.clipboard.timeout();
+        let dnd = self.state.dnd.timeout();
+        clipboard
+            .into_iter()
+            .chain(dnd)
+            .min()
             .map(|delay| std::time::Instant::now() + delay)
     }
 
-    /// Move clipboard pipes forward, queueing a finished paste as an event.
+    /// Move clipboard and drag pipes forward, queueing whatever finished as events.
     fn service_clipboard(&mut self) {
         if let Some(text) = self.state.clipboard.service() {
-            self.state.events.push(ui_core::Event::Paste(text));
-            self.state.redraw_requested = true;
+            self.state.push_event(ui_core::Event::Paste(text));
         }
+        let events = self.state.dnd.service();
+        for event in events {
+            self.state.push_event(event);
+        }
+        self.state.dnd.retire();
     }
 
     /// Block until at least one event arrives.
@@ -1992,6 +2029,9 @@ impl WaylandWindow {
         if let Some(t) = self.state.clipboard.timeout() {
             timeout = timeout.min(t);
         }
+        if let Some(t) = self.state.dnd.timeout() {
+            timeout = timeout.min(t);
+        }
         self.poll_once(timeout);
         self.service_clipboard();
         let _ = self.drain_events();
@@ -2004,7 +2044,8 @@ impl WaylandWindow {
             return;
         };
         let conn_fd = guard.connection_fd();
-        let pipes = self.state.clipboard.fds();
+        let mut pipes = self.state.clipboard.fds();
+        pipes.extend(self.state.dnd.fds());
         let mut fds: Vec<rustix::event::PollFd<'_>> = Vec::with_capacity(1 + pipes.len());
         fds.push(rustix::event::PollFd::from_borrowed_fd(
             conn_fd,

@@ -132,6 +132,8 @@ pub enum Event {
         before: usize,
         after: usize,
     },
+    /// A drag crossing the surface, as the operating system reports it.
+    Dnd(crate::dnd::DndEvent),
 }
 
 impl Event {
@@ -150,7 +152,12 @@ impl Event {
             | Event::PointerPressed { pos, .. }
             | Event::PointerReleased { pos, .. }
             | Event::Scroll { pos, .. } => Some(*pos),
-            Event::PointerLeft | Event::Text(_) | Event::KeyPressed { .. } => None,
+            Event::Dnd(
+                crate::dnd::DndEvent::Entered { pos, .. }
+                | crate::dnd::DndEvent::Over { pos }
+                | crate::dnd::DndEvent::Dropped { pos, .. },
+            ) => Some(*pos),
+            Event::PointerLeft | Event::Text(_) | Event::KeyPressed { .. } | Event::Dnd(_) => None,
             Event::KeyReleased { .. } | Event::Modifiers(_) => None,
             Event::Preedit(_) | Event::DeleteSurrounding { .. } | Event::Paste(_) => None,
         }

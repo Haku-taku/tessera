@@ -58,9 +58,29 @@ pub enum Change {
 
     /// A drag ended on `target`, the node under the pointer that accepts drops.
     ///
-    /// Placeholder: nothing declares `Sense::DROP` yet, so `target` is always `None` and
-    /// this only says "the gesture ended". Real drop targets fill it in later.
+    /// Reported to the node the drag started on, never to the target: the target hears
+    /// [`DroppedOn`](Self::DroppedOn) with the payload. `None` means the drag ended over
+    /// nothing that takes it, or over another application.
     Dropped(Option<Id>),
+
+    /// A drag is over this node and it accepts what the drag offers.
+    ///
+    /// `types` is the drag's MIME list, best first, so a target can preview what it is about
+    /// to receive. Sent once on arrival and once more whenever the pointer moves from a
+    /// non-target to this node; the node's `WidgetState::drag_over` stays true until
+    /// [`DragExited`](Self::DragExited) or [`DroppedOn`](Self::DroppedOn).
+    DragEntered { types: Vec<String> },
+
+    /// The drag left this node without dropping; the highlight comes down.
+    ///
+    /// Never sent when the drag is released here: `DroppedOn` ends the hover itself.
+    DragExited,
+
+    /// A drag was released on this node and it takes what the drag carries.
+    ///
+    /// The payload is the drag's own bytes, decoded by the platform for a drag from another
+    /// application and handed straight over for one inside this app.
+    DroppedOn(crate::dnd::DragData),
 
     /// The interaction that would have reported a change was abandoned.
     Cancelled,

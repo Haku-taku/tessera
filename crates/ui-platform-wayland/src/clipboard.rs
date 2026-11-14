@@ -7,6 +7,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
@@ -47,39 +48,18 @@ struct WriteJob {
     deadline: Instant,
 }
 
-/// The bytes behind our selection and the pipes a peer reads them through.
+/// Pipes a peer reads a payload from, drained without blocking the loop.
 ///
-/// A `wl_data_source` and a data-control source differ only in which object the compositor
-/// asks, so the payload and its drain are shared: neither may block the loop, and both die
-/// with the process that owns the selection.
-pub(crate) struct Payload {
-    contents: Option<Contents>,
+/// A selection and a drag source both hand peers a payload this way, and neither may stall
+/// a frame: the pipes are polled by the window's wait and written a slice per turn.
+#[derive(Default)]
+pub(crate) struct Outbox {
     writes: Vec<WriteJob>,
 }
 
-impl Payload {
-    pub(crate) fn new() -> Self {
-        Self {
-            contents: None,
-            writes: Vec::new(),
-        }
-    }
-
-    pub(crate) fn set(&mut self, contents: Contents) {
-        self.contents = Some(contents);
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.contents = None;
-    }
-
-    /// Queue our payload for a peer's `send` request.
-    pub(crate) fn serve(&mut self, fd: OwnedFd) {
-        let bytes = match self.contents.as_ref() {
-            Some(Contents::Text(text)) => std::sync::Arc::new(text.clone().into_bytes()),
-            Some(Contents::Bytes { data, .. }) => std::sync::Arc::clone(data),
-            None => std::sync::Arc::new(Vec::new()),
-        };
+impl Outbox {
+    /// Queue `bytes` for a peer's `send` request.
+    pub(crate) fn push(&mut self, fd: OwnedFd, bytes: Arc<Vec<u8>>) {
         self.writes.push(WriteJob {
             fd: File::from(fd),
             bytes,
@@ -127,6 +107,60 @@ impl Payload {
             .map(|w| w.deadline)
             .min()
             .map(|at| at.saturating_duration_since(Instant::now()))
+    }
+
+    /// Whether the peer has taken everything it asked for.
+    pub(crate) fn idle(&self) -> bool {
+        self.writes.is_empty()
+    }
+}
+
+/// The bytes behind our selection and the pipes a peer reads them through.
+///
+/// A `wl_data_source` and a data-control source differ only in which object the compositor
+/// asks, so the payload and its drain are shared: neither may block the loop, and both die
+/// with the process that owns the selection.
+pub(crate) struct Payload {
+    contents: Option<Contents>,
+    outbox: Outbox,
+}
+
+impl Payload {
+    pub(crate) fn new() -> Self {
+        Self {
+            contents: None,
+            outbox: Outbox::default(),
+        }
+    }
+
+    pub(crate) fn set(&mut self, contents: Contents) {
+        self.contents = Some(contents);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.contents = None;
+    }
+
+    /// Queue our payload for a peer's `send` request.
+    pub(crate) fn serve(&mut self, fd: OwnedFd) {
+        let bytes = match self.contents.as_ref() {
+            Some(Contents::Text(text)) => Arc::new(text.clone().into_bytes()),
+            Some(Contents::Bytes { data, .. }) => Arc::clone(data),
+            None => Arc::new(Vec::new()),
+        };
+        self.outbox.push(fd, bytes);
+    }
+
+    pub(crate) fn service(&mut self) {
+        self.outbox.service();
+    }
+
+    pub(crate) fn fds(&self) -> Vec<(BorrowedFd<'_>, bool)> {
+        self.outbox.fds()
+    }
+
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        self.outbox.timeout()
     }
 }
 
@@ -215,6 +249,12 @@ impl Drop for SelectionSource {
     }
 }
 
+/// An offer announced by `data_offer` and not yet claimed by a selection or a drag.
+struct PendingOffer {
+    offer: wl_data_offer::WlDataOffer,
+    mimes: Vec<String>,
+}
+
 /// Everything the seat's clipboard owns.
 pub(crate) struct Clipboard {
     manager: Option<wl_data_device_manager::WlDataDeviceManager>,
@@ -222,6 +262,9 @@ pub(crate) struct Clipboard {
     /// What the compositor last offered us; invalid once we lose keyboard focus.
     offer: Option<wl_data_offer::WlDataOffer>,
     mimes: Vec<String>,
+    /// The offer a following `selection` or `enter` names; its MIME types arrive before
+    /// either, so they are held here until the event says which side wants them.
+    pending: Option<PendingOffer>,
     /// Our side of the clipboard while this window is the one that copied.
     source: SelectionSource,
     /// Serial of the latest input event; `set_selection` is ignored without a fresh one.
@@ -236,6 +279,7 @@ impl Clipboard {
             device: None,
             offer: None,
             mimes: Vec::new(),
+            pending: None,
             source: SelectionSource::new(),
             serial: 0,
             read: None,
@@ -362,7 +406,72 @@ impl Clipboard {
         done
     }
 
-    fn set_offer(&mut self, offer: Option<wl_data_offer::WlDataOffer>) {
+    /// Take the offer `data_offer` announced, so the following `selection` or `enter`
+    /// claims it together with the MIME types that arrived in between.
+    pub(crate) fn set_pending(&mut self, offer: wl_data_offer::WlDataOffer) {
+        if self.pending.as_ref().is_some_and(|p| p.offer == offer) {
+            return;
+        }
+        if let Some(old) = self.pending.take() {
+            old.offer.destroy();
+        }
+        self.pending = Some(PendingOffer {
+            offer,
+            mimes: Vec::new(),
+        });
+    }
+
+    /// Claim the pending offer `id` names, with the MIME types announced for it.
+    ///
+    /// A drag takes it into the drag state, a selection into the paste state. The caller
+    /// owns the returned object and destroys it.
+    pub(crate) fn take_pending(
+        &mut self,
+        id: &wl_data_offer::WlDataOffer,
+    ) -> (wl_data_offer::WlDataOffer, Vec<String>) {
+        match self.pending.take() {
+            Some(pending) if &pending.offer == id => (pending.offer, pending.mimes),
+            Some(pending) => {
+                // The announcement and the claim disagree; keep the claimed object, which
+                // is the one the compositor names, and let the other go.
+                pending.offer.destroy();
+                (id.clone(), Vec::new())
+            }
+            None => (id.clone(), Vec::new()),
+        }
+    }
+
+    /// Record a MIME type on whichever offer it belongs to. False when it is neither the
+    /// selection's nor a pending one (a drag's, which the drag module keeps).
+    pub(crate) fn note_mime(&mut self, offer: &wl_data_offer::WlDataOffer, mime: String) -> bool {
+        if let Some(pending) = self.pending.as_mut()
+            && &pending.offer == offer
+        {
+            pending.mimes.push(mime);
+            return true;
+        }
+        if self.offer.as_ref() == Some(offer) {
+            self.mimes.push(mime);
+            return true;
+        }
+        false
+    }
+
+    /// Publish the selection: the offer `selection` names, or none.
+    pub(crate) fn set_selection_offer(&mut self, id: Option<wl_data_offer::WlDataOffer>) {
+        // A `selection` with no offer also drops an announcement the compositor abandoned.
+        let (offer, mimes) = match id {
+            Some(id) => {
+                let (offer, mimes) = self.take_pending(&id);
+                (Some(offer), mimes)
+            }
+            None => {
+                if let Some(pending) = self.pending.take() {
+                    pending.offer.destroy();
+                }
+                (None, Vec::new())
+            }
+        };
         // `data_offer` and `selection` announce the same object; destroying it twice kills it.
         if let (Some(old), Some(new)) = (self.offer.as_ref(), offer.as_ref())
             && old == new
@@ -372,8 +481,28 @@ impl Clipboard {
         if let Some(old) = self.offer.take() {
             old.destroy();
         }
-        self.mimes.clear();
+        self.mimes = mimes;
         self.offer = offer;
+    }
+
+    /// The device an outgoing drag starts from, when the compositor gave the seat one.
+    pub(crate) fn device(
+        &self,
+    ) -> Option<(
+        wl_data_device_manager::WlDataDeviceManager,
+        wl_data_device::WlDataDevice,
+    )> {
+        Some((self.manager.clone()?, self.device.clone()?))
+    }
+
+    /// Queue a peer's request for our selection's bytes.
+    pub(crate) fn serve_source(&mut self, fd: OwnedFd) {
+        self.source.serve(fd);
+    }
+
+    /// The compositor took the selection away from us.
+    pub(crate) fn cancel_source(&mut self) {
+        self.source.cancelled();
     }
 }
 
@@ -381,6 +510,9 @@ impl Drop for Clipboard {
     fn drop(&mut self) {
         if let Some(offer) = self.offer.take() {
             offer.destroy();
+        }
+        if let Some(pending) = self.pending.take() {
+            pending.offer.destroy();
         }
     }
 }
@@ -398,58 +530,5 @@ impl Dispatch<wl_data_device_manager::WlDataDeviceManager, ()> for WindowState {
     }
 }
 
-impl Dispatch<wl_data_device::WlDataDevice, ()> for WindowState {
-    // `data_offer` is the only event that creates an object; without this the client panics.
-    wayland_client::event_created_child!(WindowState, wl_data_device::WlDataDevice, [
-        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
-    ]);
-
-    fn event(
-        state: &mut Self,
-        _: &wl_data_device::WlDataDevice,
-        event: wl_data_device::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_data_device::Event::DataOffer { id } => state.clipboard.set_offer(Some(id)),
-            wl_data_device::Event::Selection { id } => state.clipboard.set_offer(id),
-            // `leave` ends a drag-and-drop session, not the selection; paste must survive it.
-            wl_data_device::Event::Leave => {}
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<wl_data_offer::WlDataOffer, ()> for WindowState {
-    fn event(
-        state: &mut Self,
-        _: &wl_data_offer::WlDataOffer,
-        event: wl_data_offer::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_data_offer::Event::Offer { mime_type } = event {
-            state.clipboard.mimes.push(mime_type);
-        }
-    }
-}
-
-impl Dispatch<wl_data_source::WlDataSource, ()> for WindowState {
-    fn event(
-        state: &mut Self,
-        _: &wl_data_source::WlDataSource,
-        event: wl_data_source::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_data_source::Event::Send { fd, .. } => state.clipboard.source.serve(fd),
-            wl_data_source::Event::Cancelled => state.clipboard.source.cancelled(),
-            _ => {}
-        }
-    }
-}
+// The data device itself is dispatched by `crate::dnd`: one device carries both the
+// selection and drag-and-drop, and only the event says which side the offer belongs to.

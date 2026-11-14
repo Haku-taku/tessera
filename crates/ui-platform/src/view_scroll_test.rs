@@ -855,6 +855,9 @@ fn tall_paragraph(index: usize) -> Decl {
         grid: ui_core::GridItem::default(),
         placement: ui_core::layout::Placement::default(),
         env: None,
+        drag: None,
+        drag_out: false,
+        drop_types: None,
         children: Vec::new(),
     }
 }

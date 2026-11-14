@@ -53,6 +53,9 @@ fn text_decl(id: &'static str, text: &str, size: f32, color: Color) -> Decl {
         grid: Default::default(),
         placement: Default::default(),
         env: None,
+        drag: None,
+        drag_out: false,
+        drop_types: None,
         children: Vec::new(),
     }
 }
