@@ -4,7 +4,9 @@ use ui_core::BackdropBlur;
 use ui_core::anim::{AnimSpec, Easing};
 use ui_core::draw::{Acrylic, BackdropMaterial};
 use ui_core::geom::{Color, Corners, Insets};
-use ui_core::layout::{Anchor, AxisSize, Grow, OverlayAlign, OverlayPlacement, Side, SizeClass};
+use ui_core::layout::{
+    Anchor, AxisSize, Grow, OverlayAlign, OverlayPlacement, Presentation, Side, SizeClass,
+};
 use ui_core::{Decl, Id, NodeKind};
 use ui_style::Style;
 use ui_widgets::text::Text;
@@ -119,6 +121,7 @@ impl Widget for FluentToolTip {
             match_anchor_width: false,
             match_anchor_height: false,
             min_width: 0.0,
+            presentation: Presentation::Parent,
         };
         // A fully faded panel paints nothing, so the app can keep it mounted across the fade.
         // It stays an overlay: an in-flow stand-in would take a slot and shift the page.

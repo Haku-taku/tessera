@@ -2,7 +2,9 @@
 
 use ui_core::draw::{Acrylic, BackdropMaterial, FocusVisual};
 use ui_core::geom::{Color, Corners, Insets};
-use ui_core::layout::{Anchor, AxisSize, Grow, OverlayAlign, OverlayPlacement, Side, SizeClass};
+use ui_core::layout::{
+    Anchor, AxisSize, Grow, OverlayAlign, OverlayPlacement, Presentation, Side, SizeClass,
+};
 use ui_core::shortcut::{KeyChord, ShortcutId};
 use ui_core::{
     BackdropBlur, Change, CursorShape, Decl, Id, Key, Modifiers, NodeKind, Sense, Weight,
@@ -717,6 +719,7 @@ impl FluentComboBox {
             match_anchor_width: true,
             match_anchor_height: false,
             min_width: POPUP_MIN_WIDTH,
+            presentation: Presentation::Parent,
         };
         let corners = Corners::all(POPUP_RADIUS);
         // The window is the one the field's width is applied to, so the panel fills it.

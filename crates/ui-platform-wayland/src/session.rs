@@ -7,7 +7,7 @@ use ui_core::geom::Point;
 use ui_core::timed;
 use ui_platform::clipboard::{ClipboardCommand, ClipboardCopy, ClipboardKind};
 use ui_platform::driver::{Driver, Turn};
-use ui_platform::host::{SurfaceHandle, SurfaceStep};
+use ui_platform::host::{Engine, SurfaceHandle, SurfaceStep};
 #[cfg(feature = "gpu")]
 use ui_platform::present::{PresentStats, SceneTarget};
 use ui_platform::session::{HostSession, SessionOptions, Tick};
@@ -18,6 +18,8 @@ use ui_platform::view::{App, AppLoop};
 #[cfg(feature = "gpu")]
 use crate::gpu_window::{GpuWindow, GpuWindowConfig};
 use crate::window::WaylandWindow;
+#[cfg(feature = "gpu")]
+use ui_platform::window::{PopupSpec, SurfaceRole, SurfaceSpec};
 
 /// The GPU presenter as the engine's scene target.
 #[cfg(feature = "gpu")]
@@ -89,15 +91,17 @@ impl SceneTarget for GpuTarget<'_> {
     }
 }
 
-/// Window, presenter and driver, owned together so an app never orders them itself.
+/// One Wayland surface as a presenter: window, renderer, driver and its own input.
 ///
 /// Dropped in declaration order, which is the order teardown needs: GPU objects while the
-/// surface still exists, then the loop, then the window.
-pub struct Session<A: App> {
+/// surface still exists, then the driver, then the window.
+pub struct Presenter {
     #[cfg(feature = "gpu")]
     gpu: Option<GpuWindow>,
     driver: Driver,
-    lp: AppLoop<A>,
+    /// What this surface was opened as, so a panel it opens is named the same way.
+    #[cfg(feature = "gpu")]
+    spec: SurfaceSpec,
     win: WaylandWindow,
     /// Scripted pointer for the next frame; see `set_pointer`.
     pointer: Option<Point>,
@@ -105,26 +109,32 @@ pub struct Session<A: App> {
     closed: bool,
 }
 
-impl<A: App> Session<A> {
-    /// Open the surface and pick a presenter; the loop is the caller's, the lifecycle is not.
-    pub fn open(lp: AppLoop<A>, opts: SessionOptions) -> Result<Self, String> {
-        Self::open_linked(lp, opts, None)
+/// An app and the one surface it drives, for code that runs a single window itself.
+///
+/// The loop is dropped before the presenter, so the engine lets go of the window it built
+/// frames for rather than the other way round.
+pub struct Session<A: App> {
+    lp: AppLoop<A>,
+    presenter: Presenter,
+}
+
+impl Presenter {
+    /// Open the surface and pick a presenter.
+    pub fn open(opts: SessionOptions) -> Result<Self, String> {
+        Self::open_linked(opts, None)
     }
 
-    /// Open on an existing connection, so this session's surface is one of several.
-    pub fn open_on(
-        link: &crate::link::WaylandLink,
-        lp: AppLoop<A>,
-        opts: SessionOptions,
-    ) -> Result<Self, String> {
-        Self::open_linked(lp, opts, Some(link))
+    /// Open on an existing connection, so this surface is one of several.
+    pub fn open_on(link: &crate::link::WaylandLink, opts: SessionOptions) -> Result<Self, String> {
+        Self::open_linked(opts, Some(link))
     }
 
     fn open_linked(
-        lp: AppLoop<A>,
         opts: SessionOptions,
         link: Option<&crate::link::WaylandLink>,
     ) -> Result<Self, String> {
+        #[cfg(feature = "gpu")]
+        let spec = opts.surface.clone();
         let win = match link {
             Some(link) => link.surface(opts.surface),
             None => WaylandWindow::new(opts.surface),
@@ -151,20 +161,21 @@ impl<A: App> Session<A> {
             #[cfg(feature = "gpu")]
             gpu,
             driver: Driver::new().uncapped(opts.uncapped),
-            lp,
+            #[cfg(feature = "gpu")]
+            spec,
             win,
             pointer: None,
             closed: false,
         })
     }
 
-    /// The GPU renderer's name and node, when one is in use.
     /// The pointer to build the next frame with, overriding the seat's — scripted input
     /// needs it, or the frame snaps back to wherever the real cursor is.
     pub fn set_pointer(&mut self, pointer: Option<Point>) {
         self.pointer = pointer;
     }
 
+    /// The GPU renderer's name and node, when one is in use.
     pub fn presenter_name(&self) -> Option<String> {
         #[cfg(feature = "gpu")]
         {
@@ -178,14 +189,6 @@ impl<A: App> Session<A> {
         }
     }
 
-    pub fn lp(&self) -> &AppLoop<A> {
-        &self.lp
-    }
-
-    pub fn lp_mut(&mut self) -> &mut AppLoop<A> {
-        &mut self.lp
-    }
-
     pub fn window(&self) -> &WaylandWindow {
         &self.win
     }
@@ -194,7 +197,7 @@ impl<A: App> Session<A> {
         &mut self.win
     }
 
-    /// The connection the session runs on; see [`WaylandLink`](crate::link::WaylandLink).
+    /// The connection this surface runs on; see [`WaylandLink`](crate::link::WaylandLink).
     pub fn link(&self) -> crate::link::WaylandLink {
         self.win.link()
     }
@@ -202,13 +205,6 @@ impl<A: App> Session<A> {
     #[cfg(feature = "gpu")]
     pub fn gpu_mut(&mut self) -> Option<&mut GpuWindow> {
         self.gpu.as_mut()
-    }
-
-    /// All three at once, for host code that needs the engine and the window together
-    /// (clipboard round-trips, synthetic input). Finish with them before calling `tick`.
-    #[cfg(feature = "gpu")]
-    pub fn split(&mut self) -> (&mut AppLoop<A>, &mut WaylandWindow, Option<&mut GpuWindow>) {
-        (&mut self.lp, &mut self.win, self.gpu.as_mut())
     }
 
     pub fn finished(&self) -> bool {
@@ -234,44 +230,44 @@ impl<A: App> Session<A> {
     ///
     /// The loop's form. It never waits — polling the connection is the loop's job — so it
     /// can be called for every surface of a process in turn.
-    pub fn step(&mut self) -> Result<Tick, String> {
+    pub fn step_with<A: App>(&mut self, lp: &mut AppLoop<A>) -> Result<Tick, String> {
         self.win
             .pump_checked()
             .map_err(|error| format!("wayland: {error}"))?;
         self.win.service_paste();
-        if self.take_close() {
+        if self.take_close(lp) {
             return Ok(Tick::default());
         }
-        let pointer = match self.driver.decide(&mut self.lp, &mut self.win) {
+        let pointer = match self.driver.decide(lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
             Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
         };
-        self.draw(pointer)
+        self.draw(lp, pointer)
     }
 
     /// Intake, decide, draw and pace — everything a frame needs, waiting included.
     ///
     /// The single-surface form: scripted probes and tests drive one session themselves.
-    pub fn tick(&mut self) -> Result<Tick, String> {
-        if self.take_close() {
+    pub fn tick_with<A: App>(&mut self, lp: &mut AppLoop<A>) -> Result<Tick, String> {
+        if self.take_close(lp) {
             return Ok(Tick::default());
         }
-        let pointer = match self.driver.step(&mut self.lp, &mut self.win) {
+        let pointer = match self.driver.step(lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
             Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
         };
-        let tick = self.draw(pointer)?;
+        let tick = self.draw(lp, pointer)?;
         self.driver.pace(&mut self.win);
         Ok(tick)
     }
 
     /// A close the app asked for, recorded once so a later turn stays closed.
-    fn take_close(&mut self) -> bool {
-        self.closed |= self.lp.take_close();
+    fn take_close<A: App>(&mut self, lp: &mut AppLoop<A>) -> bool {
+        self.closed |= lp.take_close();
         self.closed
     }
 
-    fn draw(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
+    fn draw<A: App>(&mut self, lp: &mut AppLoop<A>, pointer: Option<Point>) -> Result<Tick, String> {
         // A scripted pointer wins over the seat's, which the driver just read.
         let pointer = self.pointer.take().or(pointer);
         #[cfg(feature = "gpu")]
@@ -281,10 +277,10 @@ impl<A: App> Session<A> {
                     win: &mut self.win,
                     gpu,
                 };
-                self.lp.frame_scene(&mut target, pointer)
+                lp.frame_scene(&mut target, pointer)
             }
             None => {
-                let outcome = self.lp.frame(&mut self.win, pointer);
+                let outcome = lp.frame(&mut self.win, pointer);
                 Ok(ui_platform::view::SceneFrameOutcome {
                     outcome,
                     presented: None,
@@ -293,35 +289,34 @@ impl<A: App> Session<A> {
         }?;
         #[cfg(not(feature = "gpu"))]
         let framed = {
-            let outcome = self.lp.frame(&mut self.win, pointer);
+            let outcome = lp.frame(&mut self.win, pointer);
             Ok::<_, String>(ui_platform::view::SceneFrameOutcome {
                 outcome,
                 presented: None,
             })
         }?;
         // A close the build asked for takes effect in this turn, not the next one.
-        self.closed |= self.lp.take_close();
+        self.closed |= lp.take_close();
         // A build may ask to move the pointer, which only this surface's window can do. A
         // refused step moves nothing; the app keeps the position it had, as documented.
-        let steps = self.lp.take_pointer_steps();
+        let steps = lp.take_pointer_steps();
         for (dx, dy) in &steps {
             self.win.nudge_pointer(*dx, *dy);
         }
         // The frame just built read the pointer's old place, so one more shows the new one.
         if !steps.is_empty() {
-            self.lp.request_frame();
+            lp.request_frame();
         }
         // A drag that asked to leave the app becomes the compositor's; the outcome comes
         // back as an event once the target is done with it.
-        if let Some(drag) = self.lp.take_native_drag()
+        if let Some(drag) = lp.take_native_drag()
             && !self.win.begin_drag(drag.data)
         {
             // The host refused, so the gesture ends without a drop.
-            self.lp
-                .dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Finished {
-                    dropped: false,
-                }));
-            self.lp.request_frame();
+            lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Finished {
+                dropped: false,
+            }));
+            lp.request_frame();
         }
         Ok(Tick {
             drew: true,
@@ -329,6 +324,275 @@ impl<A: App> Session<A> {
             presented: framed.presented,
             pointer,
         })
+    }
+}
+
+/// A panel's own surface: the engine paints it, this presenter shows it and routes its input.
+///
+/// The panel's subtree lives in the parent's tree, so this is not a second engine: what
+/// arrives here is shifted back into that tree and dispatched to the same app.
+#[cfg(feature = "gpu")]
+pub struct PopupPresenter {
+    gpu: GpuWindow,
+    win: WaylandWindow,
+    /// What the popup was opened as, so a panel inside it is named the same way.
+    spec: SurfaceSpec,
+    node: ui_core::NodeId,
+    /// The tree origin of the surface this popup hangs from.
+    parent_origin: Point,
+    /// Where the panel's subtree stands in the parent tree's coordinates.
+    origin: Point,
+    /// The build whose panel list this surface last showed.
+    presented: Option<u64>,
+    /// The compositor took the popup back; the host dismisses the panel.
+    closed: bool,
+}
+
+/// The surface spec a panel's window is opened with.
+#[cfg(feature = "gpu")]
+fn popup_surface_spec(parent: &SurfaceSpec, spec: PopupSpec) -> SurfaceSpec {
+    SurfaceSpec {
+        app_id: parent.app_id.clone(),
+        name: parent.name.clone(),
+        role: SurfaceRole::Window {
+            size: (
+                spec.rect.size.w.round().max(1.0) as u32,
+                spec.rect.size.h.round().max(1.0) as u32,
+            ),
+        },
+        min_size: None,
+    }
+}
+
+/// Open a popup hung off `parent_window` that shows the panel `node`.
+///
+/// `spec` is in the parent presentation's coordinates, so the panel's place in the tree is
+/// that offset from `parent_origin`.
+#[cfg(feature = "gpu")]
+fn open_panel(
+    parent_window: &WaylandWindow,
+    parent_spec: &SurfaceSpec,
+    parent_origin: Point,
+    node: ui_core::NodeId,
+    spec: PopupSpec,
+    grab_serial: u32,
+) -> Result<PopupPresenter, String> {
+    let surface = popup_surface_spec(parent_spec, spec);
+    let mut win = WaylandWindow::create_popup(parent_window, surface.clone(), spec, grab_serial)
+        .map_err(|e| format!("cannot open a popup surface: {e}"))?;
+    let gpu = GpuWindow::open(&mut win, GpuWindowConfig::default())
+        .map_err(|e| format!("GPU presenter unavailable: {e}"))?;
+    Ok(PopupPresenter {
+        gpu,
+        win,
+        spec: surface,
+        node,
+        parent_origin,
+        origin: parent_origin + spec.rect.origin,
+        presented: None,
+        closed: false,
+    })
+}
+
+/// Move an event's position from a panel's own space into the parent tree's.
+#[cfg(feature = "gpu")]
+fn shift(event: ui_core::Event, by: Point) -> ui_core::Event {
+    use ui_core::Event;
+    match event {
+        Event::PointerMoved { pos } => Event::PointerMoved { pos: pos + by },
+        Event::PointerPressed { pos, button } => Event::PointerPressed { pos: pos + by, button },
+        Event::PointerReleased { pos, button } => Event::PointerReleased { pos: pos + by, button },
+        Event::Scroll { pos, delta } => Event::Scroll { pos: pos + by, delta },
+        other => other,
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl PopupPresenter {
+    /// Feed what arrived on this surface into the tree the panel belongs to.
+    ///
+    /// A dispatch that can change the frame leaves the engine owing a build, which is what
+    /// wakes the loop for it; a move over inert space asks for nothing.
+    fn route_input(&mut self, engine: &mut Engine) {
+        let origin = self.origin;
+        for event in self.win.take_events() {
+            engine.dispatch(shift(event, origin));
+        }
+    }
+
+    /// Show the shape the tree gives the pointer's place on the panel.
+    fn follow_cursor(&mut self, engine: &Engine) {
+        if let Some(at) = self.win.pointer() {
+            self.win.set_cursor(engine.cursor_shape_at(at + self.origin));
+        }
+    }
+
+    fn present(&mut self, engine: &Engine, frame: u64) -> Result<(), String> {
+        let mut target = GpuTarget {
+            win: &mut self.win,
+            gpu: &mut self.gpu,
+        };
+        engine
+            .present_panel(self.node, &mut target)
+            .map_err(|e| format!("present failed: {e}"))?;
+        self.presented = Some(frame);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl SurfaceHandle for PopupPresenter {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        self.win
+            .pump_checked()
+            .map_err(|error| format!("wayland: {error}"))?;
+        if self.win.should_close() {
+            self.closed = true;
+            return Ok(SurfaceStep::default());
+        }
+        self.route_input(engine);
+        self.follow_cursor(engine);
+        let frame = engine.frame_number();
+        // Nothing new since the last show, nothing painted for it, or no frame window yet.
+        if self.presented == Some(frame)
+            || !self.win.can_draw()
+            || !engine.panel_painted(self.node)
+        {
+            return Ok(SurfaceStep::default());
+        }
+        self.present(engine, frame)?;
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        self.win.repeat_deadline()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed || self.win.should_close()
+    }
+
+    /// Empty: the app is one, and its copy commands are drained by the surface that steps
+    /// first — the parent's, which is the one that can serve them this same turn.
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+
+    /// A panel inside this one hangs off this surface, so the grab stays with the topmost.
+    fn open_popup(
+        &mut self,
+        node: ui_core::NodeId,
+        spec: PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        let grab = self.win.input_serial();
+        let presenter = open_panel(&self.win, &self.spec, self.origin, node, spec, grab)?;
+        Ok(Box::new(presenter))
+    }
+
+    fn reconfigure(&mut self, spec: PopupSpec) -> Result<(), String> {
+        self.win.reposition_popup(spec)?;
+        self.origin = self.parent_origin + spec.rect.origin;
+        Ok(())
+    }
+}
+
+impl<A: App> Session<A> {
+    /// Open the surface and pick a presenter; the loop is the caller's, the lifecycle is not.
+    pub fn open(lp: AppLoop<A>, opts: SessionOptions) -> Result<Self, String> {
+        Ok(Self {
+            lp,
+            presenter: Presenter::open(opts)?,
+        })
+    }
+
+    /// Open on an existing connection, so this session's surface is one of several.
+    pub fn open_on(
+        link: &crate::link::WaylandLink,
+        lp: AppLoop<A>,
+        opts: SessionOptions,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            lp,
+            presenter: Presenter::open_on(link, opts)?,
+        })
+    }
+
+    /// The pointer to build the next frame with, overriding the seat's — scripted input
+    /// needs it, or the frame snaps back to wherever the real cursor is.
+    pub fn set_pointer(&mut self, pointer: Option<Point>) {
+        self.presenter.set_pointer(pointer);
+    }
+
+    pub fn presenter_name(&self) -> Option<String> {
+        self.presenter.presenter_name()
+    }
+
+    pub fn lp(&self) -> &AppLoop<A> {
+        &self.lp
+    }
+
+    pub fn lp_mut(&mut self) -> &mut AppLoop<A> {
+        &mut self.lp
+    }
+
+    pub fn window(&self) -> &WaylandWindow {
+        self.presenter.window()
+    }
+
+    pub fn window_mut(&mut self) -> &mut WaylandWindow {
+        self.presenter.window_mut()
+    }
+
+    /// The connection the session runs on; see [`WaylandLink`](crate::link::WaylandLink).
+    pub fn link(&self) -> crate::link::WaylandLink {
+        self.presenter.link()
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn gpu_mut(&mut self) -> Option<&mut GpuWindow> {
+        self.presenter.gpu_mut()
+    }
+
+    /// All three at once, for host code that needs the engine and the window together
+    /// (clipboard round-trips, synthetic input). Finish with them before calling `tick`.
+    #[cfg(feature = "gpu")]
+    pub fn split(&mut self) -> (&mut AppLoop<A>, &mut WaylandWindow, Option<&mut GpuWindow>) {
+        let presenter = &mut self.presenter;
+        (&mut self.lp, &mut presenter.win, presenter.gpu.as_mut())
+    }
+
+    pub fn finished(&self) -> bool {
+        self.presenter.finished()
+    }
+
+    /// How long the last turn waited for a frame callback; a long one means a stalled output.
+    pub fn last_wait(&self) -> Duration {
+        self.presenter.last_wait()
+    }
+
+    /// Frame waits so far and their total, for the host's exit line.
+    pub fn wait_stats(&self) -> (Duration, u32) {
+        self.presenter.wait_stats()
+    }
+
+    /// Events the last turn took from the window and dispatched to the app.
+    pub fn events(&self) -> &[ui_core::Event] {
+        self.presenter.events()
+    }
+
+    /// One non-blocking turn: dispatch what arrived and draw if a frame is due.
+    ///
+    /// The loop's form. It never waits — polling the connection is the loop's job — so it
+    /// can be called for every surface of a process in turn.
+    pub fn step(&mut self) -> Result<Tick, String> {
+        self.presenter.step_with(&mut self.lp)
+    }
+
+    /// Intake, decide, draw and pace — everything a frame needs, waiting included.
+    ///
+    /// The single-surface form: scripted probes and tests drive one session themselves.
+    pub fn tick(&mut self) -> Result<Tick, String> {
+        self.presenter.tick_with(&mut self.lp)
     }
 }
 
@@ -385,35 +649,35 @@ impl<A: App> HostSession<A> for Session<A> {
     }
 
     fn logical_size(&self) -> (u32, u32) {
-        self.win.logical_size()
+        self.presenter.win.logical_size()
     }
 
     fn scale(&self) -> f32 {
-        self.win.scale()
+        self.presenter.win.scale()
     }
 
     fn request_close(&mut self) {
-        self.win.request_close();
+        self.presenter.win.request_close();
     }
 
     fn write_clipboard(&mut self, content: ui_core::clipboard::ClipboardContent) -> bool {
-        self.win.write_clipboard(content)
+        self.presenter.win.write_clipboard(content)
     }
 
     fn request_paste(&mut self) -> bool {
-        self.win.request_paste()
+        self.presenter.win.request_paste()
     }
 
     fn begin_drag(&mut self, drag: ui_platform::view::NativeDrag) -> bool {
         // A compositor drag has no image of its own: the surface behind it keeps painting,
         // so the element under the pointer is what shows.
-        self.win.begin_drag(drag.data)
+        self.presenter.win.begin_drag(drag.data)
     }
 
     fn gpu_present(&self) -> bool {
         #[cfg(feature = "gpu")]
         {
-            self.gpu.is_some()
+            self.presenter.gpu.is_some()
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -423,7 +687,7 @@ impl<A: App> HostSession<A> for Session<A> {
 
     fn set_supersample(&mut self, factor: u32) {
         #[cfg(feature = "gpu")]
-        if let Some(gpu) = self.gpu.as_mut() {
+        if let Some(gpu) = self.presenter.gpu.as_mut() {
             gpu.renderer_mut().set_supersample(factor);
         }
         #[cfg(not(feature = "gpu"))]
@@ -433,15 +697,18 @@ impl<A: App> HostSession<A> for Session<A> {
     }
 
     fn frame_callbacks(&mut self) -> u32 {
-        self.win.take_frame_callbacks()
+        self.presenter.win.take_frame_callbacks()
     }
 
     fn refresh_hz(&self) -> Option<f32> {
-        self.win.refresh_hz()
+        self.presenter.win.refresh_hz()
     }
 
     fn dmabuf_stats(&self) -> Option<(usize, u32)> {
-        Some((self.win.dmabuf_inflight(), self.win.dmabuf_releases()))
+        Some((
+            self.presenter.win.dmabuf_inflight(),
+            self.presenter.win.dmabuf_releases(),
+        ))
     }
 
     fn dump_frame(&mut self, path: &std::path::Path) -> Result<(), String> {
@@ -455,7 +722,7 @@ impl<A: App> HostSession<A> for Session<A> {
             }
             // The layer dump goes beside the frame: one path names both pictures.
             let layer = path.with_file_name(format!("{}_layer.ppm", stem(path)));
-            let Some(gpu) = self.gpu.as_mut() else {
+            let Some(gpu) = self.presenter.gpu.as_mut() else {
                 return Err(String::from("this session presents through the CPU rasterizer"));
             };
             gpu.dump_ppm(path, &layer)
@@ -471,23 +738,19 @@ impl<A: App> HostSession<A> for Session<A> {
 
     fn finish(&mut self) {
         #[cfg(feature = "gpu")]
-        if let Some(gpu) = self.gpu.as_mut() {
+        if let Some(gpu) = self.presenter.gpu.as_mut() {
             gpu.finish();
         }
     }
 }
 
-impl<A: App + 'static> SurfaceHandle for Session<A> {
-    fn add_image(&mut self, image: ui_core::draw::ImageEntry) -> Result<(), String> {
-        self.lp.register_image(image);
-        Ok(())
+impl SurfaceHandle for Presenter {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        self.step_with(engine)
+            .map(|tick| SurfaceStep { drew: tick.drew })
     }
 
-    fn step(&mut self) -> Result<SurfaceStep, String> {
-        Session::step(self).map(|tick| SurfaceStep { drew: tick.drew })
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
         [
             self.driver.deadline(),
             self.win.paste_deadline(),
@@ -498,20 +761,34 @@ impl<A: App + 'static> SurfaceHandle for Session<A> {
         .min()
     }
 
-    fn request_frame(&mut self) {
-        self.lp.request_frame();
-    }
-
     fn is_closed(&self) -> bool {
         self.closed || self.win.should_close()
     }
 
+    /// A panel hung off this surface gets one of its own, with its own renderer.
+    #[cfg(feature = "gpu")]
+    fn open_popup(
+        &mut self,
+        node: ui_core::NodeId,
+        spec: PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        // Without a GPU there is no scene target to hand a panel's list to.
+        if self.gpu.is_none() {
+            return Err("the CPU presenter cannot show a panel in a surface of its own".into());
+        }
+        // The press that declared the panel, which is what a grab may carry.
+        let grab = self.win.input_serial();
+        let root = Point::new(0.0, 0.0);
+        let presenter = open_panel(&self.win, &self.spec, root, node, spec, grab)?;
+        Ok(Box::new(presenter))
+    }
+
     /// Copies go to the process's clipboard host, not to this window's own source: a window
     /// that copied and closed would take the selection with it.
-    fn take_copies(&mut self) -> Vec<ClipboardCopy> {
+    fn take_copies(&mut self, engine: &mut Engine) -> Vec<ClipboardCopy> {
         let serial = self.win.input_serial();
         let mut copies = Vec::new();
-        for command in self.lp.take_clipboard_commands() {
+        for command in engine.take_clipboard_commands() {
             match command {
                 ClipboardCommand::Copy { content, kind } => copies.push(ClipboardCopy {
                     content,

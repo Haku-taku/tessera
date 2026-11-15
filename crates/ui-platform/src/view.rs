@@ -1080,6 +1080,13 @@ pub struct AppLoop<A: App> {
     image_slots: FastMap<(u64, ui_core::draw::Sampling), u32>,
     /// Last frame's ink rect and content hash per node id, for damage diffing.
     node_prints: FastMap<Id, (Rect, u64)>,
+    /// Panels the last build painted for a surface of the platform's own: each subtree's
+    /// list, rebased on the panel's own top-left, ready for that surface to take.
+    panel_views: Vec<(ui_core::NodeId, ui_core::draw::DrawList)>,
+    /// Which presentation the host gave each platform panel: `true` for a surface of its
+    /// own, `false` for the parent's. Absent means the host has not decided yet, and the
+    /// panel is held back rather than painted somewhere it would have to move from.
+    panel_presentation: FastMap<ui_core::NodeId, bool>,
     /// The backdrop each node painted last frame. A frost writes no primitive of its own,
     /// so it is absent from `node_prints` and must be diffed on its own.
     backdrops: FastMap<Id, ui_core::draw::BackdropEntry>,
@@ -1307,6 +1314,8 @@ impl<A: App> AppLoop<A> {
             damage: DamageAccum::new(),
             frame: 0,
             node_prints: FastMap::default(),
+            panel_views: Vec::new(),
+            panel_presentation: FastMap::default(),
             backdrops: FastMap::default(),
             backdrops_now: FastMap::default(),
             layer_prints: Vec::new(),
@@ -1574,6 +1583,15 @@ impl<A: App> AppLoop<A> {
     }
 
     /// Whether an event since the last call requires a build; takes the flag.
+    /// Whether something asked for a frame that no build has drawn yet.
+    ///
+    /// A loop that is about to block must wake at once while this holds: the demand came
+    /// from input or a dismissal that arrived after the last build, and nothing else will
+    /// arrive to carry it.
+    pub fn frame_due(&self) -> bool {
+        self.dispatched
+    }
+
     pub fn take_dispatched(&mut self) -> bool {
         std::mem::take(&mut self.dispatched)
     }
@@ -1843,6 +1861,68 @@ impl<A: App> AppLoop<A> {
             outcome,
             presented: Some(presented),
         })
+    }
+
+    /// The panels the last layout put on a surface of the platform's own.
+    pub fn platform_panels(&self) -> &[ui_core::layout::PlatformPanel] {
+        self.tree.platform_panels()
+    }
+
+    /// Which build the panel lists come from.
+    ///
+    /// A panel surface shows the frame it was handed, not the tree as it is now: comparing
+    /// this against the number it presented last is what tells it there is nothing new.
+    pub fn frame_number(&self) -> u64 {
+        self.frame
+    }
+
+    /// Say where a panel's declaration is presented, once the host has decided.
+    ///
+    /// `true` when the platform opened a surface of its own for the panel, `false` when no
+    /// surface could be had and the panel is painted by its parent after all.
+    pub fn set_panel_presentation(&mut self, node: ui_core::NodeId, platform: bool) {
+        self.panel_presentation.insert(node, platform);
+    }
+
+    /// The platform took a panel's surface back — the grab ended, the window server closed
+    /// it. Reported to the app the way a press outside is, so it closes what it declared.
+    ///
+    /// Returns false when the node is no longer in the tree, where there is nothing to
+    /// dismiss and nobody to tell.
+    pub fn dismiss_panel(&mut self, node: ui_core::NodeId) -> bool {
+        let Some(id) = self.tree.get(node).map(|decl| decl.id) else {
+            return false;
+        };
+        self.dismissed = Some(id);
+        // The app reads the dismissal in a build; without the demand the next build would
+        // only happen when unrelated input arrived, which is too late to matter.
+        self.dispatched = true;
+        true
+    }
+
+    /// Whether the last build painted a list for this panel.
+    ///
+    /// A panel the host bound after that build has none yet: its surface waits for the
+    /// frame the binding itself asked for.
+    pub fn panel_painted(&self, node: ui_core::NodeId) -> bool {
+        self.panel_views.iter().any(|(id, _)| *id == node)
+    }
+
+    /// Hand `node`'s panel, as the last frame painted it, to the surface the platform
+    /// opened for it.
+    ///
+    /// The list is rebased on the panel's own top-left and carries the whole panel every
+    /// time: that surface shows nothing else, so it has nothing to diff against.
+    pub fn present_panel(
+        &self,
+        node: ui_core::NodeId,
+        target: &mut dyn crate::present::SceneTarget,
+    ) -> Result<crate::present::PresentStats, String> {
+        let Some((_, list)) = self.panel_views.iter().find(|(id, _)| *id == node) else {
+            return Err("the panel is not in this frame".into());
+        };
+        let text = self.text.borrow();
+        target.present_scene(list, &text, &ui_core::Damage::Full, &[])
     }
 
     /// Drive each transitioned node's axes toward the size they declared, writing the
@@ -2652,6 +2732,28 @@ impl<A: App> AppLoop<A> {
         // The layout just said how much content every scroller has: an offset the content no
         // longer reaches is out of range now, and nothing else brings it back.
         self.reconcile_scroll_offsets();
+        // Panels the host has not placed yet are held back for one frame, and this is the
+        // build that asks for it: the host decides right after this step, and the next
+        // frame paints each panel where it will stay.
+        if self.tree.platform_panels().is_empty() {
+            self.panel_presentation.clear();
+        } else {
+            let live: FastSet<ui_core::NodeId> = self
+                .tree
+                .platform_panels()
+                .iter()
+                .map(|panel| panel.node)
+                .collect();
+            self.panel_presentation.retain(|node, _| live.contains(node));
+            if self
+                .tree
+                .platform_panels()
+                .iter()
+                .any(|panel| !self.panel_presentation.contains_key(&panel.node))
+            {
+                self.dispatched = true;
+            }
+        }
         // A control that opens an editor asks for the keyboard in the same build: the node
         // exists from that declaration, and only layout gives it the rect a stop is.
         for id in focus_requests {
@@ -2865,6 +2967,10 @@ impl<A: App> AppLoop<A> {
         timed!("damage", self.compute_damage());
 
         let damage = std::mem::take(&mut self.damage).finish();
+
+        // Panels with a surface of their own, after the root's damage is diffed: they are
+        // not in that surface, so their ink must neither claim nor lose damage there.
+        timed!("panels", self.paint_panels());
 
         // Springs are integrated, so the scheduler steps them: one left to a widget that
         // stopped building it would never land, and would ask for frames for ever.
@@ -3519,7 +3625,7 @@ impl<A: App> AppLoop<A> {
     ///
     /// Takes the point rather than reading the live one: a move has to know what shape it
     /// is moving to before it is stored, and the answer is a pixel-independent effect.
-    fn cursor_shape_at(&self, p: ui_core::geom::Point) -> ui_core::CursorShape {
+    pub fn cursor_shape_at(&self, p: ui_core::geom::Point) -> ui_core::CursorShape {
         // An open menu is painted above the tree and owns the pointer over itself: a row
         // that can be chosen is a control, the rest of the surface is not.
         if let Some(menu) = self.menu.as_ref()
@@ -8403,8 +8509,69 @@ impl<A: App> AppLoop<A> {
         let mut next = 0usize;
         while let Some(nid) = deferred.get(next).copied() {
             next += 1;
+            // A panel with a surface of its own is painted there, not here.
+            if self.is_platform_panel(nid) {
+                continue;
+            }
             self.paint_node(nid, false, &mut deferred);
         }
+    }
+
+    /// Whether this node is a panel the layout handed to a surface of the platform's own.
+    ///
+    /// A panel the host has not placed yet counts as one: it is held back for the frame
+    /// the host decided in, rather than painted in the window and moved out of it.
+    fn is_platform_panel(&self, nid: ui_core::NodeId) -> bool {
+        self.tree.platform_panels().iter().any(|panel| panel.node == nid)
+            && self.panel_presentation.get(&nid) != Some(&false)
+    }
+
+    /// Paint every platform panel into its own list, rebased on the panel's top-left.
+    ///
+    /// The parent's list left these subtrees out, so nothing paints twice. The lists are
+    /// resolved here too: a presenter has no text pass of its own.
+    fn paint_panels(&mut self) {
+        self.panel_views.clear();
+        let panels: Vec<_> = self
+            .tree
+            .platform_panels()
+            .iter()
+            .filter(|panel| self.panel_presentation.get(&panel.node) == Some(&true))
+            .copied()
+            .collect();
+        if panels.is_empty() {
+            return;
+        }
+        let scale = self.text_scale();
+        for panel in panels {
+            let rect = panel.rect;
+            let canvas = Rect::new(0.0, 0.0, rect.size.w, rect.size.h);
+            let mut list = ui_core::draw::DrawList::new(canvas);
+            list.transform = Some(ui_core::draw::Transform {
+                scale: 1.0,
+                offset: ui_core::geom::Point::new(-rect.origin.x, -rect.origin.y),
+            });
+            std::mem::swap(&mut list, &mut self.list);
+            let mut deferred = Vec::new();
+            self.paint_node(panel.node, true, &mut deferred);
+            let mut next = 0usize;
+            while let Some(nid) = deferred.get(next).copied() {
+                next += 1;
+                if self.is_platform_panel(nid) {
+                    continue;
+                }
+                self.paint_node(nid, false, &mut deferred);
+            }
+            std::mem::swap(&mut list, &mut self.list);
+            let mut resolved = ui_core::draw::DrawList::new(canvas);
+            self.text
+                .borrow_mut()
+                .resolve_into(&list, scale, &mut resolved);
+            self.panel_views.push((panel.node, resolved));
+        }
+        // The root's damage has already been diffed; a panel's frosts belong to the surface
+        // that shows the panel, and would otherwise be diffed into the root next frame.
+        self.backdrops_now.clear();
     }
 
     /// Whether a kernel layer is large enough that reusing its output beats recomputing it.

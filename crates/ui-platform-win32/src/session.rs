@@ -1,31 +1,36 @@
 //! One engine-owned surface on Windows: window, render thread, driver and teardown order.
 
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use ui_core::Damage;
+use ui_core::NodeId;
 use ui_core::draw::DrawList;
 use ui_core::geom::Point;
+use ui_platform::clipboard::{ClipboardCommand, ClipboardCopy};
 use ui_platform::driver::{Driver, FrameHost as _, Turn};
+use ui_platform::host::{Engine, SurfaceHandle, SurfaceStep};
 use ui_platform::present::{CanvasFrame, PresentStats, SceneTarget};
 use ui_platform::session::{HostSession, SessionOptions, Tick};
 use ui_platform::text_pass::TextPass;
 use ui_platform::view::{App, AppLoop, SceneFrameOutcome};
+use ui_platform::window::{PopupSpec, SurfaceRole, SurfaceSpec};
 
 use crate::frame_pace::FramePace;
 use crate::presenter::AtlasUpdate;
 use crate::render::{FramePacket, RenderThread};
 use crate::window::Win32Window;
 
-/// Window, render thread and driver, owned together so an app never orders them itself.
+/// One Win32 surface as a presenter: window, render thread, driver and its own input.
 ///
 /// The frame's GPU work happens on [`RenderThread`]; this type is what a host holds, and
 /// every call on it stays on the host's own thread.
-pub struct Session<A: App> {
+pub struct Presenter {
     /// The device, chain and presents; stopped before the window goes, in `Drop`.
     render: RenderThread,
     driver: Driver,
-    lp: AppLoop<A>,
     win: Win32Window,
     /// The surface's frame event, shared with the window and the host's wait set.
     pace: Arc<FramePace>,
@@ -38,6 +43,19 @@ pub struct Session<A: App> {
     closed: bool,
     /// Supersampling the app asked for, sent on to a renderer rebuilt later.
     supersample: u32,
+    /// What the window was opened as, so a panel inside it is named the same way.
+    spec: SurfaceSpec,
+    /// Whether frames are presented without the display's pacing, for the panels too.
+    uncapped: bool,
+    /// Every surface's frame event, which the host's one sleep waits on. A panel opened
+    /// later adds its own, or its next frame would wait for an event nothing is waiting for.
+    paces: Rc<RefCell<Vec<Weak<FramePace>>>>,
+}
+
+/// An app and the one surface it drives, for code that runs a single window itself.
+pub struct Session<A: App> {
+    lp: AppLoop<A>,
+    presenter: Presenter,
 }
 
 /// The two atlas pages' versions, as last handed to the render thread.
@@ -65,15 +83,18 @@ impl Atlases {
     }
 }
 
-impl<A: App> Session<A> {
-    /// Open the window, start the render thread and build the loop the caller owns.
-    pub fn open(lp: AppLoop<A>, opts: SessionOptions) -> Result<Self, String> {
+impl Presenter {
+    /// Open the window and start the render thread.
+    pub fn open(
+        opts: SessionOptions,
+        paces: Rc<RefCell<Vec<Weak<FramePace>>>>,
+    ) -> Result<Self, String> {
         if opts.cpu_presenter {
             return Err(String::from(
                 "the Win32 backend presents through D3D11 only; it has no CPU presenter",
             ));
         }
-        let mut win = Win32Window::new(opts.surface)
+        let mut win = Win32Window::new(opts.surface.clone())
             .map_err(|error| format!("cannot open a Win32 window: {error}"))?;
         let pace = Arc::new(FramePace::new());
         let render = RenderThread::open(
@@ -89,22 +110,16 @@ impl<A: App> Session<A> {
         Ok(Self {
             render,
             driver: Driver::new().uncapped(opts.uncapped),
-            lp,
             win,
             pace,
             atlases: Atlases::fresh(),
             pointer: None,
             closed: false,
             supersample: 1,
+            spec: opts.surface,
+            uncapped: opts.uncapped,
+            paces,
         })
-    }
-
-    pub fn lp(&self) -> &AppLoop<A> {
-        &self.lp
-    }
-
-    pub fn lp_mut(&mut self) -> &mut AppLoop<A> {
-        &mut self.lp
     }
 
     pub fn window(&self) -> &Win32Window {
@@ -173,60 +188,70 @@ impl<A: App> Session<A> {
         self.render.finish();
     }
 
+    /// Render at `factor` device pixels per logical pixel.
+    pub fn set_supersample(&mut self, factor: u32) {
+        self.supersample = factor;
+        self.render.set_supersample(factor);
+    }
+
     /// One non-blocking turn: take the thread's messages, then draw if a frame is due.
     ///
     /// The host's form. It never waits — the queue is the process's and the loop sleeps
     /// once for every surface — so it can be called for each surface of a process in turn.
-    pub fn step(&mut self) -> Result<Tick, String> {
+    pub fn step_with<A: App>(&mut self, lp: &mut AppLoop<A>) -> Result<Tick, String> {
         // The shell's move or resize loop owns this window until the pointer comes up. Its
         // messages are dispatched by that loop, so pumping here would take messages out
         // from under it; the surface keeps drawing from the loop's timer instead.
         if self.win.in_size_move() {
             return Ok(Tick::default());
         }
-        self.under_move_pump(Session::step_body)
+        self.under_move_pump(lp, Presenter::step_body)
     }
 
     /// Run `step` with this window's own frame pump answering the shell's move-loop timer.
     ///
     /// The host answers that tick for a surface still in its list — it asks
-    /// [`moving`](Self::moving) and calls [`pump_moved`](Self::pump_moved). This covers the
-    /// other half: a title-bar press that arrives inside the step itself, when the surface
-    /// has been taken out of that list so its own step could run. A step dispatches from
-    /// more than one place — the window's pump and the driver's intake — so the pump has to
-    /// be armed before the step starts, not around the call that happens to see the press.
+    /// [`moving`](Self::moving) and calls [`pump_moved_with`](Self::pump_moved_with). This
+    /// covers the other half: a title-bar press that arrives inside the step itself, when
+    /// the surface has been taken out of that list so its own step could run. A step
+    /// dispatches from more than one place — the window's pump and the driver's intake — so
+    /// the pump has to be armed before the step starts, not around the call that happens to
+    /// see the press.
     ///
-    /// The pump reads the session through a raw pointer because the step holds `&mut self`
-    /// across the same call stack. That is the one alias this module allows: the closure is
-    /// cleared before the step returns, and while the move loop is on the stack the step's
-    /// own borrow is not used — it is blocked inside the message dispatch that started it.
-    fn under_move_pump(
+    /// The pump reads the presenter and the engine through raw pointers because the step
+    /// holds both mutably across the same call stack. That is the one alias this module
+    /// allows: the closure is cleared before the step returns, and while the move loop is on
+    /// the stack the step's own borrows are not used — they are blocked inside the message
+    /// dispatch that started it.
+    fn under_move_pump<A: App>(
         &mut self,
-        body: fn(&mut Self) -> Result<Tick, String>,
+        lp: &mut AppLoop<A>,
+        body: fn(&mut Self, &mut AppLoop<A>) -> Result<Tick, String>,
     ) -> Result<Tick, String> {
-        let session: *mut Self = self;
-        // SAFETY: see above — the pointer is only called while this step is on the stack,
+        let presenter: *mut Self = self;
+        let engine: *mut AppLoop<A> = lp;
+        // SAFETY: see above — both pointers are only called while this step is on the stack,
         // and only from the shell's loop, which is the step's own dispatch.
         let mut pump = || {
-            let _ = unsafe { (*session).pump_moved() };
+            let _ = unsafe { (*presenter).pump_moved_with(&mut *engine) };
         };
         let held = crate::modal::attach(&mut pump);
-        let stepped = body(self);
+        let stepped = body(self, lp);
         crate::modal::detach(held);
         stepped
     }
 
-    fn step_body(&mut self) -> Result<Tick, String> {
+    fn step_body<A: App>(&mut self, lp: &mut AppLoop<A>) -> Result<Tick, String> {
         self.win.pump();
         if self.finished() {
             return Ok(Tick::default());
         }
         self.check_render()?;
-        let pointer = match self.driver.decide(&mut self.lp, &mut self.win) {
+        let pointer = match self.driver.decide(lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
             Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
         };
-        self.draw(pointer)
+        self.draw(lp, pointer)
     }
 
     /// Whether the shell's move or resize loop owns this surface right now.
@@ -238,7 +263,7 @@ impl<A: App> Session<A> {
     }
 
     /// When the loop must wake with nothing arriving: the engine's own deadlines.
-    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+    pub fn next_deadline_with<A: App>(&self, lp: &AppLoop<A>) -> Option<std::time::Instant> {
         // A move loop the shell is running owes nothing of its own: its timer is what
         // steps the rest of the process, and a deadline here would only spin the host.
         if self.win.in_size_move() {
@@ -253,7 +278,7 @@ impl<A: App> Session<A> {
         // A turn that drew clears the driver's deadline, yet an animation in flight or a
         // build that read the clock still owes the next frame. Saying "now" is what makes
         // the host come straight back instead of sleeping until the poll timeout.
-        let owed = self.lp.is_animating().then(std::time::Instant::now);
+        let owed = lp.is_animating().then(std::time::Instant::now);
         match (owed, self.driver.deadline()) {
             (Some(now), Some(at)) => Some(now.min(at)),
             (now, at) => now.or(at),
@@ -263,7 +288,7 @@ impl<A: App> Session<A> {
     /// Intake, decide, draw and pace — everything a frame needs, waiting included.
     ///
     /// The single-surface form: scripted probes and tests drive one session themselves.
-    pub fn tick(&mut self) -> Result<Tick, String> {
+    pub fn tick_with<A: App>(&mut self, lp: &mut AppLoop<A>) -> Result<Tick, String> {
         if self.finished() {
             return Ok(Tick::default());
         }
@@ -272,17 +297,17 @@ impl<A: App> Session<A> {
         if self.win.in_size_move() {
             return Ok(Tick::default());
         }
-        self.under_move_pump(Session::tick_body)
+        self.under_move_pump(lp, Presenter::tick_body)
     }
 
-    fn tick_body(&mut self) -> Result<Tick, String> {
+    fn tick_body<A: App>(&mut self, lp: &mut AppLoop<A>) -> Result<Tick, String> {
         self.check_render()?;
-        let turn = self.driver.step(&mut self.lp, &mut self.win);
+        let turn = self.driver.step(lp, &mut self.win);
         let pointer = match turn {
             Turn::Draw { pointer } => pointer,
             Turn::Idle | Turn::Waiting => return Ok(Tick::default()),
         };
-        let tick = self.draw(pointer)?;
+        let tick = self.draw(lp, pointer)?;
         self.driver.pace(&mut self.win);
         Ok(tick)
     }
@@ -298,10 +323,10 @@ impl<A: App> Session<A> {
     /// Nothing may block here: this thread is the one that moves the window, so a wait in
     /// this tick stops the window under the pointer until the wait ends. A frame the chain
     /// refuses is simply retried on the next tick, the timer being periodic.
-    pub fn pump_moved(&mut self) -> bool {
+    pub fn pump_moved_with<A: App>(&mut self, lp: &mut AppLoop<A>) -> bool {
         // The same question the loop asks: something the app or the clock reached owes a
         // frame, and a still surface owes none.
-        let pointer = match self.driver.decide(&mut self.lp, &mut self.win) {
+        let pointer = match self.driver.decide(lp, &mut self.win) {
             Turn::Draw { pointer } => pointer,
             Turn::Idle | Turn::Waiting => return false,
         };
@@ -310,7 +335,7 @@ impl<A: App> Session<A> {
             return false;
         }
         let drew = present_once(
-            &mut self.lp,
+            lp,
             &mut self.win,
             &self.render,
             &self.pace,
@@ -318,11 +343,11 @@ impl<A: App> Session<A> {
             pointer,
         )
         .is_ok();
-        self.closed |= self.lp.take_close();
-        for (dx, dy) in self.lp.take_pointer_steps() {
+        self.closed |= lp.take_close();
+        for (dx, dy) in lp.take_pointer_steps() {
             self.win.nudge_pointer(dx, dy);
         }
-        self.win.set_drop_effect(self.lp.drop_effect());
+        self.win.set_drop_effect(lp.drop_effect());
         drew
     }
 
@@ -340,8 +365,8 @@ impl<A: App> Session<A> {
         }
     }
 
-    fn draw(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
-        let tick = self.draw_frame(pointer)?;
+    fn draw<A: App>(&mut self, lp: &mut AppLoop<A>, pointer: Option<Point>) -> Result<Tick, String> {
+        let tick = self.draw_frame(lp, pointer)?;
         // The render thread presents asynchronously: a refused frame is reported here, one
         // turn late, rather than closing the window from a driver error nobody can see.
         match self.render.error() {
@@ -350,19 +375,27 @@ impl<A: App> Session<A> {
         }
     }
 
-    fn draw_frame(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
-        let tick = self.present_frame(pointer)?;
+    fn draw_frame<A: App>(
+        &mut self,
+        lp: &mut AppLoop<A>,
+        pointer: Option<Point>,
+    ) -> Result<Tick, String> {
+        let tick = self.present_frame(lp, pointer)?;
         // A drag that asked to leave the app becomes OLE's; one that highlighted a drop
         // publishes the effect the pointer should show from now on.
-        if let Some(drag) = self.lp.take_native_drag() {
-            self.run_native_drag(drag);
+        if let Some(drag) = lp.take_native_drag() {
+            self.run_native_drag(lp, drag);
         }
-        self.win.set_drop_effect(self.lp.drop_effect());
+        self.win.set_drop_effect(lp.drop_effect());
         Ok(tick)
     }
 
     /// Build, layout, paint and hand one frame to the render thread; no drag starts here.
-    fn present_frame(&mut self, pointer: Option<Point>) -> Result<Tick, String> {
+    fn present_frame<A: App>(
+        &mut self,
+        lp: &mut AppLoop<A>,
+        pointer: Option<Point>,
+    ) -> Result<Tick, String> {
         // A scripted pointer wins over the window's, which the driver just read.
         let pointer = self.pointer.take().or(pointer);
         if self.win.client_size().0 == 0 || self.win.client_size().1 == 0 {
@@ -378,25 +411,26 @@ impl<A: App> Session<A> {
         if self.render.take_atlas_request() {
             self.atlases.forget();
         }
-        let Session {
-            lp,
-            win,
-            render,
-            pace,
-            atlases,
-            ..
-        } = self;
-        let framed = present_once(lp, win, render, pace, atlases, pointer)?;
+        let framed = {
+            let Presenter {
+                win,
+                render,
+                pace,
+                atlases,
+                ..
+            } = self;
+            present_once(lp, win, render, pace, atlases, pointer)?
+        };
         // A close the build asked for takes effect in this turn, not the next one.
-        self.closed |= self.lp.take_close();
+        self.closed |= lp.take_close();
         // A build may ask to move the pointer, which only the window can do.
-        let steps = self.lp.take_pointer_steps();
+        let steps = lp.take_pointer_steps();
         for (dx, dy) in &steps {
             self.win.nudge_pointer(*dx, *dy);
         }
         // The frame just built read the pointer's old place, so one more shows the new one.
         if !steps.is_empty() {
-            self.lp.request_frame();
+            lp.request_frame();
         }
         Ok(Tick {
             drew: true,
@@ -413,11 +447,14 @@ impl<A: App> Session<A> {
     /// appears, an animation that stops. The pump OLE's timer calls is one frame of the
     /// same work a turn does, plus the drag phases the drop target queued since the last
     /// one; a still frame costs a build and presents nothing.
-    fn run_native_drag(&mut self, drag: ui_platform::view::NativeDrag) {
+    fn run_native_drag<A: App>(
+        &mut self,
+        lp: &mut AppLoop<A>,
+        drag: ui_platform::view::NativeDrag,
+    ) {
         let hwnd = self.win.hwnd();
         let queue = self.win.drag_queue();
-        let Session {
-            lp,
+        let Presenter {
             win,
             render,
             pace,
@@ -464,14 +501,385 @@ impl<A: App> Session<A> {
             lp.request_frame();
         }
     }
-
 }
 
-impl<A: App> Drop for Session<A> {
+impl<A: App> Session<A> {
+    /// Open the window, start the render thread and build the loop the caller owns.
+    pub fn open(lp: AppLoop<A>, opts: SessionOptions) -> Result<Self, String> {
+        Ok(Self {
+            lp,
+            // A single surface drives itself: nothing else would step a panel it opened.
+            presenter: Presenter::open(opts, Rc::new(RefCell::new(Vec::new())))?,
+        })
+    }
+
+    pub fn lp(&self) -> &AppLoop<A> {
+        &self.lp
+    }
+
+    pub fn lp_mut(&mut self) -> &mut AppLoop<A> {
+        &mut self.lp
+    }
+
+    pub fn window(&self) -> &Win32Window {
+        self.presenter.window()
+    }
+
+    pub fn window_mut(&mut self) -> &mut Win32Window {
+        self.presenter.window_mut()
+    }
+
+    /// Physical pixels per logical unit.
+    pub fn scale(&self) -> f32 {
+        self.presenter.scale()
+    }
+
+    /// The renderer in use, for the app's own report.
+    pub fn presenter_name(&self) -> Option<String> {
+        self.presenter.presenter_name()
+    }
+
+    /// What the pointer must be for the next frame, overriding the window's own.
+    ///
+    /// Scripted input needs it, or the frame snaps back to wherever the real cursor is.
+    pub fn set_pointer(&mut self, pointer: Option<Point>) {
+        self.presenter.set_pointer(pointer);
+    }
+
+    /// Whether the surface asked to close.
+    pub fn finished(&self) -> bool {
+        self.presenter.finished()
+    }
+
+    /// How long the last turn waited for the compositor.
+    pub fn last_wait(&self) -> Duration {
+        self.presenter.last_wait()
+    }
+
+    /// Frame waits so far and their total, for the host's exit line.
+    pub fn wait_stats(&self) -> (Duration, u32) {
+        self.presenter.wait_stats()
+    }
+
+    /// Events the last turn took from the window and dispatched to the app.
+    pub fn events(&self) -> &[ui_core::Event] {
+        self.presenter.events()
+    }
+
+    /// Frames presented since the last call: the rate the compositor actually took.
+    pub fn take_frame_callbacks(&mut self) -> u32 {
+        self.presenter.take_frame_callbacks()
+    }
+
+    /// Write the last presented frame as a PPM.
+    pub fn dump_frame_ppm(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.presenter.dump_frame_ppm(path)
+    }
+
+    /// Drain the GPU and stop the render thread; how long this takes is the backlog that
+    /// teardown would otherwise inherit. A no-op after the first call.
+    pub fn finish(&mut self) {
+        self.presenter.finish();
+    }
+
+    /// One non-blocking turn: take the thread's messages, then draw if a frame is due.
+    pub fn step(&mut self) -> Result<Tick, String> {
+        self.presenter.step_with(&mut self.lp)
+    }
+
+    /// Whether the shell's move or resize loop owns this surface right now.
+    pub fn moving(&self) -> bool {
+        self.presenter.moving()
+    }
+
+    /// When the loop must wake with nothing arriving: the engine's own deadlines.
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.presenter.next_deadline_with(&self.lp)
+    }
+
+    /// Intake, decide, draw and pace — everything a frame needs, waiting included.
+    ///
+    /// The single-surface form: scripted probes and tests drive one session themselves.
+    pub fn tick(&mut self) -> Result<Tick, String> {
+        self.presenter.tick_with(&mut self.lp)
+    }
+
+    /// Draw this surface from the shell's move-loop timer; see [`Presenter::pump_moved_with`].
+    pub fn pump_moved(&mut self) -> bool {
+        self.presenter.pump_moved_with(&mut self.lp)
+    }
+}
+
+impl Drop for Presenter {
     fn drop(&mut self) {
         // The chain belongs to the render thread and the window to this type: the thread
         // must let go of the chain before the window it presents through is destroyed.
         self.finish();
+    }
+}
+
+impl SurfaceHandle for Presenter {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        let tick = self.step_with(engine)?;
+        Ok(SurfaceStep { drew: tick.drew })
+    }
+
+    fn moving(&self) -> bool {
+        Presenter::moving(self)
+    }
+
+    fn pump_moved(&mut self, engine: &mut Engine) -> bool {
+        self.pump_moved_with(engine)
+    }
+
+    fn next_deadline(&self, engine: &Engine) -> Option<std::time::Instant> {
+        self.next_deadline_with(engine)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.finished()
+    }
+
+    fn take_copies(&mut self, engine: &mut Engine) -> Vec<ClipboardCopy> {
+        let mut copies = Vec::new();
+        for command in engine.take_clipboard_commands() {
+            match command {
+                ClipboardCommand::Copy { content, kind } => copies.push(ClipboardCopy {
+                    content,
+                    kind,
+                    // A copy here is the clipboard itself; there is no serial to serve under.
+                    serial: 0,
+                }),
+                // Windows has no primary selection, so a paste is always the clipboard's.
+                ClipboardCommand::RequestPaste { .. } => {
+                    let _ = self.win.request_paste();
+                }
+            }
+        }
+        copies
+    }
+
+    /// A panel hung off this surface gets a window and a renderer of its own.
+    fn open_popup(
+        &mut self,
+        node: NodeId,
+        spec: PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        let root = Point::new(0.0, 0.0);
+        let presenter = open_panel(
+            &self.win,
+            &self.spec,
+            root,
+            node,
+            spec,
+            self.uncapped,
+            &self.paces,
+        )?;
+        Ok(Box::new(presenter))
+    }
+}
+
+/// A panel's own window: the engine paints it, this presenter shows it and routes its input.
+///
+/// The panel's subtree lives in the parent's tree, so this is not a second engine: what
+/// arrives here is shifted back into that tree and dispatched to the same app.
+struct PopupPresenter {
+    render: RenderThread,
+    win: Win32Window,
+    pace: Arc<FramePace>,
+    atlases: Atlases,
+    /// What the popup was opened as, so a panel inside it is named the same way.
+    spec: SurfaceSpec,
+    node: NodeId,
+    /// Whether frames are presented without the display's pacing.
+    uncapped: bool,
+    /// Every surface's frame event, which a nested panel adds its own to.
+    paces: Rc<RefCell<Vec<Weak<FramePace>>>>,
+    /// The tree origin of the surface this popup hangs from.
+    parent_origin: Point,
+    /// Where the panel's subtree stands in the parent tree's coordinates.
+    origin: Point,
+    /// The build whose panel list this window last showed.
+    presented: Option<u64>,
+    /// The panel went away or the shell took it back; the host dismisses it.
+    closed: bool,
+}
+
+/// The surface spec a panel's window is opened with.
+fn popup_surface_spec(parent: &SurfaceSpec, spec: PopupSpec) -> SurfaceSpec {
+    SurfaceSpec {
+        app_id: parent.app_id.clone(),
+        name: parent.name.clone(),
+        role: SurfaceRole::Window {
+            size: (
+                spec.rect.size.w.round().max(1.0) as u32,
+                spec.rect.size.h.round().max(1.0) as u32,
+            ),
+        },
+        min_size: None,
+    }
+}
+
+/// Open a popup owned by `parent` that shows the panel `node`.
+///
+/// `spec` is in the parent presentation's coordinates, so the panel's place in the tree is
+/// that offset from `parent_origin`.
+fn open_panel(
+    parent: &Win32Window,
+    parent_spec: &SurfaceSpec,
+    parent_origin: Point,
+    node: NodeId,
+    spec: PopupSpec,
+    uncapped: bool,
+    paces: &Rc<RefCell<Vec<Weak<FramePace>>>>,
+) -> Result<PopupPresenter, String> {
+    let surface = popup_surface_spec(parent_spec, spec);
+    let mut win = Win32Window::new_popup(parent, surface.clone(), spec)
+        .map_err(|error| format!("cannot open a panel's window: {error}"))?;
+    let pace = Arc::new(FramePace::new());
+    let render = RenderThread::open(
+        win.visual_hwnd(),
+        win.client_size(),
+        win.alpha(),
+        uncapped,
+        win.refresh_hz(),
+        Arc::clone(&pace),
+    )
+    .map_err(|error| format!("the panel's renderer could not start: {error}"))?;
+    win.set_frame_pace(Arc::clone(&pace));
+    paces.borrow_mut().push(Arc::downgrade(&pace));
+    Ok(PopupPresenter {
+        render,
+        win,
+        pace,
+        atlases: Atlases::fresh(),
+        spec: surface,
+        node,
+        uncapped,
+        paces: Rc::clone(paces),
+        parent_origin,
+        origin: parent_origin + spec.rect.origin,
+        presented: None,
+        closed: false,
+    })
+}
+
+/// Move an event's position from a panel's own space into the parent tree's.
+fn shift(event: ui_core::Event, by: Point) -> ui_core::Event {
+    use ui_core::Event;
+    match event {
+        Event::PointerMoved { pos } => Event::PointerMoved { pos: pos + by },
+        Event::PointerPressed { pos, button } => Event::PointerPressed { pos: pos + by, button },
+        Event::PointerReleased { pos, button } => Event::PointerReleased { pos: pos + by, button },
+        Event::Scroll { pos, delta } => Event::Scroll { pos: pos + by, delta },
+        other => other,
+    }
+}
+
+impl PopupPresenter {
+    fn present(&mut self, engine: &Engine, frame: u64) -> Result<(), String> {
+        let size = self.win.client_size();
+        if size.0 == 0 || size.1 == 0 {
+            return Ok(());
+        }
+        let scale = self.win.scale();
+        let node = self.node;
+        let PopupPresenter {
+            win,
+            render,
+            pace,
+            atlases,
+            ..
+        } = self;
+        let mut target = Target {
+            win,
+            sink: Sink {
+                render,
+                pace,
+                atlases,
+                size,
+                scale,
+            },
+        };
+        engine
+            .present_panel(node, &mut target)
+            .map_err(|error| format!("present failed: {error}"))?;
+        self.presented = Some(frame);
+        Ok(())
+    }
+}
+
+impl SurfaceHandle for PopupPresenter {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        // The queue is the thread's, so a pump here takes whatever arrived for this window
+        // as well as for the root's; each window keeps only what its own procedure stored.
+        self.win.pump();
+        if self.win.should_close() {
+            self.closed = true;
+            return Ok(SurfaceStep::default());
+        }
+        // A frame the render thread refused is reported here, one turn late, rather than
+        // leaving the panel showing its last one forever.
+        if let Some(error) = self.render.error() {
+            return Err(error);
+        }
+        let origin = self.origin;
+        for event in self.win.take_events() {
+            engine.dispatch(shift(event, origin));
+        }
+        // The shape the tree gives the pointer's place on the panel; the pointer is the
+        // panel's own, so it is lifted back into the tree's coordinates first.
+        if let Some(at) = self.win.pointer() {
+            self.win.set_cursor(engine.cursor_shape_at(at + origin));
+        }
+        let frame = engine.frame_number();
+        // Nothing new since the last show, nothing painted for it, or no frame window yet.
+        if self.presented == Some(frame)
+            || !self.win.can_draw()
+            || !engine.panel_painted(self.node)
+        {
+            return Ok(SurfaceStep::default());
+        }
+        self.present(engine, frame)?;
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<std::time::Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed || self.win.should_close()
+    }
+
+    /// Empty: the app is one, and its copy commands are drained by the surface that steps
+    /// first — the parent's, which is the one that can serve them this same turn.
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+
+    /// A panel inside this one is owned by this window, so the grab stays with the topmost.
+    fn open_popup(
+        &mut self,
+        node: NodeId,
+        spec: PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        let presenter = open_panel(
+            &self.win,
+            &self.spec,
+            self.origin,
+            node,
+            spec,
+            self.uncapped,
+            &self.paces,
+        )?;
+        Ok(Box::new(presenter))
+    }
+
+    fn reconfigure(&mut self, spec: PopupSpec) -> Result<(), String> {
+        self.win.move_popup(spec).map_err(|error| error.to_string())?;
+        self.origin = self.parent_origin + spec.rect.origin;
+        Ok(())
     }
 }
 
@@ -549,7 +957,7 @@ impl<A: App> HostSession<A> for Session<A> {
     }
 
     fn logical_size(&self) -> (u32, u32) {
-        self.win.logical_size()
+        self.presenter.window().logical_size()
     }
 
     fn scale(&self) -> f32 {
@@ -557,19 +965,19 @@ impl<A: App> HostSession<A> for Session<A> {
     }
 
     fn request_close(&mut self) {
-        self.win.request_close();
+        self.presenter.window_mut().request_close();
     }
 
     fn write_clipboard(&mut self, content: ui_core::clipboard::ClipboardContent) -> bool {
-        self.win.write_clipboard(content)
+        self.presenter.window_mut().write_clipboard(content)
     }
 
     fn request_paste(&mut self) -> bool {
-        self.win.request_paste()
+        self.presenter.window_mut().request_paste()
     }
 
     fn begin_drag(&mut self, drag: ui_platform::view::NativeDrag) -> bool {
-        self.win.begin_drag(drag)
+        self.presenter.window_mut().begin_drag(drag)
     }
 
     fn gpu_present(&self) -> bool {
@@ -578,8 +986,7 @@ impl<A: App> HostSession<A> for Session<A> {
     }
 
     fn set_supersample(&mut self, factor: u32) {
-        self.supersample = factor;
-        self.render.set_supersample(factor);
+        self.presenter.set_supersample(factor);
     }
 
     fn frame_callbacks(&mut self) -> u32 {
@@ -587,7 +994,7 @@ impl<A: App> HostSession<A> for Session<A> {
     }
 
     fn refresh_hz(&self) -> Option<f32> {
-        self.win.refresh_hz()
+        self.presenter.window().refresh_hz()
     }
 
     fn dmabuf_stats(&self) -> Option<(usize, u32)> {

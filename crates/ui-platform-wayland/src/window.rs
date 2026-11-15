@@ -21,7 +21,7 @@ use ui_core::geom::Insets;
 use ui_paint::Pixels;
 use ui_platform::present::{PresentTarget, SurfaceKind};
 use ui_platform::window::{
-    ExclusiveZone, KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec,
+    ExclusiveZone, KeyboardMode, Layer, LayerSpec, PopupSpec, SurfaceRole, SurfaceSpec,
 };
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::{
@@ -48,7 +48,9 @@ use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
     self, Event as TextInputEvent, ZwpTextInputV3,
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::dmabuf::{self, DmaBufBuffer, DmaBufError, DmaBufFormats, DmaBufImage};
@@ -795,6 +797,40 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WindowState {
     }
 }
 
+noop_dispatch!(xdg_positioner::XdgPositioner, ());
+
+impl Dispatch<xdg_popup::XdgPopup, ()> for WindowState {
+    fn event(
+        state: &mut Self,
+        _: &xdg_popup::XdgPopup,
+        event: xdg_popup::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_popup::Event::Configure { width, height, .. } => {
+                // The positioner fixed the size; the configure echoes it, and says nothing
+                // when it is zero.
+                if width > 0 && height > 0 {
+                    state.width = width as u32;
+                    state.height = height as u32;
+                }
+                state.silent_change = true;
+            }
+            // The compositor took the grab back — a click outside, Escape, focus lost. The
+            // panel is gone whether or not the app agrees, so the surface closes and the
+            // host reports it as a dismissal.
+            xdg_popup::Event::PopupDone => {
+                ui_platform::exit_probe::stage("popup-done");
+                state.closed = true;
+            }
+            xdg_popup::Event::Repositioned { .. } => state.silent_change = true,
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WindowState {
     fn event(
         _: &mut Self,
@@ -1012,6 +1048,14 @@ pub struct WaylandWindow {
     _toplevel: Option<xdg_toplevel::XdgToplevel>,
     /// The layer-shell role, when this surface is an overlay instead of a window.
     layer: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+    /// The popup role, when this surface is a panel hung off another.
+    popup: Option<xdg_popup::XdgPopup>,
+    /// The positioner the popup was mapped with; a reposition replaces it.
+    positioner: Option<xdg_positioner::XdgPositioner>,
+    /// Name for the next `reposition`; the protocol wants every request named.
+    reposition_token: u32,
+    /// The seat a popup grabs through, kept for a panel opened inside this one.
+    seat: Option<wl_seat::WlSeat>,
     /// The logical size last asked of the layer role, for the dedupe: the configure that
     /// carries it arrives later, so the configured size is not the answer yet.
     layer_size_request: Option<(u32, u32)>,
@@ -1107,6 +1151,14 @@ impl Drop for WaylandWindow {
             self.state.dmabuf_inflight.clear();
         }
         ui_platform::exit_probe::stage("window: proxies");
+        // The popup role goes before the surface role it belongs to, and the positioner
+        // after the popup that consumed it.
+        if let Some(p) = self.popup.take() {
+            p.destroy();
+        }
+        if let Some(p) = self.positioner.take() {
+            p.destroy();
+        }
         if let Some(t) = self._toplevel.take() {
             t.destroy();
         }
@@ -1132,10 +1184,122 @@ impl Drop for WaylandWindow {
     }
 }
 
+/// The positioner a panel's place and size describe.
+///
+/// `xdg_positioner` hangs the popup's anchoring corner off a point of the anchor rectangle:
+/// the engine's `side` says which point (an edge midpoint, or a corner when the alignment
+/// asks for one), `gravity` says where the popup extends from it, and the gap is an offset
+/// along the unfolding axis.
+fn popup_positioner(
+    wm: &xdg_wm_base::XdgWmBase,
+    qh: &QueueHandle<WindowState>,
+    spec: &PopupSpec,
+) -> xdg_positioner::XdgPositioner {
+    use ui_core::layout::{OverlayAlign, Side};
+    use xdg_positioner::{Anchor, ConstraintAdjustment, Gravity};
+
+    let positioner = wm.create_positioner(qh, ());
+    let size = spec.rect.size;
+    positioner.set_size(
+        size.w.round().max(1.0) as i32,
+        size.h.round().max(1.0) as i32,
+    );
+    let anchor = spec.anchor;
+    positioner.set_anchor_rect(
+        anchor.min_x().round() as i32,
+        anchor.min_y().round() as i32,
+        anchor.size.w.round().max(0.0) as i32,
+        anchor.size.h.round().max(0.0) as i32,
+    );
+    // The popup extends away from the anchor on the unfolding axis, and lies along the
+    // anchor's own row or column on the other.
+    let (anchor_point, gravity) = match spec.side {
+        Side::Below => match spec.align {
+            OverlayAlign::Start => (Anchor::BottomLeft, Gravity::BottomRight),
+            OverlayAlign::Center => (Anchor::Bottom, Gravity::Bottom),
+            OverlayAlign::End => (Anchor::BottomRight, Gravity::BottomLeft),
+        },
+        Side::Above => match spec.align {
+            OverlayAlign::Start => (Anchor::TopLeft, Gravity::TopRight),
+            OverlayAlign::Center => (Anchor::Top, Gravity::Top),
+            OverlayAlign::End => (Anchor::TopRight, Gravity::TopLeft),
+        },
+        Side::Right => match spec.align {
+            OverlayAlign::Start => (Anchor::TopRight, Gravity::BottomRight),
+            OverlayAlign::Center => (Anchor::Right, Gravity::Right),
+            OverlayAlign::End => (Anchor::BottomRight, Gravity::TopRight),
+        },
+        Side::Left => match spec.align {
+            OverlayAlign::Start => (Anchor::TopLeft, Gravity::BottomLeft),
+            OverlayAlign::Center => (Anchor::Left, Gravity::Left),
+            OverlayAlign::End => (Anchor::BottomLeft, Gravity::TopLeft),
+        },
+    };
+    positioner.set_anchor(anchor_point);
+    positioner.set_gravity(gravity);
+    let gap = spec.offset.round() as i32;
+    let (offset_x, offset_y) = match spec.side {
+        Side::Below => (0, gap),
+        Side::Above => (0, -gap),
+        Side::Right => (gap, 0),
+        Side::Left => (-gap, 0),
+    };
+    positioner.set_offset(offset_x, offset_y);
+    let mut adjustment = ConstraintAdjustment::empty();
+    adjustment.set(ConstraintAdjustment::FlipX, spec.constraint.flip_x);
+    adjustment.set(ConstraintAdjustment::FlipY, spec.constraint.flip_y);
+    adjustment.set(ConstraintAdjustment::SlideX, spec.constraint.slide_x);
+    adjustment.set(ConstraintAdjustment::SlideY, spec.constraint.slide_y);
+    positioner.set_constraint_adjustment(adjustment);
+    positioner
+}
+
+/// The parent a popup hangs off.
+pub struct PopupParent {
+    /// The parent surface role the positioner's coordinates are relative to.
+    surface: xdg_surface::XdgSurface,
+    /// The seat the compositor hands the popup's grab through.
+    seat: Option<wl_seat::WlSeat>,
+    spec: PopupSpec,
+    /// Serial of the press that opened the panel; zero takes no grab.
+    grab_serial: u32,
+}
+
 impl WaylandWindow {
     /// Create and map a surface, waiting until the compositor configures it.
     pub fn new(spec: SurfaceSpec) -> Result<Self, WindowError> {
         Self::create(spec, None)
+    }
+
+    /// Create a popup hung off `parent`, waiting until the compositor configures it.
+    ///
+    /// The panel's size and place come from `popup`; `grab_serial` is the key press or click
+    /// that opened it, which is what lets the compositor route later input to the popup.
+    pub fn create_popup(
+        parent: &WaylandWindow,
+        spec: SurfaceSpec,
+        popup: PopupSpec,
+        grab_serial: u32,
+    ) -> Result<Self, WindowError> {
+        let surface = parent
+            ._xdg
+            .as_ref()
+            .ok_or_else(|| WindowError::Protocol("a popup needs an xdg surface to hang from".into()))?
+            .clone();
+        // A panel opened inside another one hangs off that panel, and its grab is the outer
+        // one's: the outer popup is what the compositor has focused.
+        let seat = parent.seat.clone();
+        let link = parent.link();
+        Self::build(
+            spec,
+            Some(&link),
+            Some(PopupParent {
+                surface,
+                seat,
+                spec: popup,
+                grab_serial,
+            }),
+        )
     }
 
     /// The connection this window runs on, for platform-bound application code.
@@ -1150,6 +1314,15 @@ impl WaylandWindow {
     pub(crate) fn create(
         spec: SurfaceSpec,
         link: Option<&WaylandLink>,
+    ) -> Result<Self, WindowError> {
+        Self::build(spec, link, None)
+    }
+
+    /// The one construction path: a window, a layer surface, or a popup.
+    fn build(
+        spec: SurfaceSpec,
+        link: Option<&WaylandLink>,
+        parent: Option<PopupParent>,
     ) -> Result<Self, WindowError> {
         let layer: Option<LayerSpec> = spec.layer_spec().cloned();
         let keyboard_follow = layer
@@ -1221,8 +1394,27 @@ impl WaylandWindow {
                 None
             }
         };
-        let (xdg, toplevel, layer_surface) = match layer {
-            None => {
+        let (xdg, toplevel, layer_surface, popup_role) = match (layer, parent) {
+            // A popup: the parent's surface role fixes the coordinates the positioner's
+            // rectangle is read in, and the grab decides who hears the input after the
+            // press that opened it.
+            (_, Some(parent)) => {
+                let wm = wm_base
+                    .clone()
+                    .ok_or(WindowError::MissingGlobal("xdg_wm_base"))?;
+                let positioner = popup_positioner(&wm, &qh, &parent.spec);
+                let xdg = wm.get_xdg_surface(&surface, &qh, ());
+                let popup = xdg.get_popup(Some(&parent.surface), &positioner, &qh, ());
+                if parent.grab_serial != 0
+                    && let Some(seat) = parent.seat.as_ref()
+                {
+                    // A serial the compositor no longer accepts gets the grab refused, not
+                    // an error: the panel still shows, it just stops taking outside input.
+                    popup.grab(seat, parent.grab_serial);
+                }
+                (Some(xdg), None, None, Some((popup, positioner)))
+            }
+            (None, None) => {
                 let wm = wm_base
                     .clone()
                     .ok_or(WindowError::MissingGlobal("xdg_wm_base"))?;
@@ -1234,9 +1426,9 @@ impl WaylandWindow {
                 if let Some((width, height)) = spec.min_size {
                     toplevel.set_min_size(width as i32, height as i32);
                 }
-                (Some(xdg), Some(toplevel), None)
+                (Some(xdg), Some(toplevel), None, None)
             }
-            Some(cfg) => {
+            (Some(cfg), None) => {
                 let shell = layer_shell
                     .clone()
                     .ok_or(WindowError::MissingGlobal("zwlr_layer_shell_v1"))?;
@@ -1287,7 +1479,7 @@ impl WaylandWindow {
                         zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive
                     }
                 });
-                (None, None, Some(surface_role))
+                (None, None, Some(surface_role), None)
             }
         };
         surface.commit();
@@ -1307,7 +1499,8 @@ impl WaylandWindow {
         let mut pointer: Option<wl_pointer::WlPointer> = None;
         let mut keyboard: Option<wl_keyboard::WlKeyboard> = None;
         let mut text_input: Option<ZwpTextInputV3> = None;
-        if let Some(seat) = seat {
+        // Cloned, not moved: a panel this one opens later grabs through the same seat.
+        if let Some(seat) = seat.clone() {
             pointer = Some(seat.get_pointer(&qh, ()));
             keyboard = Some(seat.get_keyboard(&qh, ()));
             // Text input is per seat, like the keyboard it replaces.
@@ -1341,6 +1534,10 @@ impl WaylandWindow {
         let (w, h) = (state.width, state.height);
         let pixels = Pixels::new(w, h);
         let back = ShmBuffer::new(&shm, &qh, w, h).ok_or(WindowError::Buffer)?;
+        let (popup, positioner) = match popup_role {
+            Some((popup, positioner)) => (Some(popup), Some(positioner)),
+            None => (None, None),
+        };
 
         // A roundtrip delivers the keyboard's initial keymap before returning, so
         // callers can type on the very first frame.
@@ -1371,6 +1568,10 @@ impl WaylandWindow {
             _xdg: xdg,
             _toplevel: toplevel,
             layer: layer_surface,
+            popup,
+            positioner,
+            reposition_token: 1,
+            seat,
             dmabuf,
             dmabuf_cache: HashMap::new(),
             syncobj_manager: syncobj,
@@ -1809,6 +2010,42 @@ impl WaylandWindow {
             margin.left.round() as i32,
         );
         self.surface.commit();
+    }
+
+    /// Move the popup to what `spec` asks for, or say why it must be made again.
+    ///
+    /// A positioner fixes a popup's size when it first maps, so a size change cannot be
+    /// expressed here: the caller closes this surface and opens another at the new request.
+    pub fn reposition_popup(&mut self, spec: PopupSpec) -> Result<(), String> {
+        let popup = self
+            .popup
+            .clone()
+            .ok_or("this surface is not a popup")?;
+        let size = (
+            spec.rect.size.w.round().max(1.0) as u32,
+            spec.rect.size.h.round().max(1.0) as u32,
+        );
+        if (self.state.width, self.state.height) != size {
+            return Err("the panel changed size, so its surface must be made again".into());
+        }
+        // Repositioning arrived in protocol version 3; before that a mapped popup is fixed.
+        if popup.version() < 3 {
+            return Err("this compositor cannot move a mapped popup".into());
+        }
+        let base = self
+            .state
+            .base
+            .clone()
+            .ok_or("this surface has no xdg_wm_base")?;
+        let positioner = popup_positioner(&base, &self.qh, &spec);
+        popup.reposition(&positioner, self.reposition_token);
+        self.reposition_token += 1;
+        if let Some(old) = self.positioner.replace(positioner) {
+            old.destroy();
+        }
+        // The new place is applied by the next commit of the popup's surface.
+        self.surface.commit();
+        Ok(())
     }
 
     /// Resize a layer surface; the compositor answers with a configure carrying the new size.

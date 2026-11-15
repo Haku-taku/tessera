@@ -1581,6 +1581,8 @@ pub struct Tree {
     appeared: Vec<NodeId>,
     /// Roots of subtrees kept alive past their declaration so they can leave visibly.
     held: Vec<NodeId>,
+    /// Panels the last layout pass measured for a surface of the platform's own.
+    platform_panels: Vec<crate::layout::PlatformPanel>,
 }
 
 impl Tree {
@@ -1605,6 +1607,20 @@ impl Tree {
     /// Subtrees the engine is keeping alive while they leave, painted above the content.
     pub fn held(&self) -> &[NodeId] {
         &self.held
+    }
+
+    /// Panels the last layout pass laid out for the platform to present.
+    pub fn platform_panels(&self) -> &[crate::layout::PlatformPanel] {
+        &self.platform_panels
+    }
+
+    /// The layout pass is about to record this frame's platform panels.
+    pub(crate) fn clear_platform_panels(&mut self) {
+        self.platform_panels.clear();
+    }
+
+    pub(crate) fn record_platform_panel(&mut self, panel: crate::layout::PlatformPanel) {
+        self.platform_panels.push(panel);
     }
 
     /// Whether anything is painting at a scale other than 1: a presence animation or a

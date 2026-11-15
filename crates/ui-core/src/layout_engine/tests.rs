@@ -389,6 +389,57 @@ mod layout {
         );
     }
 
+    /// A panel for a surface of the platform's own keeps its preferred position, even a
+    /// position the viewport it was declared in does not contain, and is recorded for the
+    /// platform to present.
+    #[test]
+    fn a_platform_panel_keeps_its_preferred_position_and_is_recorded() {
+        use crate::layout::{Anchor, OverlayPlacement, Presentation};
+        let mut tree = Tree::new();
+        tree.apply(
+            &Decl::container(Id::str("root"), NodeKind::Stack)
+                .size(crate::layout::SizeClass::fixed(200.0, 200.0))
+                .child(
+                    Decl::container(Id::str("anchor"), NodeKind::Box)
+                        .size(crate::layout::SizeClass::fixed(40.0, 20.0))
+                        .offset(150.0, 150.0),
+                )
+                .child(
+                    Decl::container(Id::str("panel"), NodeKind::Box)
+                        .size(crate::layout::SizeClass::fixed(400.0, 300.0))
+                        .overlay(
+                            OverlayPlacement::below(Anchor::Node(Id::str("anchor")))
+                                .presentation(Presentation::Platform),
+                        ),
+                ),
+        );
+        let mut engine = BuiltinLayout::new(MonospaceMeasure::default());
+        let root = tree.root().unwrap();
+        engine.solve(&mut tree, root, Constraints::loose(Size::new(200.0, 200.0)));
+
+        let panel = tree
+            .get(tree.find_by_id(Id::str("panel")).unwrap())
+            .unwrap();
+        assert_eq!(
+            (panel.visual_rect().origin.x, panel.visual_rect().origin.y),
+            (150.0, 170.0),
+            "the panel hangs under its anchor, outside a 200-square viewport"
+        );
+        let recorded = tree.platform_panels();
+        assert_eq!(recorded.len(), 1, "one panel asks for a surface of its own");
+        assert_eq!(recorded[0].node, tree.find_by_id(Id::str("panel")).unwrap());
+        assert_eq!(
+            (recorded[0].anchor.origin.x, recorded[0].anchor.origin.y),
+            (150.0, 150.0),
+            "the anchor travels with the request, in the parent's coordinates"
+        );
+        assert_eq!(
+            (recorded[0].rect.origin.x, recorded[0].rect.origin.y),
+            (150.0, 170.0),
+            "the platform gets the preferred position, not a clamped one"
+        );
+    }
+
     /// A row squeezes a scrollable child to its own width instead of letting it overflow.
     #[test]
     fn a_row_squeezes_a_scrollable_child_to_the_line_before_it_overflows() {

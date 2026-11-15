@@ -30,8 +30,8 @@ pub mod window;
 pub use clipboard::ClipboardCopy;
 pub use element::{Container, Element, Leaf, from_decl};
 pub use host::{
-    Backend, Effect, Host, LoopCtx, MessageCtx, OpenOptions, RunStats, SurfaceHandle, SurfaceId,
-    SurfaceStep,
+    Backend, Effect, Engine, Host, LoopCtx, MessageCtx, OpenOptions, PresentationOptions, RunStats,
+    SurfaceHandle, SurfaceId, SurfaceStep,
 };
 pub use locale::posix_system_languages;
 pub use output::OutputInfo;
@@ -43,5 +43,6 @@ pub use theme::{FixedTheme, ThemePreference, ThemeWatcher};
 pub use transfer::{Selection, SelectionReader};
 pub use view::{App, AppLoop, FrameInfo, run_app};
 pub use window::{
-    Anchor, AutoHide, ExclusiveZone, KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec,
+    Anchor, AutoHide, Constraint, ExclusiveZone, KeyboardMode, Layer, LayerSpec, PopupSpec,
+    SurfaceRole, SurfaceSpec, place_popup,
 };

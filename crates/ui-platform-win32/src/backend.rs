@@ -6,19 +6,17 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use ui_core::draw::ImageEntry;
-use ui_platform::clipboard::{ClipboardCommand, ClipboardCopy};
-use ui_platform::host::{Backend, OpenOptions, SurfaceHandle, SurfaceStep};
+use ui_platform::clipboard::ClipboardCopy;
+use ui_platform::host::{Backend, PresentationOptions, SurfaceHandle};
 use ui_platform::hotkeys::GlobalHotkeys;
 use ui_platform::ipc::Channel;
 use ui_platform::jobs::Waker;
 use ui_platform::output::OutputInfo;
-use ui_platform::session::{HostSession, SessionOptions};
+use ui_platform::session::SessionOptions;
 use ui_platform::transfer::SelectionReader;
 use ui_platform::tray::{Icon, TrayEvent, TrayHandle, TrayId};
-use ui_platform::view::{App, AppLoop};
 use ui_platform::window::SurfaceSpec;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -35,7 +33,7 @@ use windows::core::{BOOL, PCWSTR};
 use crate::clipboard::ClipboardReader;
 use crate::frame_pace::FramePace;
 use crate::hotkeys::Win32Hotkeys;
-use crate::session::Session;
+use crate::session::Presenter;
 use crate::tray::{TrayQueue, Win32TrayIcon};
 use crate::window::{bounded_millis, pump_messages, set_system_clipboard};
 
@@ -50,8 +48,9 @@ pub struct Win32Backend {
     /// The system clipboard, read in place: a copy is already complete when it lands.
     reader: ClipboardReader,
     /// Every surface's frame window: the compositor wakes the loop through these. Weak, so
-    /// a retired surface takes its entry with it; the wait prunes what is left.
-    paces: Vec<Weak<FramePace>>,
+    /// a retired surface takes its entry with it; the wait prunes what is left. Shared with
+    /// the presenters, because a panel opened later has a frame event of its own.
+    paces: Rc<RefCell<Vec<Weak<FramePace>>>>,
 }
 
 /// The loop's wake channel from the other side: an event any worker can set.
@@ -87,7 +86,7 @@ impl Win32Backend {
             hotkeys: None,
             tray_events: Rc::new(RefCell::new(Vec::new())),
             reader: ClipboardReader::default(),
-            paces: Vec::new(),
+            paces: Rc::new(RefCell::new(Vec::new())),
         }
     }
 }
@@ -102,33 +101,22 @@ impl Backend for Win32Backend {
     fn open(
         &mut self,
         spec: SurfaceSpec,
-        app: Box<dyn App>,
-        options: OpenOptions,
+        options: PresentationOptions,
     ) -> Result<Box<dyn SurfaceHandle>, String> {
-        let mut lp = AppLoop::with_stack(app, &[]);
-        for image in options.images {
-            lp.register_image(image);
-        }
-        for face in options.fonts {
-            if !lp.register_font(&face.name, face.data) {
-                return Err(format!("the font {} could not be registered", face.name));
-            }
-        }
-        for (chord, id) in options.shortcuts {
-            lp.bind_shortcut(chord, id);
-        }
-        let session = Session::open(
-            lp,
+        let presenter = Presenter::open(
             SessionOptions {
                 surface: spec,
                 uncapped: options.uncapped,
                 cpu_presenter: false,
             },
+            Rc::clone(&self.paces),
         )?;
         // The host's one sleep must end when this surface's render thread finishes a frame;
-        // the session keeps the pace alive, so the entry needs no removal on retirement.
-        self.paces.push(Arc::downgrade(&session.frame_pace()));
-        Ok(Box::new(HostedSurface { session }))
+        // the presenter keeps the pace alive, so the entry needs no removal on retirement.
+        self.paces
+            .borrow_mut()
+            .push(Arc::downgrade(&presenter.frame_pace()));
+        Ok(Box::new(presenter))
     }
 
     fn set_clipboard_copy(&mut self, copy: ClipboardCopy) -> bool {
@@ -194,8 +182,10 @@ impl Backend for Win32Backend {
         // The queue's own messages, the worker's wake event and every surface's frame
         // event end the sleep. A frame event is what makes a surface drawable again:
         // consuming it here is the same act as a Wayland frame callback arriving.
-        self.paces.retain(|pace| pace.strong_count() > 0);
-        let live: Vec<Arc<FramePace>> = self.paces.iter().filter_map(Weak::upgrade).collect();
+        let mut registered = self.paces.borrow_mut();
+        registered.retain(|pace| pace.strong_count() > 0);
+        let live: Vec<Arc<FramePace>> = registered.iter().filter_map(Weak::upgrade).collect();
+        drop(registered);
         let mut handles: Vec<HANDLE> = Vec::with_capacity(live.len() + 1);
         if let Some(wake) = &self.wake {
             handles.push(wake.0);
@@ -227,62 +217,6 @@ impl Backend for Win32Backend {
     fn flush(&mut self) {
         // Nothing waits here any more: the frame the turn built is with its render thread,
         // and the next turn waits on that thread's event when it has one to wait for.
-    }
-}
-
-/// One surface the host opened: the session and nothing else.
-struct HostedSurface {
-    session: Session<Box<dyn App>>,
-}
-
-impl SurfaceHandle for HostedSurface {
-    fn add_image(&mut self, image: ImageEntry) -> Result<(), String> {
-        self.session.lp_mut().register_image(image);
-        Ok(())
-    }
-
-    fn step(&mut self) -> Result<SurfaceStep, String> {
-        let tick = self.session.step()?;
-        Ok(SurfaceStep { drew: tick.drew })
-    }
-
-    fn moving(&self) -> bool {
-        self.session.moving()
-    }
-
-    fn pump_moved(&mut self) -> bool {
-        self.session.pump_moved()
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
-        self.session.next_deadline()
-    }
-
-    fn request_frame(&mut self) {
-        self.session.lp_mut().request_frame();
-    }
-
-    fn is_closed(&self) -> bool {
-        self.session.finished()
-    }
-
-    fn take_copies(&mut self) -> Vec<ClipboardCopy> {
-        let mut copies = Vec::new();
-        for command in self.session.lp_mut().take_clipboard_commands() {
-            match command {
-                ClipboardCommand::Copy { content, kind } => copies.push(ClipboardCopy {
-                    content,
-                    kind,
-                    // A copy here is the clipboard itself; there is no serial to serve under.
-                    serial: 0,
-                }),
-                // Windows has no primary selection, so a paste is always the clipboard's.
-                ClipboardCommand::RequestPaste { .. } => {
-                    let _ = self.session.request_paste();
-                }
-            }
-        }
-        copies
     }
 }
 

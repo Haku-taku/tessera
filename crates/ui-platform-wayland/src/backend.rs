@@ -10,19 +10,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ui_platform::clipboard::{ClipboardCopy, ClipboardKind};
-use ui_platform::host::{Backend, OpenOptions, SurfaceHandle};
+use ui_platform::host::{Backend, PresentationOptions, SurfaceHandle};
 use ui_platform::hotkeys::{GlobalHotkeys, NoGlobalHotkeys};
 use ui_platform::ipc::Channel;
 use ui_platform::output::OutputInfo;
 use ui_platform::session::SessionOptions;
 use ui_platform::transfer::SelectionReader;
-use ui_platform::view::{App, AppLoop};
 use ui_platform::window::SurfaceSpec;
 
 use crate::clipboard_host::ClipboardHost;
 use crate::ipc::{ServerState, UnixChannel};
 use crate::link::WaylandLink;
-use crate::session::Session;
+use crate::session::Presenter;
 use crate::window::WindowError;
 
 /// Surfaces and services on one compositor connection.
@@ -121,31 +120,17 @@ impl Backend for WaylandBackend {
     fn open(
         &mut self,
         spec: SurfaceSpec,
-        app: Box<dyn App>,
-        options: OpenOptions,
+        options: PresentationOptions,
     ) -> Result<Box<dyn SurfaceHandle>, String> {
-        let mut lp = AppLoop::with_stack(app, &[]);
-        for image in options.images {
-            lp.register_image(image);
-        }
-        for face in options.fonts {
-            if !lp.register_font(&face.name, face.data) {
-                return Err(format!("the font {} could not be registered", face.name));
-            }
-        }
-        for (chord, id) in options.shortcuts {
-            lp.bind_shortcut(chord, id);
-        }
-        let session = Session::open_on(
+        let presenter = Presenter::open_on(
             &self.link,
-            lp,
             SessionOptions {
                 surface: spec,
                 uncapped: options.uncapped,
                 cpu_presenter: self.cpu_presenter,
             },
         )?;
-        Ok(Box::new(session))
+        Ok(Box::new(presenter))
     }
 
     fn set_clipboard_copy(&mut self, copy: ClipboardCopy) -> bool {

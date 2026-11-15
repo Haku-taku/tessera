@@ -3,7 +3,7 @@
 use ui_core::BackdropBlur;
 use ui_core::draw::{Acrylic, BackdropMaterial, FocusVisual};
 use ui_core::geom::{Color, Corners, Insets};
-use ui_core::layout::{Anchor, AxisSize, Grow, OverlayPlacement, Side, SizeClass};
+use ui_core::layout::{Anchor, AxisSize, Grow, OverlayPlacement, Presentation, Side, SizeClass};
 use ui_core::shortcut::{KeyChord, ShortcutId};
 use ui_core::{Change, Decl, Id, Key, Modifiers, NodeKind, Sense};
 use ui_style::{ControlKind, Density, Style, TextRole};
@@ -453,6 +453,7 @@ impl Widget for FluentMenuFlyout {
             match_anchor_width: false,
             match_anchor_height: false,
             min_width: 0.0,
+            presentation: Presentation::Parent,
         };
         let corners = Corners::all(PRESENTER_RADIUS);
         let mut panel = Decl::container(panel_id, NodeKind::Column)

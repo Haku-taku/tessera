@@ -12,7 +12,8 @@
 //! `margin` and `size` into a rectangle on the output itself; `exclusive` and `keyboard` have
 //! no counterpart and are ignored, or approximated with "does not activate" window styles.
 
-use ui_core::geom::Insets;
+use ui_core::geom::{Insets, Point, Rect, Size};
+use ui_core::layout::{OverlayAlign, Side};
 
 /// What a host asks for when it opens a surface.
 #[derive(Clone, Debug)]
@@ -201,4 +202,292 @@ pub enum KeyboardMode {
     /// focus is the compositor's, and it holds until the client asks for less. A pin canvas
     /// wants it — typing under the canvas belongs to the window under the pointer.
     FollowPointer,
+}
+
+/// What a platform popup asks for: a rectangle, an anchor, and what to do at an edge.
+///
+/// Every coordinate is in the parent presentation's space. The engine lays the panel out in
+/// the parent tree before the surface exists, so `rect` is that subtree's rect plus whatever
+/// paints outside it, and no second layout follows. Its size is never changed by a constraint
+/// adjustment, and its origin is where the panel's own coordinates start: a platform that
+/// routes the popup's input back into the tree shifts each position by it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PopupSpec {
+    /// The laid-out panel: the surface's size, and the tree position it stands for.
+    pub rect: Rect,
+    /// The rectangle the panel hangs from, in the parent presentation's coordinates.
+    pub anchor: Rect,
+    /// The preferred unfolding side.
+    pub side: Side,
+    /// How the panel lines up with the anchor along the other axis.
+    pub align: OverlayAlign,
+    /// Gap between the anchor and the panel.
+    pub offset: f32,
+    pub constraint: Constraint,
+}
+
+/// What a platform may do when a popup's preferred position does not fit.
+///
+/// The set is `xdg_positioner`'s, so a Wayland backend forwards it instead of interpreting
+/// it; a platform without a positioner applies [`place_popup`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Constraint {
+    /// Mirror to the anchor's other side.
+    pub flip_x: bool,
+    pub flip_y: bool,
+    /// Move along the axis until the popup fits, covering part of the anchor.
+    pub slide_x: bool,
+    pub slide_y: bool,
+}
+
+impl Constraint {
+    /// Leave the request alone; the output edge cuts the panel.
+    pub const NONE: Self = Self {
+        flip_x: false,
+        flip_y: false,
+        slide_x: false,
+        slide_y: false,
+    };
+
+    /// Flip first, then slide. `resize` is absent on purpose: the size is the engine's
+    /// layout result, and a platform that shrank it would cut content.
+    pub const FLIP_AND_SLIDE: Self = Self {
+        flip_x: true,
+        flip_y: true,
+        slide_x: true,
+        slide_y: true,
+    };
+}
+
+impl Default for Constraint {
+    fn default() -> Self {
+        Self::FLIP_AND_SLIDE
+    }
+}
+
+/// Where a popup lands: the preferred placement, adjusted against `bounds`.
+///
+/// `bounds` is the space the popup must stay inside, in the same coordinates as
+/// [`PopupSpec::anchor`]: a backend converts its monitor's work area into the parent's client
+/// space before calling. The popup's size never changes.
+pub fn place_popup(spec: &PopupSpec, bounds: Rect) -> Rect {
+    let size = spec.rect.size;
+    let vertical = matches!(spec.side, Side::Below | Side::Above);
+    let (flip_along, flip_across) = if vertical {
+        (spec.constraint.flip_y, spec.constraint.flip_x)
+    } else {
+        (spec.constraint.flip_x, spec.constraint.flip_y)
+    };
+
+    let mut side = spec.side;
+    let mut rect = preferred(spec.anchor, size, side, spec.align, spec.offset);
+
+    // Flipping along the unfolding axis changes which side of the anchor the panel is on.
+    if flip_along && !fits(rect, bounds, vertical) {
+        let flipped = opposite(side);
+        let alternative = preferred(spec.anchor, size, flipped, spec.align, spec.offset);
+        if overflow(alternative, bounds, vertical) < overflow(rect, bounds, vertical) {
+            side = flipped;
+            rect = alternative;
+        }
+    }
+    // The cross axis has no other side, only the anchor's other end.
+    if flip_across
+        && !fits(rect, bounds, !vertical)
+        && let Some(align) = flipped_align(spec.align)
+    {
+        let alternative = preferred(spec.anchor, size, side, align, spec.offset);
+        if overflow(alternative, bounds, !vertical) < overflow(rect, bounds, !vertical) {
+            rect = alternative;
+        }
+    }
+    if spec.constraint.slide_x {
+        rect.origin.x = slide(rect.origin.x, rect.size.w, bounds.min_x(), bounds.max_x());
+    }
+    if spec.constraint.slide_y {
+        rect.origin.y = slide(rect.origin.y, rect.size.h, bounds.min_y(), bounds.max_y());
+    }
+    rect
+}
+
+fn preferred(anchor: Rect, size: Size, side: Side, align: OverlayAlign, offset: f32) -> Rect {
+    let (x, y) = match side {
+        Side::Below => (
+            along(anchor.min_x(), anchor.size.w, size.w, align),
+            anchor.max_y() + offset,
+        ),
+        Side::Above => (
+            along(anchor.min_x(), anchor.size.w, size.w, align),
+            anchor.min_y() - offset - size.h,
+        ),
+        Side::Right => (
+            anchor.max_x() + offset,
+            along(anchor.min_y(), anchor.size.h, size.h, align),
+        ),
+        Side::Left => (
+            anchor.min_x() - offset - size.w,
+            along(anchor.min_y(), anchor.size.h, size.h, align),
+        ),
+    };
+    Rect::from_origin_size(Point::new(x, y), size)
+}
+
+fn along(start: f32, span: f32, length: f32, align: OverlayAlign) -> f32 {
+    match align {
+        OverlayAlign::Start => start,
+        OverlayAlign::Center => start + (span - length) * 0.5,
+        OverlayAlign::End => start + span - length,
+    }
+}
+
+fn opposite(side: Side) -> Side {
+    match side {
+        Side::Below => Side::Above,
+        Side::Above => Side::Below,
+        Side::Left => Side::Right,
+        Side::Right => Side::Left,
+    }
+}
+
+/// A centered panel has no other end to move to; only sliding can help it.
+fn flipped_align(align: OverlayAlign) -> Option<OverlayAlign> {
+    match align {
+        OverlayAlign::Start => Some(OverlayAlign::End),
+        OverlayAlign::End => Some(OverlayAlign::Start),
+        OverlayAlign::Center => None,
+    }
+}
+
+fn fits(rect: Rect, bounds: Rect, vertical: bool) -> bool {
+    let (start, end) = axis(rect, vertical);
+    let (low, high) = axis(bounds, vertical);
+    start >= low && end <= high
+}
+
+fn overflow(rect: Rect, bounds: Rect, vertical: bool) -> f32 {
+    let (start, end) = axis(rect, vertical);
+    let (low, high) = axis(bounds, vertical);
+    (low - start).max(0.0) + (end - high).max(0.0)
+}
+
+fn axis(rect: Rect, vertical: bool) -> (f32, f32) {
+    if vertical {
+        (rect.min_y(), rect.max_y())
+    } else {
+        (rect.min_x(), rect.max_x())
+    }
+}
+
+/// Move `value` the least distance that puts `length` inside `low..=high`.
+fn slide(value: f32, length: f32, low: f32, high: f32) -> f32 {
+    if length >= high - low {
+        low
+    } else {
+        value.clamp(low, high - length)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(anchor: Rect, size: (u32, u32), constraint: Constraint) -> PopupSpec {
+        PopupSpec {
+            rect: Rect::new(0.0, 0.0, size.0 as f32, size.1 as f32),
+            anchor,
+            side: Side::Below,
+            align: OverlayAlign::Start,
+            offset: 0.0,
+            constraint,
+        }
+    }
+
+    /// The case the design was written around: an anchor 40 px above the output's bottom
+    /// edge, whose panel cannot fit below. Flipping keeps the anchor visible; sliding would
+    /// cover it. The gap is preserved on the side it flips to.
+    #[test]
+    fn a_panel_at_the_bottom_flips_before_it_slides() {
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let mut request = spec(Rect::new(100.0, 720.0, 200.0, 40.0), (300, 300), Constraint::default());
+        assert_eq!(
+            place_popup(&request, bounds),
+            Rect::new(100.0, 420.0, 300.0, 300.0)
+        );
+
+        request.offset = 8.0;
+        assert_eq!(
+            place_popup(&request, bounds),
+            Rect::new(100.0, 412.0, 300.0, 300.0),
+            "the gap belongs on whichever side the panel unfolds"
+        );
+    }
+
+    /// With flipping refused, the panel slides up and covers the anchor instead of leaving
+    /// the output. This is the branch a platform without flip support takes.
+    #[test]
+    fn a_panel_without_flip_slides_to_the_edge() {
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let request = spec(
+            Rect::new(100.0, 720.0, 200.0, 40.0),
+            (300, 300),
+            Constraint {
+                flip_x: false,
+                flip_y: false,
+                slide_x: true,
+                slide_y: true,
+            },
+        );
+        assert_eq!(
+            place_popup(&request, bounds),
+            Rect::new(100.0, 500.0, 300.0, 300.0)
+        );
+    }
+
+    /// A panel that cannot fit at all is pinned to the output's top-left rather than
+    /// centered on a negative offset or left with an arbitrary overflow.
+    #[test]
+    fn a_panel_larger_than_the_bounds_pins_its_origin() {
+        let bounds = Rect::new(50.0, 60.0, 200.0, 200.0);
+        let request = spec(Rect::new(60.0, 70.0, 10.0, 10.0), (300, 300), Constraint::default());
+        let placed = place_popup(&request, bounds);
+        assert_eq!(placed.origin, Point::new(50.0, 60.0));
+        assert_eq!(placed.size, Size::new(300.0, 300.0), "the size never changes");
+    }
+
+    /// `NONE` is the platform saying it has no positioner and no space to adjust: the request
+    /// stands, even though the panel is cut by the output edge.
+    #[test]
+    fn no_constraint_leaves_the_request_where_it_was() {
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let request = spec(Rect::new(100.0, 720.0, 200.0, 40.0), (300, 300), Constraint::NONE);
+        assert_eq!(
+            place_popup(&request, bounds),
+            Rect::new(100.0, 760.0, 300.0, 300.0)
+        );
+    }
+
+    /// At the right edge the panel has no room to the right, and there is no other side of
+    /// the anchor along x: flipping the alignment moves its far edge onto the anchor's.
+    #[test]
+    fn an_aligned_panel_flips_its_alignment_at_the_right_edge() {
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let request = spec(Rect::new(800.0, 100.0, 100.0, 40.0), (300, 100), Constraint::default());
+        assert_eq!(
+            place_popup(&request, bounds),
+            Rect::new(600.0, 140.0, 300.0, 100.0)
+        );
+    }
+
+    /// A centered panel has no other alignment to flip to, so the cross-axis flip is skipped
+    /// and the slide does the work.
+    #[test]
+    fn a_centered_panel_slides_because_it_has_no_second_alignment() {
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let mut request = spec(Rect::new(900.0, 100.0, 100.0, 40.0), (300, 100), Constraint::default());
+        request.align = OverlayAlign::Center;
+        assert_eq!(
+            place_popup(&request, bounds),
+            Rect::new(700.0, 140.0, 300.0, 100.0)
+        );
+    }
 }

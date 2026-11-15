@@ -336,6 +336,17 @@ pub enum OverlayAlign {
     End,
 }
 
+/// Which surface paints the panel an overlay declares.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Presentation {
+    /// The parent's surface, laid out against it and clamped into its viewport.
+    #[default]
+    Parent,
+    /// A surface of the platform's own: measured here as content, positioned there
+    /// against an output this tree knows nothing about.
+    Platform,
+}
+
 /// An anchored overlay: where it unfolds from, how far off, and what to do at an edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OverlayPlacement {
@@ -353,6 +364,25 @@ pub struct OverlayPlacement {
     /// The narrowest the panel may become when it matches the anchor (WinUI's
     /// `ComboBoxPopupThemeMinWidth`): a short trigger still gets a usable panel.
     pub min_width: f32,
+    /// Painted by its parent, or presented by the platform.
+    pub presentation: Presentation,
+}
+
+/// A panel the layout pass measured for a surface of the platform's own.
+///
+/// The rect is where the panel would be if its parent painted it: the platform may put
+/// the surface somewhere else entirely, so this is a request, not a position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlatformPanel {
+    /// The panel subtree's root, laid out in the parent tree.
+    pub node: crate::id::NodeId,
+    /// The anchor's rect, in the parent presentation's coordinates.
+    pub anchor: Rect,
+    /// The panel's own rect in those same coordinates, before any platform adjustment.
+    pub rect: Rect,
+    pub side: Side,
+    pub align: OverlayAlign,
+    pub offset: f32,
 }
 
 impl OverlayPlacement {
@@ -367,6 +397,7 @@ impl OverlayPlacement {
             match_anchor_width: false,
             match_anchor_height: false,
             min_width: 0.0,
+            presentation: Presentation::Parent,
         }
     }
 
@@ -402,6 +433,11 @@ impl OverlayPlacement {
 
     pub fn min_width(mut self, width: f32) -> Self {
         self.min_width = width;
+        self
+    }
+
+    pub fn presentation(mut self, presentation: Presentation) -> Self {
+        self.presentation = presentation;
         self
     }
 }

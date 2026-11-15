@@ -11,7 +11,9 @@ use ui_core::draw::ImageEntry;
 use ui_core::shortcut::{KeyChord, ShortcutId};
 use ui_core::{Decl, Id, NodeKind};
 use ui_platform::clipboard::{ClipboardCopy, ClipboardKind};
-use ui_platform::host::{Backend, Effect, Host, OpenOptions, SurfaceHandle, SurfaceStep};
+use ui_platform::host::{
+    Backend, Effect, Engine, Host, OpenOptions, PresentationOptions, SurfaceHandle, SurfaceStep,
+};
 use ui_platform::hotkeys::{GlobalHotkeyError, GlobalHotkeys};
 use ui_platform::ipc::{Channel, Reply};
 use ui_platform::window::SurfaceSpec;
@@ -48,12 +50,12 @@ struct Scripted {
 }
 
 impl SurfaceHandle for Scripted {
-    fn add_image(&mut self, image: ImageEntry) -> Result<(), String> {
+    fn add_image(&mut self, image: &ImageEntry) -> Result<(), String> {
         self.images.borrow_mut().push(image.id);
         Ok(())
     }
 
-    fn step(&mut self) -> Result<SurfaceStep, String> {
+    fn step(&mut self, _engine: &mut Engine) -> Result<SurfaceStep, String> {
         self.steps.set(self.steps.get() + 1);
         assert!(
             self.steps.get() < 100,
@@ -77,11 +79,11 @@ impl SurfaceHandle for Scripted {
         Ok(SurfaceStep::default())
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
         self.deadline
     }
 
-    fn request_frame(&mut self) {
+    fn frame_requested(&mut self) {
         self.requested.set(self.requested.get() + 1);
     }
 
@@ -89,7 +91,7 @@ impl SurfaceHandle for Scripted {
         self.closed
     }
 
-    fn take_copies(&mut self) -> Vec<ClipboardCopy> {
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
         std::mem::take(&mut self.copies)
     }
 }
@@ -127,7 +129,7 @@ impl GlobalHotkeys for ScriptedHotkeys {
 }
 
 struct FakeBackend {
-    prepared: VecDeque<Scripted>,
+    prepared: VecDeque<Box<dyn SurfaceHandle>>,
     log: Rc<RefCell<Log>>,
     /// Stop the loop once this many waits have happened; the fake never blocks.
     stop_after: usize,
@@ -138,11 +140,10 @@ impl Backend for FakeBackend {
     fn open(
         &mut self,
         _spec: SurfaceSpec,
-        _app: Box<dyn App>,
-        _options: OpenOptions,
+        _options: PresentationOptions,
     ) -> Result<Box<dyn SurfaceHandle>, String> {
         match self.prepared.pop_front() {
-            Some(surface) => Ok(Box::new(surface)),
+            Some(surface) => Ok(surface),
             None => Err("the test prepared no surface".into()),
         }
     }
@@ -248,7 +249,10 @@ fn host_with_hotkeys(
         log: Rc::clone(&log),
     });
     let backend = FakeBackend {
-        prepared: surfaces.into_iter().collect(),
+        prepared: surfaces
+            .into_iter()
+            .map(|surface| Box::new(surface) as Box<dyn SurfaceHandle>)
+            .collect(),
         log: Rc::clone(&log),
         stop_after,
         hotkeys,
@@ -652,4 +656,357 @@ fn a_finished_job_asks_every_surface_for_a_frame() {
     host.run_until(None).expect("the surface closes");
 
     assert_eq!(requested.get(), 1, "one completion asks for one frame");
+}
+
+// ---- panels on surfaces of their own ----
+
+/// What the engine told the app was dismissed, frame by frame.
+type Seen = Rc<RefCell<Vec<Option<ui_core::Id>>>>;
+
+/// A page whose panel asks for a surface of its own.
+struct PanelPage {
+    seen: Seen,
+}
+
+impl App for PanelPage {
+    fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn Element> {
+        self.seen.borrow_mut().push(cx.dismissed());
+        use ui_core::layout::{Anchor, OverlayPlacement, Presentation, SizeClass};
+        ui_platform::from_decl(
+            Decl::container(Id::str("root"), NodeKind::Stack)
+                .size(SizeClass::fixed(200.0, 200.0))
+                .child(
+                    Decl::container(Id::str("anchor"), NodeKind::Box)
+                        .size(SizeClass::fixed(20.0, 20.0)),
+                )
+                .child(
+                    Decl::container(Id::str("panel"), NodeKind::Box)
+                        .size(SizeClass::fixed(100.0, 60.0))
+                        .background(
+                            ui_core::geom::Color::from_rgba8(255, 0, 0, 255),
+                            ui_core::geom::Corners::ZERO,
+                        )
+                        .overlay(
+                            OverlayPlacement::below(Anchor::Node(Id::str("anchor")))
+                                .presentation(Presentation::Platform),
+                        ),
+                ),
+        )
+    }
+}
+
+/// What the panel machinery did, readable after the loop is over.
+#[derive(Default)]
+struct PanelLog {
+    /// Owners of every rect the root's own lists carried, across all frames.
+    parent_owners: RefCell<Vec<ui_core::NodeId>>,
+    /// Panels the platform was asked for, with the request it got.
+    opened: RefCell<Vec<(ui_core::NodeId, ui_platform::window::PopupSpec)>>,
+    /// Panels whose surface presented a list.
+    shown: RefCell<Vec<ui_core::NodeId>>,
+    /// The engine's absolute panel rects, from the last frame the root built.
+    rects: RefCell<Vec<(ui_core::NodeId, ui_core::geom::Rect)>>,
+}
+
+/// A scene target that records which nodes owned the rects it was handed.
+#[derive(Default)]
+struct OwnerTarget {
+    owners: Vec<ui_core::NodeId>,
+}
+
+impl ui_platform::present::SceneTarget for OwnerTarget {
+    fn size(&self) -> (u32, u32) {
+        (400, 400)
+    }
+
+    fn present_scene(
+        &mut self,
+        scene: &ui_core::draw::DrawList,
+        _text: &ui_platform::TextPass,
+        _damage: &ui_core::Damage,
+        _canvases: &[ui_platform::present::CanvasFrame],
+    ) -> Result<ui_platform::present::PresentStats, String> {
+        self.owners.extend(scene.owners.rects.iter().copied());
+        Ok(ui_platform::present::PresentStats {
+            draw_calls: 1,
+            band: None,
+        })
+    }
+}
+
+/// The group's root: builds a real frame each step, then closes after `budget` steps.
+struct PanelRoot {
+    log: Rc<PanelLog>,
+    budget: Cell<usize>,
+    /// Whether this presentation can open a popup at all.
+    popups: bool,
+    /// Whether each panel's surface closes itself after its first frame, as a compositor
+    /// taking the popup back does.
+    close_panels: bool,
+}
+
+impl SurfaceHandle for PanelRoot {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        let mut target = OwnerTarget::default();
+        engine.frame_scene(&mut target, None)?;
+        self.log.parent_owners.borrow_mut().extend(target.owners);
+        *self.log.rects.borrow_mut() = engine
+            .platform_panels()
+            .iter()
+            .map(|panel| (panel.node, panel.rect))
+            .collect();
+        self.budget.set(self.budget.get() - 1);
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        self.budget.get() == 0
+    }
+
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+
+    fn open_popup(
+        &mut self,
+        node: ui_core::NodeId,
+        spec: ui_platform::window::PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        if !self.popups {
+            return Err("this presentation has no popup surfaces".into());
+        }
+        self.log.opened.borrow_mut().push((node, spec));
+        Ok(Box::new(PanelSurface {
+            node,
+            log: Rc::clone(&self.log),
+            closes: self.close_panels,
+            done: Cell::new(false),
+        }))
+    }
+}
+
+/// One panel's surface: shows the part of the frame the engine painted for its node.
+struct PanelSurface {
+    node: ui_core::NodeId,
+    log: Rc<PanelLog>,
+    /// Close after the first frame, standing in for the compositor taking the popup back.
+    closes: bool,
+    done: Cell<bool>,
+}
+
+impl SurfaceHandle for PanelSurface {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        let mut target = OwnerTarget::default();
+        engine.present_panel(self.node, &mut target)?;
+        self.log.shown.borrow_mut().push(self.node);
+        self.done.set(self.closes);
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        self.done.get()
+    }
+
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+
+    /// A panel inside this one hangs off this surface, as it does on a compositor.
+    fn open_popup(
+        &mut self,
+        node: ui_core::NodeId,
+        spec: ui_platform::window::PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        self.log.opened.borrow_mut().push((node, spec));
+        Ok(Box::new(PanelSurface {
+            node,
+            log: Rc::clone(&self.log),
+            closes: self.closes,
+            done: Cell::new(false),
+        }))
+    }
+}
+
+/// Run `PanelPage` for one panel's worth of frames.
+fn run_panels(popups: bool) -> (Rc<PanelLog>, Vec<ui_core::NodeId>) {
+    let (log, parent, _) = run_panels_with(popups, false);
+    (log, parent)
+}
+
+/// The same page, with panels that close themselves after one frame when `close_panels`.
+fn run_panels_with(
+    popups: bool,
+    close_panels: bool,
+) -> (Rc<PanelLog>, Vec<ui_core::NodeId>, Seen) {
+    let log = Rc::new(PanelLog::default());
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let root = PanelRoot {
+        log: Rc::clone(&log),
+        budget: Cell::new(3),
+        popups,
+        close_panels,
+    };
+    let backend = FakeBackend {
+        prepared: VecDeque::from([Box::new(root) as Box<dyn SurfaceHandle>]),
+        log: Rc::new(RefCell::new(Log::default())),
+        stop_after: usize::MAX,
+        hotkeys: None,
+    };
+    let mut host = Host::new(Box::new(backend));
+    host.open(
+        spec("page"),
+        PanelPage {
+            seen: Rc::clone(&seen),
+        },
+        OpenOptions::default(),
+    )
+    .expect("the page opens");
+    host.run_until(None).expect("the page closes");
+    let parent = log.parent_owners.borrow().clone();
+    (log, parent, seen)
+}
+
+/// A panel the platform closed is reported to the app as a dismissal, and stays closed for
+/// as long as the app keeps declaring it — declaring it again is what opens it again.
+#[test]
+fn a_closed_panel_is_reported_as_dismissed_and_not_reopened() {
+    let (log, _parent, seen) = run_panels_with(true, true);
+    assert_eq!(
+        log.opened.borrow().len(),
+        1,
+        "a panel the platform closed must not be opened again while it is still declared"
+    );
+    assert!(
+        seen.borrow().contains(&Some(ui_core::Id::str("panel"))),
+        "the app is told which panel the platform closed: {:?}",
+        seen.borrow()
+    );
+}
+
+/// A panel with a surface of its own is opened once, shown there, and kept out of the
+/// parent's list; a platform that cannot open one hands it back to the parent.
+#[test]
+fn a_panel_gets_a_surface_of_its_own_or_falls_back_to_its_parent() {
+    let (log, parent_owners) = run_panels(true);
+    let opened = log.opened.borrow();
+    assert_eq!(opened.len(), 1, "one surface for one panel: {opened:?}");
+    let (panel, spec) = opened[0];
+    assert_eq!(
+        (spec.rect.size.w, spec.rect.size.h),
+        (100.0, 60.0),
+        "the surface takes the panel's laid-out size"
+    );
+    let shown = log.shown.borrow();
+    assert!(
+        !shown.is_empty() && shown.iter().all(|node| *node == panel),
+        "the panel's surface showed that panel and nothing else: {shown:?}"
+    );
+    assert!(
+        !parent_owners.contains(&panel),
+        "the parent's surface must not paint the panel"
+    );
+
+    // The same page, built the same way, names the same nodes.
+    let (log, parent_owners) = run_panels(false);
+    assert!(
+        log.opened.borrow().is_empty(),
+        "a presentation with no popups opens none"
+    );
+    assert!(
+        log.shown.borrow().is_empty(),
+        "nothing was shown in a surface of its own"
+    );
+    assert!(
+        parent_owners.contains(&panel),
+        "with no surface to open, the parent paints the panel"
+    );
+}
+
+/// A page with a panel inside a panel, both asking for a surface of their own.
+struct NestedPage;
+
+impl App for NestedPage {
+    fn view(&mut self, _cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn Element> {
+        use ui_core::layout::{Anchor, OverlayPlacement, Presentation, SizeClass};
+        ui_platform::from_decl(
+            Decl::container(Id::str("root"), NodeKind::Stack)
+                .size(SizeClass::fixed(400.0, 400.0))
+                .child(
+                    Decl::container(Id::str("panel"), NodeKind::Box)
+                        .size(SizeClass::fixed(100.0, 60.0))
+                        .overlay(
+                            OverlayPlacement::below(Anchor::Node(Id::str("root")))
+                                .presentation(Presentation::Platform),
+                        )
+                        .child(
+                            Decl::container(Id::str("inner"), NodeKind::Box)
+                                .size(SizeClass::fixed(40.0, 20.0))
+                                .overlay(
+                                    OverlayPlacement::below(Anchor::Node(Id::str("panel")))
+                                        .presentation(Presentation::Platform),
+                                ),
+                        ),
+                ),
+        )
+    }
+}
+
+/// A panel inside another is asked of the outer panel's surface, and its request is
+/// measured from that surface rather than from the window under it.
+#[test]
+fn a_panel_inside_a_panel_is_placed_against_the_outer_surface() {
+    let log = Rc::new(PanelLog::default());
+    let backend = FakeBackend {
+        prepared: VecDeque::from([Box::new(PanelRoot {
+            log: Rc::clone(&log),
+            budget: Cell::new(3),
+            popups: true,
+            close_panels: false,
+        }) as Box<dyn SurfaceHandle>]),
+        log: Rc::new(RefCell::new(Log::default())),
+        stop_after: usize::MAX,
+        hotkeys: None,
+    };
+    let mut host = Host::new(Box::new(backend));
+    host.open(spec("page"), NestedPage, OpenOptions::default())
+        .expect("the page opens");
+    host.run_until(None).expect("the page closes");
+
+    let opened = log.opened.borrow();
+    assert_eq!(opened.len(), 2, "both panels get a surface: {opened:?}");
+    let rects = log.rects.borrow();
+    let engine_rect = |width: f32| {
+        rects
+            .iter()
+            .find(|(_, rect)| rect.size.w == width)
+            .map(|(_, rect)| *rect)
+            .expect("both panels are recorded by the layout")
+    };
+    let outer = engine_rect(100.0);
+    let inner = engine_rect(40.0);
+    assert_ne!(
+        outer.origin, inner.origin,
+        "the two panels are placed apart, so the coordinates below can tell them apart"
+    );
+    let request = opened
+        .iter()
+        .find(|(_, request)| request.rect.size.w == 40.0)
+        .map(|(_, request)| *request)
+        .expect("the inner panel's surface was asked of the outer one");
+    assert_eq!(
+        (
+            request.rect.origin.x - (inner.origin.x - outer.origin.x),
+            request.rect.origin.y - (inner.origin.y - outer.origin.y),
+        ),
+        (0.0, 0.0),
+        "a nested panel's request starts at the outer surface's own origin: {request:?}"
+    );
 }

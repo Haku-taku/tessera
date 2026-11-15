@@ -2444,6 +2444,123 @@ mod contracts {
         );
     }
 
+    /// A target that records the rect primitives a list carried and who owns them.
+    #[derive(Default)]
+    struct RectTarget {
+        rects: Vec<(ui_core::NodeId, Rect)>,
+    }
+
+    impl crate::present::SceneTarget for RectTarget {
+        fn size(&self) -> (u32, u32) {
+            (400, 400)
+        }
+
+        fn present_scene(
+            &mut self,
+            scene: &ui_core::draw::DrawList,
+            _text: &crate::text_pass::TextPass,
+            _damage: &ui_core::Damage,
+            _canvases: &[crate::present::CanvasFrame],
+        ) -> Result<crate::present::PresentStats, String> {
+            self.rects = scene
+                .prims
+                .rects
+                .iter()
+                .zip(&scene.owners.rects)
+                .map(|(prim, owner)| (*owner, prim.rect))
+                .collect();
+            Ok(crate::present::PresentStats {
+                draw_calls: 1,
+                band: None,
+            })
+        }
+    }
+
+    /// A panel declared for a surface of the platform's own paints into that surface's list,
+    /// rebased on the panel's own top-left, and never into its parent's.
+    #[test]
+    fn a_platform_panel_paints_into_its_own_list_and_not_the_parent() {
+        struct PanelApp;
+        impl App for PanelApp {
+            fn view(&mut self, _cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+                crate::from_decl(
+                    Decl::container(Id::str("page"), NodeKind::Stack)
+                        .size(ui_core::layout::SizeClass::fixed(400.0, 400.0))
+                        .background(Color::from_rgba8(0, 0, 255, 255), Corners::ZERO)
+                        .child(
+                            Decl::container(Id::str("anchor"), NodeKind::Box)
+                                .size(ui_core::layout::SizeClass::fixed(40.0, 20.0))
+                                .offset(150.0, 300.0)
+                                .background(Color::from_rgba8(255, 0, 0, 255), Corners::ZERO),
+                        )
+                        .child(
+                            Decl::container(Id::str("panel"), NodeKind::Box)
+                                .size(ui_core::layout::SizeClass::fixed(120.0, 80.0))
+                                .background(Color::from_rgba8(0, 255, 0, 255), Corners::ZERO)
+                                .overlay(
+                                    ui_core::layout::OverlayPlacement::below(
+                                        ui_core::layout::Anchor::Node(Id::str("anchor")),
+                                    )
+                                    .presentation(ui_core::layout::Presentation::Platform),
+                                ),
+                        ),
+                )
+            }
+        }
+        let mut parent = RectTarget::default();
+        let mut lp = AppLoop::new(PanelApp);
+        lp.frame_scene(&mut parent, None).expect("a frame");
+        let panel = lp.tree.find_by_id(Id::str("panel")).expect("laid out");
+        assert!(
+            parent.rects.iter().all(|(owner, _)| *owner != panel),
+            "a panel the host has not placed yet is held back, not painted in the window"
+        );
+        // The host's answer, which it gives right after the build that declared the panel.
+        lp.set_panel_presentation(panel, true);
+        lp.frame_scene(&mut parent, None).expect("a frame");
+        assert!(
+            parent.rects.iter().all(|(owner, _)| *owner != panel),
+            "the parent's surface must not paint a panel that has one of its own"
+        );
+
+        let mut own = RectTarget::default();
+        lp.present_panel(panel, &mut own).expect("the panel's list");
+        let mut painted: Vec<Rect> = own
+            .rects
+            .iter()
+            .filter(|(owner, _)| *owner == panel)
+            .map(|(_, rect)| *rect)
+            .collect();
+        assert_eq!(painted.len(), 1, "the panel's background, once: {painted:?}");
+        let background = painted.remove(0);
+        assert_eq!(
+            (background.origin.x, background.origin.y),
+            (0.0, 0.0),
+            "the panel's list starts at the surface's own top-left"
+        );
+        assert_eq!(
+            (background.size.w, background.size.h),
+            (120.0, 80.0),
+            "the panel paints its laid-out size"
+        );
+
+        // A platform with no surface to open hands the panel back to its parent.
+        let mut parent = RectTarget::default();
+        let mut lp = AppLoop::new(PanelApp);
+        lp.frame_scene(&mut parent, None).expect("a frame");
+        let panel = lp.tree.find_by_id(Id::str("panel")).expect("laid out");
+        lp.set_panel_presentation(panel, false);
+        lp.frame_scene(&mut parent, None).expect("a frame");
+        assert!(
+            parent.rects.iter().any(|(owner, _)| *owner == panel),
+            "with no surface of its own, the parent paints the panel"
+        );
+        assert!(
+            lp.present_panel(panel, &mut RectTarget::default()).is_err(),
+            "a panel the parent paints has no list of its own"
+        );
+    }
+
     /// A page with a panel that offers a context menu.
     struct ContextMenu;
 

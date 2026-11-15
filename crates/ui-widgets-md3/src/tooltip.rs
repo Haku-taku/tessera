@@ -3,7 +3,9 @@
 //! tooltip only while it shows; the engine fades both ways.
 
 use ui_core::geom::{Color, Corners, Insets, Rect};
-use ui_core::layout::{Anchor, AxisSize, Grow, OverlayAlign, OverlayPlacement, Side, SizeClass};
+use ui_core::layout::{
+    Anchor, AxisSize, Grow, OverlayAlign, OverlayPlacement, Presentation, Side, SizeClass,
+};
 use ui_core::tree::{Presence, ShadowSpec};
 use ui_core::{AnimSpec, Change, Decl, Easing, Id, NodeKind, Weight};
 use ui_style::Style;
@@ -109,6 +111,7 @@ impl Widget for Md3ToolTip {
             match_anchor_width: false,
             match_anchor_height: false,
             min_width: 0.0,
+            presentation: Presentation::Parent,
         };
         Decl::container(self.id, NodeKind::Box)
             .size(SizeClass {
@@ -343,6 +346,7 @@ impl Widget for Md3RichToolTip {
             match_anchor_width: false,
             match_anchor_height: false,
             min_width: 0.0,
+            presentation: Presentation::Parent,
         };
         let mut root = Decl::container(self.id, NodeKind::Column)
             .size(SizeClass {

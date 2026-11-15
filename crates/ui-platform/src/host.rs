@@ -4,6 +4,8 @@
 //! native objects behind it. Nothing here names a protocol, a file descriptor or a platform.
 
 use std::sync::Arc;
+
+use ui_core::collections::FastSet;
 use std::time::{Duration, Instant};
 
 use ui_core::draw::ImageEntry;
@@ -17,8 +19,24 @@ use crate::jobs::{Jobs, Waker};
 use crate::output::OutputInfo;
 use crate::transfer::{Selection, SelectionReader};
 use crate::tray::{Icon, Tray, TrayEvent, TrayHandle, TrayId};
-use crate::view::App;
-use crate::window::SurfaceSpec;
+use crate::view::{App, AppLoop};
+use crate::window::{PopupSpec, SurfaceSpec};
+use ui_core::layout::PlatformPanel;
+
+/// The engine behind a group: the app, its declaration tree, its clock and its focus.
+///
+/// Boxed so a surface the host owns never names the application's type. A group may present
+/// through more than one `SurfaceHandle`; the engine is what they share.
+pub type Engine = AppLoop<Box<dyn App>>;
+
+/// What a backend needs to open a presentation.
+///
+/// The app-side half of `OpenOptions` — textures, fonts, shortcuts — belongs to the engine
+/// and is applied before the surface exists.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PresentationOptions {
+    pub uncapped: bool,
+}
 
 /// What a run did, for the application's own diagnostics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,12 +54,15 @@ pub struct SurfaceStep {
     pub drew: bool,
 }
 
-/// One surface as the loop sees it: a step that never waits, and when it must be woken.
+/// One presentation as the loop sees it: a step that never waits, and when it must be woken.
 ///
 /// The platform implements this for its surface type. `step` drains what has already
-/// arrived, decides, and draws only if a frame is due and the surface can take one.
+/// arrived from the engine it is given, decides, and draws only if a frame is due and the
+/// surface can take one. The engine lives outside: the same tree may present through several
+/// surfaces, and a presenter only knows the one it owns.
 pub trait SurfaceHandle {
-    fn step(&mut self) -> Result<SurfaceStep, String>;
+    /// Take what arrived and draw a frame for `engine` if one is due.
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String>;
 
     /// Whether a move or resize loop the platform started owns this surface right now.
     ///
@@ -55,26 +76,26 @@ pub trait SurfaceHandle {
     ///
     /// The loop dispatches only input and the timer it armed, so this tick is the surface's
     /// only chance to draw while it follows the pointer.
-    fn pump_moved(&mut self) -> bool {
+    fn pump_moved(&mut self, engine: &mut Engine) -> bool {
+        let _ = engine;
         false
     }
 
-    /// Hand this surface a texture it did not have when it opened.
+    /// A texture was added to this surface's engine.
     ///
-    /// A pin's canvas is already on screen when the next pin arrives, so the texture cannot
-    /// wait for the next `open`.
-    fn add_image(&mut self, image: ui_core::draw::ImageEntry) -> Result<(), String> {
+    /// Registration is the engine's, so the default is to do nothing; a presenter that
+    /// caches textures may use this to know one is coming.
+    fn add_image(&mut self, image: &ui_core::draw::ImageEntry) -> Result<(), String> {
         let _ = image;
-        Err("this platform cannot add a texture to a running surface".into())
+        Ok(())
     }
 
     /// When this surface must be woken with no input arriving (a caret blink, a snapping
     /// scroller). `None` means it only moves when something happens.
-    fn next_deadline(&self) -> Option<Instant>;
+    fn next_deadline(&self, engine: &Engine) -> Option<Instant>;
 
-    /// Build a frame on the next turn even though no event arrived. A finished job is
-    /// the usual reason: its result lives in app state only the build reads.
-    fn request_frame(&mut self) {}
+    /// The host asked the engine for a frame; a presenter that paces its own chain may act.
+    fn frame_requested(&mut self) {}
 
     fn is_closed(&self) -> bool;
 
@@ -82,7 +103,31 @@ pub trait SurfaceHandle {
     ///
     /// The host owns the clipboard, so a surface hands over the request instead of serving
     /// it; paste requests are the surface's own business and never reach here.
-    fn take_copies(&mut self) -> Vec<ClipboardCopy>;
+    fn take_copies(&mut self, engine: &mut Engine) -> Vec<ClipboardCopy>;
+
+    /// Open a surface of this one's own for the panel `node`, hung off it per `spec`.
+    ///
+    /// The panel's subtree is painted by the engine, and `node` is what the new surface
+    /// hands back to [`AppLoop::present_panel`] each frame. The default is a presentation
+    /// with no popups, and the host then paints the panel in this surface: a panel must
+    /// never disappear because a surface could not be opened.
+    fn open_popup(
+        &mut self,
+        node: ui_core::NodeId,
+        spec: PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        let _ = (node, spec);
+        Err("this presentation has no popup surfaces".into())
+    }
+
+    /// Move or resize a popup this surface opened, per `spec`.
+    ///
+    /// The default keeps the surface where it is: a platform that cannot reposition a popup
+    /// closes and reopens it instead.
+    fn reconfigure(&mut self, spec: PopupSpec) -> Result<(), String> {
+        let _ = spec;
+        Ok(())
+    }
 }
 
 /// One font the surface draws with: bytes under the family name that resolves to them.
@@ -162,8 +207,71 @@ pub struct MessageCtx<'a> {
     pending_draw: &'a mut bool,
 }
 
-/// A surface and the id the loop gave it.
-type LiveSurface = (SurfaceId, Box<dyn SurfaceHandle>);
+/// A surface, its id, and the engine it presents, with the panels it put on surfaces of
+/// their own.
+struct LiveSurface {
+    id: SurfaceId,
+    root: Box<dyn SurfaceHandle>,
+    panels: Vec<PanelBinding>,
+    /// Panels whose surface the platform took back — a click outside, Escape. The panel
+    /// still being declared does not reopen it: the app is about to undeclare it.
+    dismissed: FastSet<ui_core::NodeId>,
+    /// Panels the platform refused a surface for. They are painted by their parent, and
+    /// asking again every frame would only fail every frame.
+    refused: FastSet<ui_core::NodeId>,
+    engine: Engine,
+}
+
+/// One panel of a group that the platform shows in a surface of its own.
+struct PanelBinding {
+    node: ui_core::NodeId,
+    /// What the platform was last told: a different request means the panel moved or
+    /// resized, and the surface must follow.
+    spec: PopupSpec,
+    handle: Box<dyn SurfaceHandle>,
+}
+
+/// What the platform is asked to show for a laid-out panel.
+fn popup_spec(panel: &PlatformPanel) -> PopupSpec {
+    PopupSpec {
+        rect: panel.rect,
+        anchor: panel.anchor,
+        side: panel.side,
+        align: panel.align,
+        offset: panel.offset,
+        constraint: crate::window::Constraint::default(),
+    }
+}
+
+/// The nearest panel an inner one hangs off, so a nested panel parents the outer one.
+fn panel_parent(tree: &ui_core::tree::Tree, node: ui_core::NodeId) -> Option<ui_core::NodeId> {
+    let mut cursor = tree.get(node)?.parent;
+    while let Some(nid) = cursor {
+        if tree.platform_panels().iter().any(|panel| panel.node == nid) {
+            return Some(nid);
+        }
+        cursor = tree.get(nid)?.parent;
+    }
+    None
+}
+
+/// Build the engine a surface presents for: the app plus everything the open declared
+/// before its first frame.
+fn engine_for(app: Box<dyn App>, options: &mut OpenOptions) -> Result<Engine, String> {
+    let mut engine = AppLoop::with_stack(app, &[]);
+    for image in options.images.drain(..) {
+        engine.register_image(image);
+    }
+    for face in options.fonts.drain(..) {
+        if !engine.register_font(&face.name, face.data) {
+            return Err(format!("the font {} could not be registered", face.name));
+        }
+    }
+    for (chord, id) in options.shortcuts.drain(..) {
+        engine.bind_shortcut(chord, id);
+    }
+    Ok(engine)
+}
 
 impl MessageCtx<'_> {
     /// The outputs as of this turn.
@@ -176,15 +284,24 @@ impl MessageCtx<'_> {
         &mut self,
         spec: SurfaceSpec,
         app: Box<dyn App>,
-        options: OpenOptions,
+        mut options: OpenOptions,
     ) -> Result<SurfaceId, String> {
-        let handle = self.backend.open(spec, app, options)?;
+        let uncapped = options.uncapped;
+        let engine = engine_for(app, &mut options)?;
+        let handle = self.backend.open(spec, PresentationOptions { uncapped })?;
         let id = SurfaceId(*self.next_surface);
         *self.next_surface += 1;
         // The surface has not been stepped: the turn that opened it is already past the
         // surfaces, so without this the loop would sleep on a surface nobody drew.
         *self.pending_draw = true;
-        self.surfaces.push((id, handle));
+        self.surfaces.push(LiveSurface {
+            id,
+            root: handle,
+            panels: Vec::new(),
+            dismissed: FastSet::default(),
+            refused: FastSet::default(),
+            engine,
+        });
         Ok(id)
     }
 
@@ -194,17 +311,18 @@ impl MessageCtx<'_> {
         id: SurfaceId,
         image: ui_core::draw::ImageEntry,
     ) -> Result<(), String> {
-        let surface = self
+        let group = self
             .surfaces
             .iter_mut()
-            .find(|(sid, _)| *sid == id)
-            .map(|(_, surface)| surface)
+            .find(|group| group.id == id)
             .ok_or("no such surface")?;
-        surface.add_image(image)?;
+        group.engine.register_image(image.clone());
+        group.root.add_image(&image)?;
         // Registering a texture changes what a running surface shows only when it builds
         // again: the app put the node that draws it into its own state, and nothing else
         // will make the surface draw.
-        surface.request_frame();
+        group.engine.request_frame();
+        group.root.frame_requested();
         *self.pending_draw = true;
         Ok(())
     }
@@ -214,13 +332,13 @@ impl MessageCtx<'_> {
     /// A request that changed what a running surface draws reaches the app only through
     /// its next build; without this the old frame stays on screen until input arrives.
     pub fn request_frame(&mut self, id: SurfaceId) -> Result<(), String> {
-        let surface = self
+        let group = self
             .surfaces
             .iter_mut()
-            .find(|(sid, _)| *sid == id)
-            .map(|(_, surface)| surface)
+            .find(|group| group.id == id)
             .ok_or("no such surface")?;
-        surface.request_frame();
+        group.engine.request_frame();
+        group.root.frame_requested();
         *self.pending_draw = true;
         Ok(())
     }
@@ -232,7 +350,7 @@ impl MessageCtx<'_> {
     pub fn is_open(&self, id: SurfaceId) -> bool {
         self.surfaces
             .iter()
-            .any(|(sid, surface)| *sid == id && !surface.is_closed())
+            .any(|group| group.id == id && !group.root.is_closed())
     }
 
     /// Put `content` on the clipboard from a handler that owns no surface.
@@ -300,11 +418,11 @@ impl MessageCtx<'_> {
 /// (the compositor connection, the clipboard pipes) and returns; surfaces then dispatch what
 /// arrived. A backend may add its own sources to that poll as the loop grows.
 pub trait Backend {
+    /// Open one presentation. The engine is the host's; a backend never holds an app.
     fn open(
         &mut self,
         spec: SurfaceSpec,
-        app: Box<dyn App>,
-        options: OpenOptions,
+        options: PresentationOptions,
     ) -> Result<Box<dyn SurfaceHandle>, String>;
 
     /// Publish a copy the loop drained from a surface. False when no clipboard exists.
@@ -392,9 +510,9 @@ impl Waker for NoWaker {
     fn wake(&self) {}
 }
 
-/// Step each surface once: a turn's work for them, without touching the backend.
+/// Step each group once: a turn's work for it, without touching the backend.
 ///
-/// Returns the copies each surface finished and the ones that failed, so a caller that
+/// Returns the copies each group finished and the ones that failed, so a caller that
 /// cannot hold the backend — one inside a wait, stepped from a modal loop — can hand them
 /// over afterwards through [`Host::absorb`].
 fn step_surfaces(
@@ -403,26 +521,192 @@ fn step_surfaces(
 ) -> (Vec<ClipboardCopy>, Vec<(SurfaceId, String)>) {
     let mut copies = Vec::new();
     let mut retired = Vec::new();
-    for (id, surface) in surfaces {
+    for group in surfaces {
+        let id = group.id;
         // A surface the platform's own move loop is moving draws from that loop's tick and
         // nowhere else: a step here would pump the queue the loop is reading.
-        if surface.moving() {
-            if surface.pump_moved() {
+        if group.root.moving() {
+            if group.root.pump_moved(&mut group.engine) {
                 stats.frames += 1;
             }
+            step_panels(group, stats, &mut copies);
             continue;
         }
-        match surface.step() {
+        match group.root.step(&mut group.engine) {
             Ok(step) => {
                 if step.drew {
                     stats.frames += 1;
                 }
-                copies.extend(surface.take_copies());
+                copies.extend(group.root.take_copies(&mut group.engine));
+                reconcile_panels(group);
+                step_panels(group, stats, &mut copies);
             }
-            Err(reason) => retired.push((*id, reason)),
+            Err(reason) => retired.push((id, reason)),
         }
     }
     (copies, retired)
+}
+
+/// Give every panel the last frame laid out a surface, and let go of the ones that left.
+///
+/// The frame's panel list is the truth: a binding survives only while its panel does. A
+/// platform that refuses a surface does not lose the panel — the engine is told to paint
+/// it in its parent instead.
+fn reconcile_panels(group: &mut LiveSurface) {
+    let declared: Vec<PlatformPanel> = group.engine.platform_panels().to_vec();
+    group
+        .panels
+        .retain(|binding| declared.iter().any(|panel| panel.node == binding.node));
+    // A panel that left the tree is not dismissed any more: declaring it again opens it.
+    group
+        .dismissed
+        .retain(|node| declared.iter().any(|panel| panel.node == *node));
+    group
+        .refused
+        .retain(|node| declared.iter().any(|panel| panel.node == *node));
+    for panel in &declared {
+        if group.dismissed.contains(&panel.node) || group.refused.contains(&panel.node) {
+            continue;
+        }
+        let spec = popup_spec(panel);
+        if let Some(index) = group
+            .panels
+            .iter()
+            .position(|binding| binding.node == panel.node)
+        {
+            if group.panels[index].spec == spec {
+                continue;
+            }
+            // A nested panel's surface is placed against the outer popup, not the window.
+            let presented = match panel_frame(group, panel.node) {
+                Some(origin) => rebase(spec, origin),
+                None => spec,
+            };
+            match group.panels[index].handle.reconfigure(presented) {
+                Ok(()) => {
+                    group.panels[index].spec = spec;
+                    continue;
+                }
+                // A positioner fixes a popup's size when it maps: the surface has to be
+                // made again at the new request, not moved to it.
+                Err(reason) => {
+                    log::warn!("ui-platform: a panel could not be moved: {reason}");
+                    group.panels.remove(index);
+                }
+            }
+        }
+        match open_panel(group, panel.node, spec) {
+            Ok(handle) => {
+                group.engine.set_panel_presentation(panel.node, true);
+                group.panels.push(PanelBinding {
+                    node: panel.node,
+                    spec,
+                    handle,
+                });
+            }
+            Err(reason) => {
+                log::warn!("ui-platform: a panel has no surface: {reason}");
+                group.engine.set_panel_presentation(panel.node, false);
+                group.refused.insert(panel.node);
+            }
+        }
+    }
+}
+
+/// Ask the surface that holds `node` for one of the panel's own.
+fn open_panel(
+    group: &mut LiveSurface,
+    node: ui_core::NodeId,
+    spec: PopupSpec,
+) -> Result<Box<dyn SurfaceHandle>, String> {
+    match panel_parent(group.engine.tree(), node) {
+        // A panel inside a panel hangs off the outer one, so the topmost holds the grab.
+        Some(outer) => {
+            let Some(origin) = panel_frame(group, node) else {
+                return Err("the panel that holds it has no rect".into());
+            };
+            match group
+                .panels
+                .iter_mut()
+                .find(|binding| binding.node == outer)
+            {
+                Some(binding) => binding.handle.open_popup(node, rebase(spec, origin)),
+                None => Err("the panel that holds it has no surface".into()),
+            }
+        }
+        None => group.root.open_popup(node, spec),
+    }
+}
+
+/// Where a panel's request is anchored: a nested panel hangs off the outer panel's surface,
+/// which is placed away from the window, so its coordinates start there.
+fn panel_frame(group: &LiveSurface, node: ui_core::NodeId) -> Option<ui_core::geom::Point> {
+    let outer = panel_parent(group.engine.tree(), node)?;
+    group
+        .engine
+        .platform_panels()
+        .iter()
+        .find(|panel| panel.node == outer)
+        .map(|panel| panel.rect.origin)
+}
+
+/// The same request, with both rectangles moved into a parent panel's coordinates.
+fn rebase(spec: PopupSpec, origin: ui_core::geom::Point) -> PopupSpec {
+    let moved = |rect: ui_core::geom::Rect| {
+        ui_core::geom::Rect::new(
+            rect.origin.x - origin.x,
+            rect.origin.y - origin.y,
+            rect.size.w,
+            rect.size.h,
+        )
+    };
+    PopupSpec {
+        rect: moved(spec.rect),
+        anchor: moved(spec.anchor),
+        ..spec
+    }
+}
+
+/// Let each panel show the part of the frame the engine painted for it.
+fn step_panels(group: &mut LiveSurface, stats: &mut RunStats, copies: &mut Vec<ClipboardCopy>) {
+    let mut failed = Vec::new();
+    let mut closed = Vec::new();
+    for binding in &mut group.panels {
+        // A panel bound after this turn's build has nothing to show yet; the build that
+        // bound it also asked for the frame that will have it.
+        if !group.engine.panel_painted(binding.node) {
+            continue;
+        }
+        let step = binding.handle.step(&mut group.engine);
+        if binding.handle.is_closed() {
+            // The platform ended the panel — a click outside, Escape. Painting it in the
+            // window now would flash it where it never was, so it stays bound-but-gone,
+            // and the app is told so it can close what it declared.
+            group.dismissed.insert(binding.node);
+            group.engine.dismiss_panel(binding.node);
+            closed.push(binding.node);
+            continue;
+        }
+        match step {
+            Ok(step) => {
+                if step.drew {
+                    stats.frames += 1;
+                }
+                copies.extend(binding.handle.take_copies(&mut group.engine));
+            }
+            Err(reason) => {
+                log::warn!("ui-platform: a panel surface failed: {reason}");
+                failed.push(binding.node);
+            }
+        }
+    }
+    for node in &failed {
+        // The panel is not lost: the parent paints it from the next frame on.
+        group.engine.set_panel_presentation(*node, false);
+    }
+    group.panels.retain(|binding| {
+        !failed.contains(&binding.node) && !closed.contains(&binding.node)
+    });
 }
 
 /// The loop. One per process; created by the application's platform layer.
@@ -558,12 +842,21 @@ impl Host {
         &mut self,
         spec: SurfaceSpec,
         app: A,
-        options: OpenOptions,
+        mut options: OpenOptions,
     ) -> Result<SurfaceId, String> {
-        let handle = self.backend.open(spec, Box::new(app), options)?;
+        let uncapped = options.uncapped;
+        let engine = engine_for(Box::new(app), &mut options)?;
+        let handle = self.backend.open(spec, PresentationOptions { uncapped })?;
         let id = SurfaceId(self.next_surface);
         self.next_surface += 1;
-        self.surfaces.push((id, handle));
+        self.surfaces.push(LiveSurface {
+            id,
+            root: handle,
+            panels: Vec::new(),
+            dismissed: FastSet::default(),
+            refused: FastSet::default(),
+            engine,
+        });
         Ok(id)
     }
 
@@ -681,9 +974,19 @@ impl Host {
         if let Some(at) = self.backend.next_deadline() {
             next = Some(next.map_or(at, |current| current.min(at)));
         }
-        for (_, surface) in &self.surfaces {
-            if let Some(at) = surface.next_deadline() {
+        for group in &self.surfaces {
+            // A frame the engine owes but no surface has built yet: turning now is what
+            // shows it, and nothing else is coming to wake the wait.
+            if group.engine.frame_due() {
+                next = Some(now);
+            }
+            if let Some(at) = group.root.next_deadline(&group.engine) {
                 next = Some(next.map_or(at, |current| current.min(at)));
+            }
+            for binding in &group.panels {
+                if let Some(at) = binding.handle.next_deadline(&group.engine) {
+                    next = Some(next.map_or(at, |current| current.min(at)));
+                }
             }
         }
         next.map(|at| at.saturating_duration_since(now))
@@ -702,8 +1005,9 @@ impl Host {
         let completed = self.jobs.completed();
         if completed != self.completed_seen {
             self.completed_seen = completed;
-            for (_, surface) in &mut self.surfaces {
-                surface.request_frame();
+            for group in &mut self.surfaces {
+                group.engine.request_frame();
+                group.root.frame_requested();
             }
         }
         // Before anything answers a command: a status reply or a pin placement must not use
@@ -715,21 +1019,25 @@ impl Host {
         // the process through [`modal::pump_others`](crate::modal::pump_others).
         let mut index = 0;
         while index < self.surfaces.len() {
-            let (id, mut surface) = self.surfaces.remove(index);
+            let mut group = self.surfaces.remove(index);
             let mut others = || self.pump_others();
             crate::modal::arm(&mut others);
-            let stepped = surface.step();
+            let stepped = group.root.step(&mut group.engine);
             crate::modal::disarm();
             match stepped {
                 Ok(step) => {
                     if step.drew {
                         self.stats.frames += 1;
                     }
-                    copies.extend(surface.take_copies());
+                    copies.extend(group.root.take_copies(&mut group.engine));
+                    // The frame just built names the panels: bind what is new, move what
+                    // moved, and let each panel show its own part of it.
+                    reconcile_panels(&mut group);
+                    step_panels(&mut group, &mut self.stats, &mut copies);
                 }
-                Err(reason) => retired.push((id, reason)),
+                Err(reason) => retired.push((group.id, reason)),
             }
-            self.surfaces.insert(index, (id, surface));
+            self.surfaces.insert(index, group);
             index += 1;
         }
         for copy in copies {
@@ -743,8 +1051,8 @@ impl Host {
         for (id, reason) in &retired {
             log::warn!("ui-platform: surface {id:?} was retired: {reason}");
         }
-        self.surfaces.retain(|(id, surface)| {
-            !retired.iter().any(|(retired, _)| retired == id) && !surface.is_closed()
+        self.surfaces.retain(|group| {
+            !retired.iter().any(|(retired, _)| retired == &group.id) && !group.root.is_closed()
         });
         self.serve_hotkeys();
         self.serve_tray();
@@ -775,8 +1083,8 @@ impl Host {
         for (id, reason) in &retired {
             log::warn!("ui-platform: surface {id:?} was retired: {reason}");
         }
-        self.surfaces.retain(|(id, surface)| {
-            !retired.iter().any(|(retired, _)| retired == id) && !surface.is_closed()
+        self.surfaces.retain(|group| {
+            !retired.iter().any(|(retired, _)| retired == &group.id) && !group.root.is_closed()
         });
     }
 

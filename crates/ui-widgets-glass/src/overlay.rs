@@ -1,7 +1,9 @@
 //! The overlay sheet the glass menu and popover share: a frosted panel hung from its anchor.
 
 use ui_core::geom::{Color, Corners, Insets};
-use ui_core::layout::{Anchor, AxisSize, Grow, OverlayAlign, OverlayPlacement, Side, SizeClass};
+use ui_core::layout::{
+    Anchor, AxisSize, Grow, OverlayAlign, OverlayPlacement, Presentation, Side, SizeClass,
+};
 use ui_core::shortcut::{KeyChord, ShortcutId};
 use ui_core::{Decl, Id, Key, Modifiers, NodeKind, Sense};
 use ui_style::Style;
@@ -109,6 +111,7 @@ impl Panel {
             match_anchor_width: false,
             match_anchor_height: false,
             min_width: 0.0,
+            presentation: Presentation::Parent,
         };
         let corners = Corners::all(self.radius);
         let mut panel = Decl::container(id, NodeKind::Column)

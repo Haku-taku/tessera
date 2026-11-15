@@ -1162,6 +1162,7 @@ impl<M: TextMeasure> crate::layout::LayoutEngine for BuiltinLayout<M> {
     fn solve(&mut self, tree: &mut Tree, root: NodeId, constraints: Constraints) -> LayoutStats {
         let max = constraints.max;
         self.remeasured = 0;
+        tree.clear_platform_panels();
         // Bottom-up demand, then top-down placement: one pass each, no retry.
         //
         // The root fills the available space unless it declares a fixed size or an
@@ -2358,7 +2359,7 @@ impl<M: TextMeasure> BuiltinLayout<M> {
         stats: &mut LayoutStats,
     ) {
         use crate::geom::Point;
-        use crate::layout::{Anchor, OverlayAlign, Side};
+        use crate::layout::{Anchor, OverlayAlign, PlatformPanel, Presentation, Side};
         // An anchor may hang off any branch of the tree, and offsets are only folded into
         // the paint offset after this pass. So both sides are spoken in the surface's own
         // space here: the anchor's rect is lifted by the offsets it will carry, and the
@@ -2380,10 +2381,16 @@ impl<M: TextMeasure> BuiltinLayout<M> {
         };
         // A missing anchor still gets a panel: it unfolds from the viewport's top-left.
         let anchor = anchor.unwrap_or(Rect::from_origin_size(viewport.origin, Size::ZERO));
+        // A platform panel is measured as content: the surface it will live in belongs to
+        // the platform, and a menu must be allowed to grow past a window smaller than it.
+        let room = match overlay.presentation {
+            Presentation::Parent => viewport.size,
+            Presentation::Platform => Size::new(f32::INFINITY, f32::INFINITY),
+        };
         let (res, c) = self.measure_node(
             tree,
             nid,
-            Constraints::loose(Size::new(viewport.size.w, viewport.size.h)),
+            Constraints::loose(Size::new(room.w, room.h)),
         );
         stats.measured += c;
         if let Some(n) = tree.get_mut(nid) {
@@ -2398,9 +2405,9 @@ impl<M: TextMeasure> BuiltinLayout<M> {
         let span_h = (overlay.match_anchor_height && anchor.size.h > 0.0).then_some(anchor.size.h);
         if span_w.is_some() || span_h.is_some() {
             let width = span_w.unwrap_or(size.w);
-            // The other axis keeps the viewport as its ceiling: a hugging panel may grow
-            // taller when its text rewraps at the anchor's width.
-            let height = span_h.unwrap_or(viewport.size.h);
+            // The other axis keeps its ceiling: a hugging panel may grow taller when its
+            // text rewraps at the anchor's width.
+            let height = span_h.unwrap_or(room.h);
             let (again, c) =
                 self.measure_node(tree, nid, Constraints::loose(Size::new(width, height)));
             stats.measured += c;
@@ -2440,35 +2447,49 @@ impl<M: TextMeasure> BuiltinLayout<M> {
             Rect::from_origin_size(Point::new(x, y), size)
         };
         let mut rect = at(overlay.side);
-        if overlay.flip && !fits(rect) {
-            let opposite = match overlay.side {
-                Side::Below => Side::Above,
-                Side::Above => Side::Below,
-                Side::Left => Side::Right,
-                Side::Right => Side::Left,
-            };
-            let flipped = at(opposite);
-            if fits(flipped) {
-                rect = flipped;
+        // A platform panel is placed against the platform's output, not this viewport: a
+        // menu near the edge of a small window must be allowed past it.
+        if overlay.presentation == Presentation::Parent {
+            if overlay.flip && !fits(rect) {
+                let opposite = match overlay.side {
+                    Side::Below => Side::Above,
+                    Side::Above => Side::Below,
+                    Side::Left => Side::Right,
+                    Side::Right => Side::Left,
+                };
+                let flipped = at(opposite);
+                if fits(flipped) {
+                    rect = flipped;
+                }
             }
+            // The viewport wins over the anchor: a panel taller than the window still
+            // starts at its top edge, so its first line stays readable.
+            rect.origin.x = rect.origin.x.clamp(
+                viewport.min_x(),
+                (viewport.max_x() - size.w).max(viewport.min_x()),
+            );
+            rect.origin.y = rect.origin.y.clamp(
+                viewport.min_y(),
+                (viewport.max_y() - size.h).max(viewport.min_y()),
+            );
         }
-        // The viewport wins over the anchor: a panel taller than the window still starts
-        // at its top edge, so its first line stays readable.
-        let x = rect.origin.x.clamp(
-            viewport.min_x(),
-            (viewport.max_x() - size.w).max(viewport.min_x()),
-        );
-        let y = rect.origin.y.clamp(
-            viewport.min_y(),
-            (viewport.max_y() - size.h).max(viewport.min_y()),
-        );
         let own = pending_offset(tree, nid);
         self.place_node(
             tree,
             nid,
-            Rect::from_origin_size(Point::new(x - own.x, y - own.y), size),
+            Rect::from_origin_size(Point::new(rect.origin.x - own.x, rect.origin.y - own.y), size),
             stats,
         );
+        if overlay.presentation == Presentation::Platform {
+            tree.record_platform_panel(PlatformPanel {
+                node: nid,
+                anchor,
+                rect,
+                side: overlay.side,
+                align: overlay.align,
+                offset: overlay.offset,
+            });
+        }
     }
 
     /// Bottom-up grid answer: measure the items, size the tracks, return the box demand.

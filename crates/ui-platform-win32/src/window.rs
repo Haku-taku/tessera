@@ -11,7 +11,7 @@ use ui_platform::ThemeWatcher as _;
 use ui_platform::driver::FrameHost;
 use ui_platform::present::ImeState;
 use ui_platform::window::{
-    AutoHide, KeyboardMode, Layer, LayerSpec, SurfaceRole, SurfaceSpec,
+    AutoHide, KeyboardMode, Layer, LayerSpec, PopupSpec, SurfaceRole, SurfaceSpec,
 };
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
@@ -32,7 +32,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
+    GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
 };
 use windows::Win32::UI::Shell::{
     ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE,
@@ -58,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
     WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
     WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_WINDOWPOSCHANGED,
     WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -82,12 +82,25 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 /// much of that edge for the desktop.
 const AUTO_HIDE_STRIP: i32 = 2;
 
+/// What a window of this backend is, which decides how it activates and what may shape it.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Kind {
+    /// A window the manager frames, decorates and activates.
+    #[default]
+    Window,
+    /// An undecorated surface held at a level over one monitor.
+    Layer,
+    /// A panel's own window, owned by the surface that opened it.
+    Popup,
+}
+
 /// What the window procedure has collected since the loop last looked.
 ///
 /// Windows hands a window its messages on the thread that created it, so this state is
 /// confined to that thread and shared with the procedure by raw pointer, not by `Arc`.
 #[derive(Default)]
 struct WindowState {
+    kind: Kind,
     events: Vec<Event>,
     pointer: Option<Point>,
     modifiers: ui_core::Modifiers,
@@ -129,6 +142,18 @@ struct WindowState {
     /// The shell's move or resize loop has the thread: it dispatches this window's
     /// messages and owns the pointer until the release.
     size_move: bool,
+    /// The popups this window opened, which it carries when it moves and hands the grab to.
+    popups: Rc<RefCell<Vec<OwnedPopup>>>,
+    /// A popup holds the mouse for as long as it is open, which is how an outside press
+    /// reaches the engine at all.
+    grab: bool,
+}
+
+/// A popup window one surface opened, and the request that decides where it goes.
+#[derive(Clone, Copy)]
+struct OwnedPopup {
+    hwnd: HWND,
+    spec: PopupSpec,
 }
 
 /// A border drag: the hit test that began it, and where the pointer and window were then.
@@ -162,6 +187,15 @@ pub struct Win32Window {
     /// The surface's frame window, set once its session exists. Absent for a window a
     /// caller drives directly, which is always drawable and paces on `DwmFlush`.
     pace: Option<std::sync::Arc<crate::frame_pace::FramePace>>,
+    /// The surface this popup hangs off; `None` for a window or a layer.
+    owner: Option<Owner>,
+}
+
+/// The surface a popup hangs off: the window that places and carries it.
+struct Owner {
+    hwnd: HWND,
+    /// The list the parent carries, so the popup can move itself in it and leave on drop.
+    popups: Rc<RefCell<Vec<OwnedPopup>>>,
 }
 
 impl Win32Window {
@@ -172,25 +206,109 @@ impl Win32Window {
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
-        let app_id = if spec.app_id.is_empty() {
+        let opening = match &spec.role {
+            SurfaceRole::Window { size } => opening_window(*size)?,
+            SurfaceRole::Layer(layer) => opening_layer(layer)?,
+        };
+        Self::build(spec, opening, None)
+    }
+
+    /// A panel's own window: undecorated, owned by `parent`, and holding the mouse.
+    ///
+    /// The owner is what keeps it above the window it belongs to and out of the taskbar; the
+    /// grab is what lets a press outside the panel reach its presenter, which is how the
+    /// engine hears about a click that dismisses it.
+    pub fn new_popup(
+        parent: &Win32Window,
+        spec: SurfaceSpec,
+        popup: PopupSpec,
+    ) -> Result<Self, WindowError> {
+        // A manifest may already have fixed the process's awareness; a refusal means it did.
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let owner = Owner {
+            hwnd: parent.hwnd,
+            popups: Rc::clone(&parent.state.borrow().popups),
+        };
+        let rect = popup_rect(owner.hwnd, &popup)?;
+        let opening = Opening {
+            x: rect.left,
+            y: rect.top,
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
+            style: WS_POPUP,
+            // Alpha is composed, so the panel's rounded corners and shadow reach the desktop.
+            ex_style: WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+            dpi: unsafe { GetDpiForWindow(owner.hwnd) }.max(96),
+            kind: Kind::Popup,
+            keyboard: None,
+            alpha: crate::presenter::Alpha::Premultiplied,
+        };
+        let window = Self::build(spec, opening, Some((owner, popup)))?;
+        // The grab outlives the press that opened the panel: it is released on close, or when
+        // the panel's own child takes it.
+        let _ = unsafe { SetCapture(window.hwnd) };
+        window.state.borrow_mut().grab = true;
+        Ok(window)
+    }
+
+    /// Where a popup of this window goes for `spec`, and the request the window now carries.
+    ///
+    /// A popup has no positioner of its own: it is placed again from the request, against the
+    /// work area of the monitor its owner is on.
+    pub fn move_popup(&mut self, spec: PopupSpec) -> Result<(), WindowError> {
+        let Some(owner) = &self.owner else {
+            return Err(WindowError::Win32(String::from(
+                "this window is not a popup",
+            )));
+        };
+        if let Some(entry) = owner
+            .popups
+            .borrow_mut()
+            .iter_mut()
+            .find(|owned| owned.hwnd == self.hwnd)
+        {
+            entry.spec = spec;
+        }
+        let rect = popup_rect(owner.hwnd, &spec)?;
+        // The return value says whether the window moved, which a move to the same place
+        // does not; nothing here has a use for it.
+        let _ = unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+        Ok(())
+    }
+
+    fn build(
+        surface: SurfaceSpec,
+        opening: Opening,
+        owner: Option<(Owner, PopupSpec)>,
+    ) -> Result<Self, WindowError> {
+        let app_id = if surface.app_id.is_empty() {
             "crabsnap"
         } else {
-            spec.app_id.as_str()
+            surface.app_id.as_str()
         };
         let class = wide(app_id);
         let instance = unsafe { GetModuleHandleW(None) }
             .map_err(|error| WindowError::Win32(format!("GetModuleHandleW: {error}")))?;
         let instance = HINSTANCE(instance.0);
         register_class(&class, instance)?;
-        let opening = match &spec.role {
-            SurfaceRole::Window { size } => opening_window(*size)?,
-            SurfaceRole::Layer(layer) => opening_layer(layer)?,
-        };
-        let title = wide(&spec.name);
+        let title = wide(&surface.name);
         let state = Rc::new(RefCell::new(WindowState {
+            kind: opening.kind,
             dpi: opening.dpi,
             keyboard: opening.keyboard,
-            min_size: spec.min_size,
+            min_size: surface.min_size,
             // Recorded on the first `WM_WINDOWPOSCHANGED`; there is no window yet here.
             monitor: 0,
             ..WindowState::default()
@@ -210,7 +328,7 @@ impl Win32Window {
                 opening.y,
                 opening.width,
                 opening.height,
-                None,
+                owner.as_ref().map(|(owner, _)| owner.hwnd),
                 None,
                 Some(instance),
                 Some(raw as *const core::ffi::c_void),
@@ -224,9 +342,13 @@ impl Win32Window {
                 return Err(WindowError::Win32(format!("CreateWindowExW: {error}")));
             }
         };
+        let owner = owner.map(|(owner, popup)| {
+            owner.popups.borrow_mut().push(OwnedPopup { hwnd, spec: popup });
+            owner
+        });
         // A layer's pixels are a second window: owned, so it stays above and dies with this
         // one, and styled to be invisible to the hit test, which this window answers.
-        let visual = if opening.keyboard.is_some() {
+        let visual = if opening.kind == Kind::Layer {
             unsafe {
                 CreateWindowExW(
                     opening.ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT,
@@ -256,12 +378,11 @@ impl Win32Window {
         // The return value says whether the window was previously visible, which is not
         // an outcome this backend has a use for.
         unsafe {
-            let command = if opening.keyboard.is_some() {
-                // Showing a layer must not take the keyboard away from the desktop; only an
-                // exclusive one asks for it, and even then as a separate step.
-                SW_SHOWNOACTIVATE
-            } else {
+            let command = if opening.kind == Kind::Window {
                 SW_SHOW
+            } else {
+                // Showing a layer or a panel must not take the keyboard from what it covers.
+                SW_SHOWNOACTIVATE
             };
             let _ = ShowWindow(hwnd, command);
             if visual != hwnd {
@@ -273,14 +394,19 @@ impl Win32Window {
                 let _ = SetForegroundWindow(hwnd);
             }
         }
-        if opening.keyboard.is_none() {
-            // Only a window the manager frames has a caption; a layer is a popup.
+        if opening.kind == Kind::Window {
+            // Only a window the manager frames has a caption.
             theme_caption(hwnd);
         }
         // OLE hands every drag over this window to the target; its callbacks only queue
-        // events, so nothing here needs the engine to exist yet.
+        // events, so nothing here needs the engine to exist yet. A panel takes no drops: its
+        // presenter has nowhere to deliver them, and registering would swallow the drag.
         let drag = Rc::new(crate::dnd::DragQueue::new(hwnd));
-        let drop_target = crate::dnd::register(hwnd, Rc::clone(&drag));
+        let drop_target = if opening.kind == Kind::Popup {
+            None
+        } else {
+            crate::dnd::register(hwnd, Rc::clone(&drag))
+        };
         Ok(Self {
             hwnd,
             visual,
@@ -289,6 +415,7 @@ impl Win32Window {
             drop_target,
             alpha: opening.alpha,
             pace: None,
+            owner,
         })
     }
 
@@ -551,11 +678,12 @@ impl Win32Window {
 
     /// Publish where this frame's tree consumes input, in surface-local logical units.
     ///
-    /// Only a layer has a shape of its own to publish: a window the manager places consumes
-    /// its whole client area, which is already what the default hit test gives it.
+    /// Only a layer has a shape to publish: its pixels are a second window, and the shape is
+    /// what decides where the pointer is passed through. A popup's alpha carries its shadow,
+    /// so clipping the window to the areas would clip the picture too.
     pub fn set_input_region(&mut self, areas: &[Rect]) {
         let mut state = self.state.borrow_mut();
-        if state.keyboard.is_none() || state.input.as_deref() == Some(areas) {
+        if state.kind != Kind::Layer || state.input.as_deref() == Some(areas) {
             return;
         }
         state.input = Some(areas.to_vec());
@@ -573,6 +701,11 @@ impl Win32Window {
     /// path that carries the surrounding text and a request to delete it. Every other state
     /// — no field, a secret one — keeps the IMM32 path.
     pub fn set_ime(&mut self, state: ImeState) {
+        // A panel never has the keyboard of its own, so an input context here would sit on a
+        // window the input method cannot reach; the owner's context serves the whole tree.
+        if self.state.borrow().kind == Kind::Popup {
+            return;
+        }
         let (open, dpi) = {
             let mut window = self.state.borrow_mut();
             if window.ime.as_ref() == Some(&state) {
@@ -700,6 +833,7 @@ struct Opening {
     ex_style: WINDOW_EX_STYLE,
     /// The DPI of the monitor the window opens on, which its first scale reflects.
     dpi: u32,
+    kind: Kind,
     /// A layer's keyboard request; `None` for a window the manager places.
     keyboard: Option<KeyboardMode>,
     /// Whether the desktop should see through the frame where it is transparent.
@@ -736,6 +870,7 @@ fn opening_window(size: (u32, u32)) -> Result<Opening, WindowError> {
         // redirection surface behind the window: it would be black, and DXGI would own it.
         ex_style: WS_EX_NOREDIRECTIONBITMAP,
         dpi,
+        kind: Kind::Window,
         keyboard: None,
         alpha: crate::presenter::Alpha::Opaque,
     })
@@ -831,9 +966,77 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
         style: WS_POPUP,
         ex_style,
         dpi: dpi_x.max(96),
+        kind: Kind::Layer,
         keyboard: Some(layer.keyboard),
         alpha: crate::presenter::Alpha::Premultiplied,
     })
+}
+
+/// Where a popup goes, in physical screen pixels, from a request in its owner's client space.
+///
+/// The work area is the bound, expressed in the same space as the request: the panel may sit
+/// on the desktop beyond its window, so the window's own rectangle is not what it must fit.
+fn popup_rect(owner: HWND, spec: &PopupSpec) -> Result<RECT, WindowError> {
+    let mut origin = POINT::default();
+    if !unsafe { ClientToScreen(owner, &mut origin) }.as_bool() {
+        return Err(WindowError::Win32(String::from(
+            "ClientToScreen: the owner has no client area",
+        )));
+    }
+    let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err(WindowError::Win32(String::from(
+            "GetMonitorInfoW: the monitor's work area was refused",
+        )));
+    }
+    let scale = unsafe { GetDpiForWindow(owner) }.max(96) as f32 / 96.0;
+    let work = info.rcWork;
+    let bounds = Rect::new(
+        (work.left - origin.x) as f32 / scale,
+        (work.top - origin.y) as f32 / scale,
+        (work.right - work.left) as f32 / scale,
+        (work.bottom - work.top) as f32 / scale,
+    );
+    let placed = ui_platform::window::place_popup(spec, bounds);
+    let at = |value: f32, base: i32| base + (value * scale).round() as i32;
+    let left = at(placed.origin.x, origin.x);
+    let top = at(placed.origin.y, origin.y);
+    Ok(RECT {
+        left,
+        top,
+        right: left + (placed.size.w * scale).round().max(1.0) as i32,
+        bottom: top + (placed.size.h * scale).round().max(1.0) as i32,
+    })
+}
+
+/// Carry every popup this window owns along with it.
+///
+/// An owned window does not follow its owner: the shell only guarantees it stays above and is
+/// destroyed with it, so a move or a resize is when the backend places the panels again.
+fn place_popups(state: &RefCell<WindowState>, owner: HWND) {
+    let popups = Rc::clone(&state.borrow().popups);
+    let owned: Vec<OwnedPopup> = popups.borrow().clone();
+    for popup in owned {
+        let Ok(rect) = popup_rect(owner, &popup.spec) else {
+            continue;
+        };
+        // The return value says whether the window moved; a popup already there needs nothing.
+        let _ = unsafe {
+            SetWindowPos(
+                popup.hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+    }
 }
 
 /// The monitor the shell treats as primary.
@@ -898,6 +1101,19 @@ impl Span {
 
 impl Drop for Win32Window {
     fn drop(&mut self) {
+        // The owner must stop carrying a window that is about to go, or its next move would
+        // place a handle the shell has already freed.
+        if let Some(owner) = &self.owner {
+            owner
+                .popups
+                .borrow_mut()
+                .retain(|owned| owned.hwnd != self.hwnd);
+            // Only this window's own grab: a child panel may hold it instead, and releasing
+            // that one would leave the child with no capture to dismiss it.
+            if self.state.borrow().grab && unsafe { GetCapture() } == self.hwnd {
+                let _ = unsafe { ReleaseCapture() };
+            }
+        }
         if self.alive() {
             // OLE keeps the window on its drop-target list; the registration must go
             // before the window it names does.
@@ -996,6 +1212,11 @@ unsafe fn handle(
         }
         WM_SIZE => {
             state.borrow_mut().silent_change = true;
+            place_popups(state, hwnd);
+            None
+        }
+        WM_MOVE => {
+            place_popups(state, hwnd);
             None
         }
         WM_WINDOWPOSCHANGED => {
@@ -1039,6 +1260,11 @@ unsafe fn handle(
             let mut window = state.borrow_mut();
             window.dpi = ((wparam.0 as u32) >> 16).max(96);
             window.silent_change = true;
+            // A popup is placed by its owner, against the owner's scale; the suggested
+            // rectangle would move it somewhere the request never named.
+            if window.kind == Kind::Popup {
+                return Some(LRESULT(0));
+            }
             let layer = window.keyboard.is_some();
             let scale = window.dpi as f32 / 96.0;
             let areas = window.input.clone();
@@ -1118,7 +1344,13 @@ unsafe fn handle(
             None
         }
         WM_MOUSEACTIVATE => {
-            let command = match state.borrow().keyboard {
+            let window = state.borrow();
+            // A panel never takes the keyboard from the window it belongs to: the engine's
+            // focus scope already names it, and the owner keeps receiving the keys.
+            if window.kind == Kind::Popup {
+                return Some(LRESULT(MA_NOACTIVATE as isize));
+            }
+            let command = match window.keyboard {
                 // A window the manager places activates the ordinary way.
                 None => return None,
                 Some(KeyboardMode::None) => MA_NOACTIVATE,
@@ -1189,8 +1421,12 @@ unsafe fn handle(
             let mut window = state.borrow_mut();
             window.pointer = Some(pos);
             window.events.push(Event::PointerReleased { pos, button });
+            let grab = window.grab;
             drop(window);
-            let _ = unsafe { ReleaseCapture() };
+            // A panel's grab outlives the press: it is what hears the click that dismisses it.
+            if !grab {
+                let _ = unsafe { ReleaseCapture() };
+            }
             Some(LRESULT(0))
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
@@ -1221,8 +1457,19 @@ unsafe fn handle(
             Some(LRESULT(0))
         }
         WM_CAPTURECHANGED => {
+            let mut window = state.borrow_mut();
             // Another window took the mouse: the drag ends where the edges already are.
-            state.borrow_mut().sizing = None;
+            window.sizing = None;
+            // A panel whose grab a foreign window took cannot hear a dismissal any more, so
+            // it closes now. A panel of its own taking the grab is the nested case, which
+            // keeps the topmost one hearing the pointer.
+            if window.kind == Kind::Popup && window.grab {
+                let gained = HWND(lparam.0 as *mut core::ffi::c_void);
+                let nested = window.popups.borrow().iter().any(|owned| owned.hwnd == gained);
+                if !nested {
+                    window.close_requested = true;
+                }
+            }
             None
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
