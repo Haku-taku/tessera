@@ -7,10 +7,10 @@ license.workspace = true
 [dependencies]
 ui-design.workspace = true
 ui-core = { path = "../ui-core" }
-ui-i18n = { path = "../ui-i18n" }
+ui-i18n = { workspace = true }
 ui-paint = { path = "../ui-paint" }
 ui-platform = { path = "../ui-platform" }
-ui-style = { path = "../ui-style" }
+ui-style = { workspace = true }
 ui-widgets = { path = "../ui-widgets" }
 ui-widgets-md3 = { path = "../ui-widgets-md3" }
 ui-widgets-fluent = { path = "../ui-widgets-fluent" }

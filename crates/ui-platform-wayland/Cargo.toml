@@ -7,19 +7,18 @@ license.workspace = true
 description = "Wayland XDG window target: wl_shm buffers presented through a real surface."
 
 [dependencies]
-ui-core = { workspace = true }
-ui-paint = { workspace = true }
 ui-gpu-egl = { path = "../ui-gpu-egl", optional = true }
 ui-paint-gpu = { workspace = true, optional = true }
-ui-platform = { workspace = true }
-ui-text = { workspace = true }
-ui-text-fontique = { workspace = true }
 # Frame-phase timing for the `profile` feature; absent from normal builds.
 hotpath = { version = "0.30", optional = true, default-features = false }
 
 # Wayland, D-Bus and the unix syscalls behind them exist only on unix; the crate is an empty
 # library elsewhere, and these are the declarations that would otherwise still be built.
 [target.'cfg(unix)'.dependencies]
+ui-core = { workspace = true }
+ui-paint = { workspace = true }
+ui-platform = { workspace = true }
+ui-text-fontique = { workspace = true }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 # wlr-layer-shell: the only portable way to ask for an overlay surface that the

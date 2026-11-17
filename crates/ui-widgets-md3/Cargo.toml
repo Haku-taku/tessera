@@ -7,8 +7,8 @@ license.workspace = true
 [dependencies]
 ui-design.workspace = true
 ui-core = { path = "../ui-core" }
-ui-i18n = { path = "../ui-i18n" }
-ui-style = { path = "../ui-style" }
+ui-i18n = { workspace = true }
+ui-style = { workspace = true }
 ui-widgets = { path = "../ui-widgets" }
 
 [dev-dependencies]

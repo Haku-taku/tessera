@@ -14,10 +14,10 @@ ui-platform = { workspace = true, features = ["system-fonts"] }
 # there, and an empty library is still a library to link. This is where an app's choice
 # between them is made, so that its own manifests and source make none.
 [target.'cfg(unix)'.dependencies]
-ui-platform-wayland = { path = "../ui-platform-wayland", features = ["gpu"] }
+ui-platform-wayland = { workspace = true, features = ["gpu"] }
 
 [target.'cfg(windows)'.dependencies]
-ui-platform-win32 = { path = "../ui-platform-win32" }
+ui-platform-win32 = { workspace = true }
 
 [features]
 # The desktop's file-type icons, read from its icon theme. Off unless the app has a picker:

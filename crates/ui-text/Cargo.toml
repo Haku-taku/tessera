@@ -9,7 +9,6 @@ description = "Font stack abstraction with platform-native providers and fallbac
 [dependencies]
 ui-core = { workspace = true }
 unicode-bidi = "0.3"
-unicode-bidi-mirroring = "0.4"
 unicode-linebreak = "0.1"
 unicode-properties = "0.1"
 parley_emoji = "0.12"

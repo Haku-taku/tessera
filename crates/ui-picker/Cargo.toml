@@ -10,9 +10,9 @@ path = "src/picker.rs"
 [dependencies]
 ui-core = { path = "../ui-core" }
 ui-design = { path = "../ui-design" }
-ui-i18n = { path = "../ui-i18n" }
+ui-i18n = { workspace = true }
 ui-platform = { path = "../ui-platform" }
-ui-style = { path = "../ui-style" }
+ui-style = { workspace = true }
 ui-widgets = { path = "../ui-widgets" }
 
 [dev-dependencies]
