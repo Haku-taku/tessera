@@ -1615,9 +1615,15 @@ unsafe fn handle(
             // it closes now. Its own grab set again on a press reports the panel itself as
             // the gainer, and a panel of its own taking it is the nested case: neither is a
             // loss, and the topmost one keeps hearing the pointer.
+            //
+            // A null gainer is not a takeover: the system drops a grab it did not grant for a
+            // gesture yet — a background thread's capture ends with the button that asked for
+            // it — and no window owns the pointer now. Reading that as a dismissal closed
+            // every menu the moment its panel opened off a click.
             if window.kind == Kind::Popup && window.grab {
                 let gained = HWND(lparam.0 as *mut core::ffi::c_void);
-                let kept = gained == hwnd
+                let kept = gained.is_invalid()
+                    || gained == hwnd
                     || window.popups.borrow().iter().any(|owned| owned.hwnd == gained);
                 if !kept {
                     window.close_requested = true;

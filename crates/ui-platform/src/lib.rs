@@ -1,6 +1,8 @@
 //! Presentation targets and the headless windowed app loop.
 
 #[cfg(test)]
+mod view_menu_test;
+#[cfg(test)]
 mod view_scroll_test;
 
 use std::time::Duration;

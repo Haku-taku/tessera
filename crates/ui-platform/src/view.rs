@@ -2025,6 +2025,10 @@ impl<A: App> AppLoop<A> {
             return false;
         };
         self.dismissed = Some(id);
+        // The menu's panels are the engine's own: no app declared them, so there is no
+        // decision to hand over, and the menu closes here. An app-declared panel keeps the
+        // fact for its own build to obey.
+        self.menu_dismissed(id);
         // The app reads the dismissal in a build; without the demand the next build would
         // only happen when unrelated input arrived, which is too late to matter.
         self.dispatched = true;
