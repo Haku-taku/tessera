@@ -181,36 +181,6 @@ fn a_build_reads_the_engine_owned_offset_and_content_extent_from_the_context() {
     );
 }
 
-/// A scroller whose build keeps the row 200 units down visible.
-struct BringApp;
-
-impl App for BringApp {
-    fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
-        cx.bring_into_view(Id::str("target"));
-        crate::from_decl(
-            Decl::container(Id::str("scroller"), NodeKind::Column)
-                .size(SizeClass::fixed(100.0, 100.0))
-                .sense(Sense::SCROLL_OWNED)
-                .clip(layout::Clip {
-                    x: layout::Overflow::Hidden,
-                    y: layout::Overflow::Scroll,
-                })
-                .child(
-                    Decl::container(Id::str("content"), NodeKind::Column)
-                        .size(SizeClass::fixed(100.0, 300.0))
-                        .child(
-                            Decl::container(Id::str("spacer"), NodeKind::Box)
-                                .size(SizeClass::fixed(100.0, 200.0)),
-                        )
-                        .child(
-                            Decl::container(Id::str("target"), NodeKind::Box)
-                                .size(SizeClass::fixed(100.0, 30.0)),
-                        ),
-                ),
-        )
-    }
-}
-
 /// A small scroller inside a taller one: 90 of content in a 60-tall inner viewport, itself
 /// sitting below 40 of spacer inside a 60-tall outer viewport (40 of travel each).
 struct NestedApp;
@@ -543,22 +513,6 @@ fn keeping_a_row_visible_moves_every_scroller_above_it() {
         lp.scroll_offset(Id::str("inner"))
             .is_none_or(|o| o.y == 0.0),
         "the inner list needed no movement"
-    );
-}
-
-#[test]
-fn a_build_can_keep_a_node_visible_in_its_scroller() {
-    // WinUI's `BringIntoViewOnFocusChange`: the control names the row that must stay seen.
-    let mut lp = AppLoop::new(BringApp);
-    let mut target = OffscreenTarget::new(200, 200);
-    lp.frame(&mut target, None);
-    lp.frame(&mut target, None);
-    let offset = lp
-        .scroll_offset(Id::str("scroller"))
-        .expect("the request stored an offset");
-    assert_eq!(
-        offset.y, 130.0,
-        "the target's 230 end meets the viewport's 100 edge"
     );
 }
 

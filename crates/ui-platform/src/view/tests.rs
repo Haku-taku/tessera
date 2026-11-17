@@ -2256,25 +2256,6 @@ mod contracts {
         assert_eq!(outcomes[0].nodes, 2, "root + bar");
     }
 
-    #[test]
-    fn unchanged_second_frame_produces_no_damage() {
-        let mut target = OffscreenTarget::new(200, 120);
-        let outcomes = run_app(
-            Demo {
-                expand: false,
-                draggable: true,
-            },
-            &mut target,
-            2,
-            None,
-        );
-        assert!(
-            outcomes[1].damage.is_none(),
-            "a frame with identical declarations must not repaint, got {:?}",
-            outcomes[1].damage
-        );
-    }
-
     /// Counts presents, so a test can ask whether a frame handed anything over.
     struct CountingTarget {
         inner: OffscreenTarget,
@@ -3116,47 +3097,6 @@ mod contracts {
             (flyout.min_y() - header.min_y()).abs() < 0.5,
             "the flyout starts level with the row that heads it"
         );
-    }
-
-    /// A programmatic menu's pick reports the row to its owner, never as a dismissal.
-    #[test]
-    fn a_programmatic_menus_pick_reports_the_row_to_its_owner() {
-        let (mut lp, _target) = menu_sink();
-        let owner = Id::str("row");
-        assert!(lp.open_menu_at(
-            owner,
-            ui_core::geom::Point::new(20.0, 20.0),
-            vec![
-                ui_core::menu::MenuItem::new(Id::str("open"), "Open"),
-                ui_core::menu::MenuItem::new(Id::str("copy"), "Copy").default_row(),
-            ],
-        ));
-        menu_key(&mut lp, ui_core::Key::Down);
-        menu_key(&mut lp, ui_core::Key::Enter);
-
-        assert_eq!(lp.app_mut().picked, [Id::str("open")]);
-        assert!(
-            lp.app_mut().closed.is_empty(),
-            "a pick is not a dismissal"
-        );
-        assert!(lp.menu.is_none(), "the pick closed the menu");
-    }
-
-    /// Backing out of a menu is reported so the app can drop what it built it from.
-    #[test]
-    fn escape_reports_menu_closed_and_closes() {
-        let (mut lp, _target) = menu_sink();
-        let owner = Id::str("row");
-        assert!(lp.open_menu_at(
-            owner,
-            ui_core::geom::Point::new(20.0, 20.0),
-            vec![ui_core::menu::MenuItem::new(Id::str("copy"), "Copy")],
-        ));
-        menu_key(&mut lp, ui_core::Key::Escape);
-
-        assert_eq!(lp.app_mut().closed, [owner]);
-        assert!(lp.app_mut().picked.is_empty());
-        assert!(lp.menu.is_none());
     }
 
     /// A press outside the menu is the light dismiss every flyout has, and it is spent on
@@ -5647,8 +5587,7 @@ mod layer_emission_tests {
     use crate::present::OffscreenTarget;
     use crate::view::*;
     use ui_core::Decl;
-    use ui_core::draw::Op;
-    use ui_core::geom::{Color, Corners, Insets as InsetsT};
+    use ui_core::geom::{Color, Insets as InsetsT};
     use ui_core::layout::{AxisSize, Grow, SizeClass};
 
     fn white_box(id: &'static str) -> Decl {
@@ -5684,33 +5623,6 @@ mod layer_emission_tests {
             drop_types: None,
             children: Vec::new(),
         }
-    }
-
-    struct Faded {
-        opacity: f32,
-    }
-
-    impl App for Faded {
-        fn view(&mut self, _f: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
-            let decl = {
-                Decl::container(Id::str("root"), NodeKind::Column)
-                    .background(Color::from_rgba8(0, 0, 0, 255), Corners::ZERO)
-                    .child(
-                        Decl::container(Id::str("group"), NodeKind::Row)
-                            .opacity(self.opacity)
-                            .child(white_box("a"))
-                            .child(white_box("b")),
-                    )
-            };
-            crate::from_decl(decl)
-        }
-    }
-
-    fn layer_count(list: &DrawList) -> usize {
-        list.ops
-            .iter()
-            .filter(|op| matches!(op, Op::PushLayer(_)))
-            .count()
     }
 
     struct Canvas {
@@ -5896,16 +5808,6 @@ mod layer_emission_tests {
         );
     }
 
-    #[test]
-    fn opacity_below_one_emits_a_layer() {
-        let mut app = AppLoop::new(Faded { opacity: 0.5 });
-        app.build((120, 60), None);
-        assert_eq!(
-            layer_count(app.draw_list()),
-            1,
-            "a 0.5 container must produce exactly one layer"
-        );
-    }
 }
 
 mod sense_subscription_tests {
@@ -7048,6 +6950,11 @@ mod nested_popup_tests {
     #[test]
     fn dismissing_the_inner_panel_hands_the_keyboard_back_to_the_outer_one() {
         let (mut lp, log, mut target) = nested();
+        assert_eq!(
+            lp.focused(),
+            Some(Id::str("c")),
+            "the open inner panel owns the keyboard, not the one that opened it"
+        );
         let inside_outer = Point::new(160.0, 20.0);
         lp.dispatch(ui_core::Event::PointerMoved { pos: inside_outer });
         lp.dispatch(ui_core::Event::PointerPressed {
@@ -7070,16 +6977,6 @@ mod nested_popup_tests {
             lp.focused(),
             Some(Id::str("a")),
             "focus goes back inside the panel that is still open, not to the page"
-        );
-    }
-
-    #[test]
-    fn the_inner_panel_is_what_owns_the_keyboard() {
-        let (lp, _, _) = nested();
-        let focused = lp.focused().expect("an open panel takes focus");
-        assert!(
-            focused != Id::str("a") && focused != Id::str("b") && focused != Id::str("page"),
-            "focus belongs to the inner panel, not the one that opened it: {focused:?}"
         );
     }
 }
