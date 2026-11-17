@@ -18,14 +18,15 @@
 //! builds the next one.
 //!
 //! One texture is not in the packet: the text pass. It is `Rc`-based and shaped per frame, so
-//! the loop copies the atlas bytes it changed instead; a rebuilt device sets
-//! [`wants_atlas`](RenderThread::take_atlas_request) and the next frame carries both pages
-//! again.
+//! the loop copies the atlas bytes it changed instead. A page belongs to the renderer, which
+//! reports through [`held_atlases`](RenderThread::held_atlases) what it actually holds; the
+//! loop compares against that, so a frame that is superseded before it is drawn, or an upload
+//! that fails, leaves the page owed and the next frame carries it again.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -65,6 +66,23 @@ pub(crate) struct FramePacket {
     pub scale: f32,
 }
 
+/// What one surface's renderer holds: the version of each atlas page, or none.
+///
+/// `None` is a renderer that holds no page at all — one that just opened, or was rebuilt
+/// after a lost device — and it is owed both pages whatever the text pass reports.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HeldAtlases {
+    pub text: Option<u64>,
+    pub color: Option<u64>,
+}
+
+impl HeldAtlases {
+    /// Whether a frame for a pass at these versions must carry each page.
+    pub(crate) fn owes(self, text: u64, color: u64) -> (bool, bool) {
+        (self.text != Some(text), self.color != Some(color))
+    }
+}
+
 /// What the GPU thread keeps for one loop.
 struct Shared {
     /// Frames presented since the loop last read the count.
@@ -75,8 +93,10 @@ struct Shared {
     error: Mutex<Option<String>>,
     /// The surface is gone: no later send will be taken.
     stopped: AtomicBool,
-    /// The device was rebuilt, so the next frame must carry both atlases again.
-    wants_atlas: AtomicBool,
+    /// The pages this surface's renderer holds, as its last upload reported them. The loop
+    /// asks here rather than keeping a record of its own: a packet is a proposal, and only
+    /// an upload that landed is a page later frames may stop carrying.
+    atlases: Mutex<HeldAtlases>,
 }
 
 impl Shared {
@@ -86,7 +106,7 @@ impl Shared {
             stats: Mutex::new(PresentStats::default()),
             error: Mutex::new(None),
             stopped: AtomicBool::new(false),
-            wants_atlas: AtomicBool::new(true),
+            atlases: Mutex::new(HeldAtlases::default()),
         }
     }
 
@@ -95,6 +115,10 @@ impl Shared {
         if slot.is_none() {
             *slot = Some(error);
         }
+    }
+
+    fn set_held(&self, held: HeldAtlases) {
+        *self.atlases.lock().unwrap_or_else(|poison| poison.into_inner()) = held;
     }
 }
 
@@ -190,6 +214,24 @@ fn service() -> Arc<Service> {
     }))
 }
 
+/// How long a handshake may go unanswered before the wait says so: an answer that never
+/// comes freezes every window on the host's thread, and the log must name what stalled.
+const HANDSHAKE: Duration = Duration::from_secs(2);
+
+/// Wait for the GPU thread's answer, reporting a wait that outlasts the handshake.
+fn await_reply<T>(answer: &Receiver<T>, what: &str) -> Option<T> {
+    loop {
+        match answer.recv_timeout(HANDSHAKE) {
+            Ok(value) => return Some(value),
+            Err(RecvTimeoutError::Timeout) => log::warn!(
+                "ui-platform-win32: the GPU thread has not answered {what} for {:.0} s",
+                HANDSHAKE.as_secs_f32()
+            ),
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
 impl RenderThread {
     /// Hand a surface to the GPU thread and wait until it has a chain, or has failed to.
     pub(crate) fn open(
@@ -213,14 +255,14 @@ impl RenderThread {
             shared: Arc::clone(&shared),
             reply,
         });
-        match answer.recv() {
-            Ok(Ok(index)) => Ok(Self {
+        match await_reply(&answer, "an open") {
+            Some(Ok(index)) => Ok(Self {
                 index,
                 shared,
                 finished: false,
             }),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(String::from(
+            Some(Err(error)) => Err(error),
+            None => Err(String::from(
                 "the GPU thread ended before it opened a chain",
             )),
         }
@@ -266,7 +308,7 @@ impl RenderThread {
             path,
             reply,
         });
-        answer.recv().map_err(|_| self.failure())?
+        await_reply(&answer, "a frame dump").ok_or_else(|| self.failure())?
     }
 
     /// Give the chain back and stop hearing from the GPU thread about this surface.
@@ -283,7 +325,7 @@ impl RenderThread {
             index: self.index,
             reply,
         });
-        let _ = answer.recv();
+        let _ = await_reply(&answer, "a close");
     }
 
     pub(crate) fn stats(&self) -> PresentStats {
@@ -304,9 +346,13 @@ impl RenderThread {
             .clone()
     }
 
-    /// Whether a rebuilt device has to be given both atlases again.
-    pub(crate) fn take_atlas_request(&self) -> bool {
-        self.shared.wants_atlas.swap(false, Ordering::AcqRel)
+    /// The pages this surface's renderer holds. A frame carries what this says it lacks.
+    pub(crate) fn held_atlases(&self) -> HeldAtlases {
+        *self
+            .shared
+            .atlases
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     pub(crate) fn stopped(&self) -> bool {
@@ -529,6 +575,7 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
             reply,
         } => {
             let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+            log::debug!("ui-platform-win32: opening a chain for {hwnd:?}");
             match Win32Presenter::open_raw(hwnd, size, alpha) {
                 Ok(presenter) => {
                     let entry = Entry {
@@ -554,6 +601,7 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
                             entries.len() - 1
                         }
                     };
+                    log::debug!("ui-platform-win32: opened the chain at index {index}");
                     let _ = reply.send(Ok(index));
                 }
                 Err(error) => {
@@ -566,7 +614,8 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
                 return;
             };
             // The gate kept the loop to one frame in flight, so a second one means the
-            // first was never taken; the one it replaces is the frame nobody shows.
+            // first was never taken; the one it replaces is the frame nobody shows. The
+            // page it carried is still owed, because nothing acknowledged it.
             if entry.pending.replace(packet).is_some() {
                 entry.pace.release();
             }
@@ -604,12 +653,14 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
             let _ = reply.send(result);
         }
         Command::Close { index, reply } => {
+            log::debug!("ui-platform-win32: releasing the chain at index {index}");
             if let Some(slot) = entries.get_mut(index) {
                 if let Some(entry) = slot.take() {
                     entry.shared.stopped.store(true, Ordering::Release);
                     entry.pace.finished();
                 }
             }
+            log::debug!("ui-platform-win32: the chain at index {index} is released");
             let _ = reply.send(());
         }
     }
@@ -652,7 +703,6 @@ fn submit(index: usize, entries: &mut [Option<Entry>]) {
                 match reopen(entry.hwnd, entry.size, entry.alpha, entry.supersample) {
                     Ok(fresh) => {
                         entry.presenter = Some(fresh);
-                        entry.shared.wants_atlas.store(true, Ordering::Release);
                         if let Some(presenter) = entry.presenter.as_mut() {
                             if let Err(error) = draw(presenter, &mut packet) {
                                 entry.shared.store(format!(
@@ -670,6 +720,12 @@ fn submit(index: usize, entries: &mut [Option<Entry>]) {
                 }
             }
         },
+    }
+    // What the renderer holds once this frame is done with, drawn or not: only an upload
+    // that landed is a page the loop may stop carrying.
+    let held = entry.presenter.as_ref().map(Win32Presenter::held_atlases);
+    if let Some(held) = held {
+        entry.shared.set_held(held);
     }
     // Whether it drew or failed, the loop must not wait on a frame nobody takes.
     entry.pace.finished();
@@ -690,7 +746,8 @@ fn rebuild(entry: &mut Entry, reason: &str) -> Result<(), String> {
     let fresh = reopen(entry.hwnd, entry.size, entry.alpha, entry.supersample)
         .map_err(|error| format!("the chain could not be rebuilt after {reason}: {error}"))?;
     entry.presenter = Some(fresh);
-    entry.shared.wants_atlas.store(true, Ordering::Release);
+    // A new renderer holds no page, so the next frame carries both.
+    entry.shared.set_held(HeldAtlases::default());
     // The new chain holds no frame: the compositor's window is open already.
     entry.pace.finished();
     Ok(())

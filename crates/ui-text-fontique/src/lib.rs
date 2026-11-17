@@ -43,6 +43,14 @@ pub struct FontiqueProvider {
     /// Shapers `advance` alone uses. Layout keeps its own per face; this map makes a
     /// convenience measurement cost one plan build per face, not one per call.
     advance_shapers: Mutex<HashMap<FaceId, crate::shape::Shaper>>,
+    /// The bytes each registered name was admitted with. The provider is shared by every
+    /// surface on its thread and fontique never gives a family back, so the same bundled
+    /// font handed over again must not be admitted again: a picker opened ten times would
+    /// otherwise hold ten copies of its icon font.
+    registered: Mutex<HashMap<String, FontBlob>>,
+    /// Counts internal family names for bytes that replace a registered one; fontique can
+    /// only append a family, never drop and re-add one.
+    next_serial: u64,
     /// Whether the OS font stack was actually available.
     system: bool,
 }
@@ -230,6 +238,8 @@ impl FontiqueProvider {
             blobs: Mutex::new(HashMap::new()),
             glyph_probes: Mutex::new(HashMap::new()),
             advance_shapers: Mutex::new(HashMap::new()),
+            registered: Mutex::new(HashMap::new()),
+            next_serial: 0,
             system,
         }
     }
@@ -357,7 +367,32 @@ impl FontiqueProvider {
     }
 
     /// Register font bytes under `name`; the family then resolves like a system one.
+    ///
+    /// Registering the same bytes under a name that already has them is a no-op: the shared
+    /// provider lives as long as its thread, and fontique holds every admitted family for
+    /// good. Different bytes for a known name get an internal family name of their own, so
+    /// the new face takes effect while the old one is simply never asked for again.
     pub fn register(&mut self, name: &str, data: Arc<[u8]>) -> bool {
+        let replaced = {
+            let registered = match self.registered.lock() {
+                Ok(registered) => registered,
+                Err(_) => return false,
+            };
+            match registered.get(name) {
+                Some(existing) if existing.bytes() == &data[..] => return true,
+                Some(_) => true,
+                None => false,
+            }
+        };
+        let family_name = if replaced {
+            self.next_serial += 1;
+            format!("{name}#{}", self.next_serial)
+        } else {
+            name.to_string()
+        };
+        if let Ok(mut registered) = self.registered.lock() {
+            registered.insert(name.to_string(), FontBlob::from(Arc::clone(&data)));
+        }
         let blob: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(FontBytes(Arc::clone(&data)));
         let added = {
             let Ok(mut inner) = self.inner.lock() else {
@@ -366,7 +401,7 @@ impl FontiqueProvider {
             inner.register_fonts(
                 fontique::Blob::new(blob),
                 Some(fontique::FontInfoOverride {
-                    family_name: Some(name),
+                    family_name: Some(&family_name),
                     ..Default::default()
                 }),
             )

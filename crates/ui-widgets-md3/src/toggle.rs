@@ -132,18 +132,6 @@ pub fn size_at(forward: bool, progress: f32, off: f32, on: f32) -> (f32, f32) {
     }
 }
 
-/// Source-over compositing in stored sRGB against an opaque surface, matching
-/// `Color.alphaBlend`.
-fn over(src: Color, dst: Color) -> Color {
-    let a = src.a.clamp(0.0, 1.0);
-    Color {
-        r: src.r * a + dst.r * (1.0 - a),
-        g: src.g * a + dst.g * (1.0 - a),
-        b: src.b * a + dst.b * (1.0 - a),
-        a: a + dst.a * (1.0 - a),
-    }
-}
-
 /// Read or write one latched endpoint; `None` means the reference stopped writing it.
 fn latch(ctx: &mut ui_widgets::NodeCx<'_>, key: Id, target: Option<f32>, rest: f32) -> f32 {
     match target {
@@ -344,14 +332,12 @@ impl Md3Toggle {
         let surface = role(pack, "surface");
         // `Color.alphaBlend(lerpedThumbColor, surfaceColor)`: a translucent handle is blended
         // over the surface so the track cannot show through it.
-        let thumb_color = over(
-            between(
-                spec_ink(pack, off.handle.color, off.handle.opacity),
-                spec_ink(pack, active.handle.color, active.handle.opacity),
-                t,
-            ),
-            surface,
-        );
+        let thumb_color = between(
+            spec_ink(pack, off.handle.color, off.handle.opacity),
+            spec_ink(pack, active.handle.color, active.handle.opacity),
+            t,
+        )
+        .over(surface);
         let track_color = between(
             spec_ink(pack, off.track.color, off.track.opacity),
             spec_ink(pack, active.track.color, active.track.opacity),

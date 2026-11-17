@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ui_core::Event;
-use ui_core::dnd::{DndEvent, DragData, DragItem, DropEffect};
+use ui_core::dnd::{
+    DndEvent, DragData, DragItem, DropEffect, DropEffects, DropOutcome, Performer,
+};
 use ui_core::geom::Point;
 use wayland_client::protocol::wl_data_device_manager::DndAction;
 use wayland_client::protocol::{
@@ -67,6 +69,8 @@ struct Outgoing {
     source: wl_data_source::WlDataSource,
     payload: DragPayload,
     version: u32,
+    /// The action the destination chose, as `dnd_action` reported it.
+    action: Option<DndAction>,
     /// Set once the outcome has been reported, so a late event adds nothing.
     settled: bool,
 }
@@ -77,6 +81,11 @@ pub(crate) struct Drag {
     /// The offer an incoming drag is over this surface with.
     offer: Option<wl_data_offer::WlDataOffer>,
     mimes: Vec<String>,
+    /// The actions the source permits; `None` means it announced none, which reads as
+    /// copy, the one action every source honours.
+    source_actions: Option<DndAction>,
+    /// The effect the engine last published for the pointer.
+    effect: Option<DropEffect>,
     pos: Option<Point>,
     serial: u32,
     /// Set by `drop`: the drag object is gone, but its payload is still arriving.
@@ -96,11 +105,64 @@ impl Drag {
         true
     }
 
-    /// A drag entered the surface with `offer` and the types announced for it.
+    /// The actions the source permits, when they did not arrive before `enter`.
+    pub(crate) fn note_actions(
+        &mut self,
+        offer: &wl_data_offer::WlDataOffer,
+        actions: DndAction,
+    ) -> bool {
+        if self.offer.as_ref() != Some(offer) {
+            return false;
+        }
+        self.source_actions = Some(actions);
+        self.apply_actions();
+        true
+    }
+
+    /// Publish the effect the engine negotiated for the pointer.
+    ///
+    /// Wayland has one side choose: the destination sends the preferred action to the
+    /// source, and the source reports it back in `dnd_action`. The engine's frame decides
+    /// from the modifiers it sees, so the backend follows `drop_effect()`.
+    pub(crate) fn set_effect(&mut self, effect: Option<DropEffect>) {
+        if self.effect == effect {
+            return;
+        }
+        self.effect = effect;
+        self.apply_actions();
+    }
+
+    /// Tell the source which action this destination supports and prefers.
+    fn apply_actions(&mut self) {
+        let Some(offer) = self.offer.as_ref() else {
+            return;
+        };
+        if offer.version() < 3 {
+            return;
+        }
+        let supported = supported_actions(self.source_actions.unwrap_or(DndAction::Copy));
+        if supported.is_empty() {
+            return;
+        }
+        let wanted = match self.effect {
+            Some(DropEffect::Move) => DndAction::Move,
+            _ => DndAction::Copy,
+        };
+        let preferred = if supported.contains(wanted) {
+            wanted
+        } else {
+            first_action(supported)
+        };
+        offer.set_actions(supported, preferred);
+    }
+
+    /// A drag entered the surface with `offer`, the types announced for it and the actions
+    /// the source permits.
     pub(crate) fn enter(
         &mut self,
         offer: wl_data_offer::WlDataOffer,
         mimes: Vec<String>,
+        actions: DndAction,
         pos: Point,
         serial: u32,
     ) -> Vec<Event> {
@@ -108,15 +170,18 @@ impl Drag {
         self.abandon();
         self.offer = Some(offer);
         self.mimes = mimes;
+        self.source_actions = Some(actions);
+        self.effect = None;
         self.pos = Some(pos);
         self.serial = serial;
+        let version = self.offer.as_ref().map_or(0, |offer| offer.version());
+        if version >= 3 {
+            // The mask this destination supports, and the action it prefers.
+            self.apply_actions();
+        }
         let Some(offer) = self.offer.as_ref() else {
             return Vec::new();
         };
-        if offer.version() >= 3 {
-            // The mask this destination supports, and the action it prefers.
-            offer.set_actions(DndAction::Copy, DndAction::Copy);
-        }
         // Version 3 cancels a drag whose destination accepted no type, taking the source's
         // data with it. The engine's own verdict needs a frame this event precedes, so the
         // first offered type is the optimistic answer — the same one OLE gets on Windows.
@@ -126,6 +191,7 @@ impl Drag {
         vec![Event::Dnd(DndEvent::Entered {
             pos,
             types: self.mimes.clone(),
+            effects: effects_of(actions),
         })]
     }
 
@@ -242,6 +308,9 @@ impl Drag {
 
     /// Report the drop with everything read so far, and let the offer go.
     fn finish_drop(&mut self) -> Vec<Event> {
+        // The destination's preferred action must be on the offer before `finish`, or the
+        // source hears the action it last saw rather than the one the drop meant.
+        self.apply_actions();
         let Some(offer) = self.offer.take() else {
             return Vec::new();
         };
@@ -254,8 +323,19 @@ impl Drag {
         let data = DragData::new(std::mem::take(&mut self.items));
         let pos = self.pos.take().unwrap_or_else(|| Point::new(0.0, 0.0));
         self.mimes.clear();
+        self.source_actions = None;
+        self.effect = None;
         self.dropped = false;
-        vec![Event::Dnd(DndEvent::Dropped { pos, data })]
+        vec![Event::Dnd(DndEvent::Dropped {
+            pos,
+            data,
+            // Wayland's drag gesture is the primary button's; there is no right drag in
+            // the protocol, so the target never sees a decision the button would imply.
+            button: ui_core::PointerButton::Primary,
+            // A move here is finished by the source after `dnd_finished`, so the
+            // destination copies and leaves the originals in place.
+            performer: Performer::Source,
+        })]
     }
 
     /// Drop an incoming drag that ended without a report.
@@ -264,6 +344,8 @@ impl Drag {
             offer.destroy();
         }
         self.mimes.clear();
+        self.source_actions = None;
+        self.effect = None;
         self.pos = None;
         self.serial = 0;
         self.dropped = false;
@@ -285,9 +367,30 @@ impl Drag {
         outgoing.payload.serve(mime, fd);
         if outgoing.version < 3 && !outgoing.settled {
             outgoing.settled = true;
-            return Some(Event::Dnd(DndEvent::Finished { dropped: true }));
+            return Some(Event::Dnd(DndEvent::Finished {
+                outcome: Some(DropOutcome {
+                    action: DropEffect::Copy,
+                    performed_by: Performer::Source,
+                }),
+            }));
         }
         None
+    }
+
+    /// The compositor reports the action the destination chose.
+    pub(crate) fn note_action(
+        &mut self,
+        source: &wl_data_source::WlDataSource,
+        action: DndAction,
+    ) -> bool {
+        let Some(outgoing) = self.outgoing.as_mut() else {
+            return false;
+        };
+        if &outgoing.source != source {
+            return false;
+        }
+        outgoing.action = Some(action);
+        true
     }
 
     /// The compositor reports how our drag ended.
@@ -297,7 +400,16 @@ impl Drag {
             return None;
         }
         outgoing.settled = true;
-        Some(Event::Dnd(DndEvent::Finished { dropped }))
+        let outcome = dropped.then(|| DropOutcome {
+            // `ask` is a request for a decision this source cannot make after the
+            // compositor has already delivered the drop; copying keeps the data and
+            // leaves deletion to the user, which is the safe reading.
+            action: effect_of(outgoing.action.unwrap_or(DndAction::Copy)),
+            // Wayland gives the move to the source: the destination copied, and the
+            // originals stay here until this side removes them.
+            performed_by: Performer::Source,
+        });
+        Some(Event::Dnd(DndEvent::Finished { outcome }))
     }
 
     /// Retire a settled source once the writes it was asked for have drained.
@@ -324,7 +436,8 @@ impl Drag {
         conn: &Connection,
     ) -> bool {
         let offers = offered(data);
-        if offers.is_empty() || serial == 0 {
+        let actions = wayland_actions(data.effects);
+        if offers.is_empty() || actions.is_empty() || serial == 0 {
             return false;
         }
         // The compositor tracks one drag at a time; a second gesture replaces the first.
@@ -333,14 +446,11 @@ impl Drag {
         }
         let source = manager.create_data_source(qh, ());
         let version = source.version();
-        // The one action this payload means. Wayland has no link action, so a link drag
-        // copies where it lands.
-        let action = match data.effect {
-            DropEffect::Move => DndAction::Move,
-            DropEffect::Copy | DropEffect::Link => DndAction::Copy,
-        };
+        // Every action the payload means. Wayland has no link action, so a link drag
+        // copies where it lands; `ask` is not offered because this source has no way to
+        // put a question in front of the user after the compositor has the gesture.
         if version >= 3 {
-            source.set_actions(action);
+            source.set_actions(actions);
         }
         for (mime, _) in &offers {
             source.offer(mime.clone());
@@ -353,6 +463,7 @@ impl Drag {
                 outbox: Outbox::default(),
             },
             version,
+            action: None,
             settled: false,
         });
         let _ = conn.flush();
@@ -392,8 +503,7 @@ impl Drag {
 }
 
 /// The types a payload offers, best first, with the spellings a Wayland peer may ask for.
-fn offered(data: &DragData) -> Vec<(String, Arc<Vec<u8>>)> {
-    let mut offers: Vec<(String, Arc<Vec<u8>>)> = Vec::new();
+fn offered(data: &DragData) -> Vec<(String, Arc<Vec<u8>>)> {    let mut offers: Vec<(String, Arc<Vec<u8>>)> = Vec::new();
     for item in &data.items {
         let bytes = Arc::new(item.data.clone());
         // A text payload is asked for under any of the three names; they all read the
@@ -414,6 +524,71 @@ fn offered(data: &DragData) -> Vec<(String, Arc<Vec<u8>>)> {
         }
     }
     offers
+}
+
+/// The `DndAction`s a payload's permitted effects map to.
+///
+/// Wayland has copy and move; a link is a copy on this protocol. An empty set refuses the
+/// drag instead of starting one no destination can honour.
+fn wayland_actions(effects: DropEffects) -> DndAction {
+    let mut actions = DndAction::empty();
+    if effects.contains(DropEffect::Copy) || effects.contains(DropEffect::Link) {
+        actions |= DndAction::Copy;
+    }
+    if effects.contains(DropEffect::Move) {
+        actions |= DndAction::Move;
+    }
+    actions
+}
+
+/// The actions this destination supports out of what a source permits.
+fn supported_actions(source: DndAction) -> DndAction {
+    if source.is_empty() {
+        // A version-2 source announces nothing; copying is the action every source has.
+        return DndAction::Copy;
+    }
+    let mut actions = DndAction::empty();
+    if source.contains(DndAction::Copy) {
+        actions |= DndAction::Copy;
+    }
+    if source.contains(DndAction::Move) {
+        actions |= DndAction::Move;
+    }
+    actions
+}
+
+/// One action out of a set, for a preferred action a mask cannot express.
+fn first_action(actions: DndAction) -> DndAction {
+    if actions.contains(DndAction::Copy) {
+        DndAction::Copy
+    } else {
+        DndAction::Move
+    }
+}
+
+/// The effects a source's action mask permits.
+fn effects_of(actions: DndAction) -> DropEffects {
+    let mut effects = DropEffects::NONE;
+    if actions.contains(DndAction::Copy) {
+        effects |= DropEffects::COPY;
+    }
+    if actions.contains(DndAction::Move) {
+        effects |= DropEffects::MOVE;
+    }
+    if effects.is_empty() {
+        DropEffects::COPY
+    } else {
+        effects
+    }
+}
+
+/// The effect an action means; `ask` and anything unknown read as a copy.
+fn effect_of(action: DndAction) -> DropEffect {
+    if action.contains(DndAction::Move) {
+        DropEffect::Move
+    } else {
+        DropEffect::Copy
+    }
 }
 
 impl Dispatch<wl_data_device::WlDataDevice, ()> for WindowState {
@@ -441,9 +616,9 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WindowState {
                     return;
                 };
                 // The types arrived between `data_offer` and this event.
-                let (offer, mimes) = state.clipboard.take_pending(&id);
+                let (offer, mimes, actions) = state.clipboard.take_pending(&id);
                 let pos = Point::new(x as f32, y as f32);
-                events.extend(state.dnd.enter(offer, mimes, pos, serial));
+                events.extend(state.dnd.enter(offer, mimes, actions, pos, serial));
             }
             wl_data_device::Event::Motion { x, y, .. } => {
                 let pos = Point::new(x as f32, y as f32);
@@ -474,6 +649,11 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for WindowState {
             if !state.dnd.note_mime(offer, &mime_type) {
                 state.clipboard.note_mime(offer, mime_type);
             }
+        } else if let wl_data_offer::Event::SourceActions { source_actions } = event
+            && let Ok(actions) = source_actions.into_result()
+            && !state.dnd.note_actions(offer, actions)
+        {
+            state.clipboard.note_actions(offer, actions);
         }
     }
 }
@@ -493,7 +673,7 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WindowState {
                 if state.dnd.owns_source(source) {
                     events.extend(state.dnd.serve(&mime_type, fd));
                 } else {
-                    state.clipboard.serve_source(fd);
+                    state.clipboard.serve_source(&mime_type, fd);
                 }
             }
             wl_data_source::Event::Cancelled => {
@@ -501,6 +681,14 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WindowState {
                     events.extend(state.dnd.settle(false));
                 } else {
                     state.clipboard.cancel_source();
+                }
+            }
+            // Version 3: the action the destination chose for this session.
+            wl_data_source::Event::Action { dnd_action } => {
+                if state.dnd.owns_source(source)
+                    && let Ok(action) = dnd_action.into_result()
+                {
+                    state.dnd.note_action(source, action);
                 }
             }
             // Version 3: the drop destination finished reading, so the drag is over.

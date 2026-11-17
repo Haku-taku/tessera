@@ -48,6 +48,8 @@ use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
     self, Event as TextInputEvent, ZwpTextInputV3,
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
+use wayland_protocols::xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1;
+use wayland_protocols::xdg::dialog::v1::client::xdg_wm_dialog_v1::XdgWmDialogV1;
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
@@ -133,6 +135,13 @@ pub(crate) struct WindowState {
     closed: bool,
     /// Latest pointer position in surface-local coordinates.
     pointer: Option<ui_core::geom::Point>,
+    /// The surface this state's seat events belong to.
+    ///
+    /// One seat delivers an event to every proxy bound on the connection, so a panel's
+    /// window also receives the events addressed to the window it hangs off. Without this,
+    /// both would push the same input into the tree, the panel's copy at its own origin and
+    /// the parent's at surface-local coordinates that mean nothing there.
+    surface: Option<wl_surface::WlSurface>,
     /// Pointer enter/leave tracking.
     pointer_over: bool,
     /// Whether the compositor currently gives this surface the keyboard.
@@ -283,6 +292,11 @@ struct ImePending {
 }
 
 impl WindowState {
+    /// Whether a seat event addressed `surface` is this window's to act on.
+    fn owns(&self, surface: &wl_surface::WlSurface) -> bool {
+        self.surface.as_ref() == Some(surface)
+    }
+
     fn new(width: u32, height: u32) -> Self {
         Self {
             shm: None,
@@ -292,6 +306,7 @@ impl WindowState {
             pointer: None,
             events: Vec::new(),
             wheel: crate::wheel::Wheel::default(),
+            surface: None,
             pointer_over: false,
             keyboard_focus: false,
             pointer_enter_serial: None,
@@ -369,7 +384,11 @@ impl WindowState {
             }
         }
         // Named keys travel as themselves; text arrives as `Text` above.
-        if let Some(named) = named_key(evdev) {
+        if self.input.menu_key(evdev) {
+            events.push(ui_core::Event::KeyPressed {
+                key: ui_core::Key::Menu,
+            });
+        } else if let Some(named) = named_key(evdev) {
             events.push(ui_core::Event::KeyPressed { key: named });
         }
         events
@@ -407,6 +426,8 @@ noop_dispatch!(
     ()
 );
 noop_dispatch!(wp_viewporter::WpViewporter, ());
+noop_dispatch!(XdgWmDialogV1, ());
+noop_dispatch!(XdgDialogV1, ());
 noop_dispatch!(WpPointerWarpV1, ());
 noop_dispatch!(wp_viewport::WpViewport, ());
 noop_dispatch!(
@@ -628,7 +649,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState {
                 }
                 state.redraw_requested = true;
             }
-            wl_keyboard::Event::Enter { serial, .. } => {
+            wl_keyboard::Event::Enter { serial, surface, .. } => {
+                // The seat names the surface that took the keyboard; another window of this
+                // client is not this one, and its keys are not ours to push.
+                if !state.owns(&surface) {
+                    return;
+                }
                 state.keyboard_focus = true;
                 // Focus returned, so the session the compositor dropped must be rebuilt; the
                 // text-input `enter` says the same thing and gates when it may be sent.
@@ -638,7 +664,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState {
                 state.redraw_requested = true;
                 state.silent_change = true;
             }
-            wl_keyboard::Event::Leave { .. } => {
+            wl_keyboard::Event::Leave { surface, .. } => {
+                if !state.owns(&surface) {
+                    return;
+                }
                 state.keyboard_focus = false;
                 // A key can no longer be heard as released, so it must not keep repeating.
                 state.repeating.clear();
@@ -657,6 +686,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState {
                 state: key_state,
                 ..
             } => {
+                // Keys go to the seat, so every window of this client hears them; only the
+                // one the keyboard entered may turn them into events.
+                if !state.keyboard_focus {
+                    return;
+                }
                 state.note_serial(serial);
                 let pressed = matches!(
                     key_state,
@@ -689,6 +723,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState {
                 mods_locked,
                 group,
             } => {
+                if !state.keyboard_focus {
+                    return;
+                }
                 state.note_serial(serial);
                 state
                     .input
@@ -903,10 +940,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WindowState {
         match event {
             wl_pointer::Event::Enter {
                 serial,
+                surface,
                 surface_x,
                 surface_y,
                 ..
             } => {
+                // Another surface of this client took the pointer: nothing here changed.
+                if !state.owns(&surface) {
+                    return;
+                }
                 // set_shape is ignored unless this matches the latest enter serial.
                 state.pointer_enter_serial = Some(serial);
                 // The compositor drops our shape when the pointer leaves, so the cache must
@@ -920,7 +962,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WindowState {
                 state.events.push(ui_core::Event::PointerMoved { pos: p });
                 state.redraw_requested = true;
             }
-            wl_pointer::Event::Leave { .. } => {
+            wl_pointer::Event::Leave { surface, .. } => {
+                if !state.owns(&surface) {
+                    return;
+                }
                 state.pointer_over = false;
                 state.warp_focus.set(false);
                 state.pointer_enter_serial = None;
@@ -937,6 +982,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WindowState {
                 surface_y,
                 ..
             } => {
+                // `motion` names no surface: it belongs to the one the pointer entered.
+                if !state.pointer_over {
+                    return;
+                }
                 let p = ui_core::geom::Point::new(surface_x as f32, surface_y as f32);
                 state.pointer = Some(p);
                 state.input.set_pointer(Some(p));
@@ -980,6 +1029,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WindowState {
                 serial,
                 ..
             } => {
+                // A click is delivered to the seat, not to a surface: without an entry the
+                // pointer is on another window of this client, and a press belongs there.
+                if !state.pointer_over {
+                    return;
+                }
                 // A click is a fresh serial, and `set_selection` needs one from our input.
                 state.note_serial(serial);
                 // Linux input-event-codes: BTN_LEFT is 0x110; other buttons map by order.
@@ -1023,6 +1077,12 @@ fn named_key(evdev: u32) -> Option<ui_core::Key> {
         109 => ui_core::Key::PageDown,
         110 => ui_core::Key::Insert,
         111 => ui_core::Key::Delete,
+        // F1-F12, then the high block F13-F24: the accelerators need F2 and F10, and the
+        // rest cost a line each rather than a second table.
+        59..=68 => ui_core::Key::Function((evdev - 59 + 1) as u8),
+        87 => ui_core::Key::Function(11),
+        88 => ui_core::Key::Function(12),
+        183..=194 => ui_core::Key::Function((evdev - 183 + 13) as u8),
         _ => return None,
     })
 }
@@ -1050,6 +1110,9 @@ pub struct WaylandWindow {
     layer: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     /// The popup role, when this surface is a panel hung off another.
     popup: Option<xdg_popup::XdgPopup>,
+    /// The dialog role, when this surface is a dialog and the compositor carries
+    /// `xdg-dialog`. Kept alive: destroying it drops the hint before the window does.
+    _dialog: Option<XdgDialogV1>,
     /// The positioner the popup was mapped with; a reposition replaces it.
     positioner: Option<xdg_positioner::XdgPositioner>,
     /// Name for the next `reposition`; the protocol wants every request named.
@@ -1265,6 +1328,20 @@ pub struct PopupParent {
     grab_serial: u32,
 }
 
+/// The parent a dialog belongs to.
+struct DialogParent {
+    /// The parent toplevel, which `set_parent` names and the compositor stacks above.
+    toplevel: xdg_toplevel::XdgToplevel,
+    /// Whether the dialog asks the compositor to hold the parent's input.
+    modal: bool,
+}
+
+/// What a new surface is attached to: a panel's positioner, or a dialog's parent.
+enum Attached {
+    Popup(PopupParent),
+    Dialog(DialogParent),
+}
+
 impl WaylandWindow {
     /// Create and map a surface, waiting until the compositor configures it.
     pub fn new(spec: SurfaceSpec) -> Result<Self, WindowError> {
@@ -1293,12 +1370,33 @@ impl WaylandWindow {
         Self::build(
             spec,
             Some(&link),
-            Some(PopupParent {
+            Some(Attached::Popup(PopupParent {
                 surface,
                 seat,
                 spec: popup,
                 grab_serial,
-            }),
+            })),
+        )
+    }
+
+    /// Create a dialog window belonging to `parent`, waiting until it is configured.
+    ///
+    /// A dialog is a toplevel with a transient parent. Where the compositor advertises
+    /// `xdg-dialog`, it is also marked as one and, when asked, as modal — but that is a
+    /// hint: the host filters the parent's input itself, as the protocol requires.
+    pub fn create_dialog(
+        parent: &WaylandWindow,
+        spec: SurfaceSpec,
+    ) -> Result<Self, WindowError> {
+        let toplevel = parent._toplevel.clone().ok_or(WindowError::Protocol(
+            "a dialog needs a toplevel parent; a layer surface has none".into(),
+        ))?;
+        let modal = spec.dialog_modal().unwrap_or(false);
+        let link = parent.link();
+        Self::build(
+            spec,
+            Some(&link),
+            Some(Attached::Dialog(DialogParent { toplevel, modal })),
         )
     }
 
@@ -1322,7 +1420,7 @@ impl WaylandWindow {
     fn build(
         spec: SurfaceSpec,
         link: Option<&WaylandLink>,
-        parent: Option<PopupParent>,
+        parent: Option<Attached>,
     ) -> Result<Self, WindowError> {
         let layer: Option<LayerSpec> = spec.layer_spec().cloned();
         let keyboard_follow = layer
@@ -1347,6 +1445,7 @@ impl WaylandWindow {
             compositor,
             shm,
             wm_base,
+            dialog: dialog_manager,
             layer_shell,
             seat,
             data_device_manager,
@@ -1363,13 +1462,14 @@ impl WaylandWindow {
 
         // A layer's configure carries the real size; the opening one is a placeholder there.
         let opening = match &spec.role {
-            SurfaceRole::Window { size } => *size,
+            SurfaceRole::Window { size } | SurfaceRole::Dialog { size, .. } => *size,
             SurfaceRole::Layer(layer) => layer.size.unwrap_or((0, 0)),
         };
         let mut state = WindowState::new(opening.0, opening.1);
         state.base = wm_base.clone();
 
         let surface = compositor.create_surface(&qh, ());
+        state.surface = Some(surface.clone());
         // Kept for the surface's lifetime: the compositor reports a change of mind through
         // this object, and it says nothing to an object that was destroyed after one read.
         let feedback = color_manager
@@ -1394,11 +1494,11 @@ impl WaylandWindow {
                 None
             }
         };
-        let (xdg, toplevel, layer_surface, popup_role) = match (layer, parent) {
+        let (xdg, toplevel, layer_surface, popup_role, dialog_role) = match (layer, parent) {
             // A popup: the parent's surface role fixes the coordinates the positioner's
             // rectangle is read in, and the grab decides who hears the input after the
             // press that opened it.
-            (_, Some(parent)) => {
+            (_, Some(Attached::Popup(parent))) => {
                 let wm = wm_base
                     .clone()
                     .ok_or(WindowError::MissingGlobal("xdg_wm_base"))?;
@@ -1412,7 +1512,30 @@ impl WaylandWindow {
                     // an error: the panel still shows, it just stops taking outside input.
                     popup.grab(seat, parent.grab_serial);
                 }
-                (Some(xdg), None, None, Some((popup, positioner)))
+                (Some(xdg), None, None, Some((popup, positioner)), None)
+            }
+            // A dialog: a toplevel with a transient parent, marked modal when asked and
+            // when the compositor carries `xdg-dialog`.
+            (_, Some(Attached::Dialog(parent))) => {
+                let wm = wm_base
+                    .clone()
+                    .ok_or(WindowError::MissingGlobal("xdg_wm_base"))?;
+                let xdg = wm.get_xdg_surface(&surface, &qh, ());
+                let toplevel = xdg.get_toplevel(&qh, ());
+                toplevel.set_title(spec.name.clone());
+                toplevel.set_app_id(spec.app_id.clone());
+                if let Some((width, height)) = spec.min_size {
+                    toplevel.set_min_size(width as i32, height as i32);
+                }
+                toplevel.set_parent(Some(&parent.toplevel));
+                let dialog = dialog_manager.as_ref().map(|manager| {
+                    let dialog = manager.get_xdg_dialog(&toplevel, &qh, ());
+                    if parent.modal {
+                        dialog.set_modal();
+                    }
+                    dialog
+                });
+                (Some(xdg), Some(toplevel), None, None, dialog)
             }
             (None, None) => {
                 let wm = wm_base
@@ -1426,7 +1549,7 @@ impl WaylandWindow {
                 if let Some((width, height)) = spec.min_size {
                     toplevel.set_min_size(width as i32, height as i32);
                 }
-                (Some(xdg), Some(toplevel), None, None)
+                (Some(xdg), Some(toplevel), None, None, None)
             }
             (Some(cfg), None) => {
                 let shell = layer_shell
@@ -1479,7 +1602,7 @@ impl WaylandWindow {
                         zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive
                     }
                 });
-                (None, None, Some(surface_role), None)
+                (None, None, Some(surface_role), None, None)
             }
         };
         surface.commit();
@@ -1567,6 +1690,7 @@ impl WaylandWindow {
                 .then_some(zwlr_layer_surface_v1::KeyboardInteractivity::None),
             _xdg: xdg,
             _toplevel: toplevel,
+            _dialog: dialog_role,
             layer: layer_surface,
             popup,
             positioner,
@@ -2048,6 +2172,21 @@ impl WaylandWindow {
         Ok(())
     }
 
+    /// Pin a toplevel's size to the panel it shows.
+    ///
+    /// Naming the content as both minimum and maximum is what stops the compositor offering a
+    /// resize: a size the content does not fill would show a blank strip beside it.
+    pub fn set_content_size(&self, size: (u32, u32)) -> Result<(), String> {
+        let toplevel = self
+            ._toplevel
+            .as_ref()
+            .ok_or("this surface is not a toplevel")?;
+        let (width, height) = (size.0.max(1) as i32, size.1.max(1) as i32);
+        toplevel.set_min_size(width, height);
+        toplevel.set_max_size(width, height);
+        Ok(())
+    }
+
     /// Resize a layer surface; the compositor answers with a configure carrying the new size.
     ///
     /// The configured size lags the request, so both are remembered: asking again for a size
@@ -2183,8 +2322,21 @@ impl WaylandWindow {
         let contents = match content {
             ClipboardContent::Text(text) => Contents::Text(text),
             ClipboardContent::Bytes { mime, data } => Contents::Bytes { mime, data },
+            ClipboardContent::Files { paths, effect } => Contents::Files {
+                paths,
+                cut: effect == ui_core::DropEffect::Move,
+            },
         };
         self.state.clipboard.copy(contents, &self._conn, &self.qh)
+    }
+
+    /// Publish the effect the engine negotiated for the drag over this surface.
+    ///
+    /// The compositor never tells a destination which modifiers are held, so the engine's
+    /// own negotiation is the only answer; sending it keeps the source's `dnd_action` and
+    /// the drop in agreement.
+    pub fn set_drop_effect(&mut self, effect: Option<ui_core::DropEffect>) {
+        self.state.dnd.set_effect(effect);
     }
 
     /// Start an operating-system drag carrying `data`; false when the seat cannot.
@@ -2236,8 +2388,8 @@ impl WaylandWindow {
 
     /// Move clipboard and drag pipes forward, queueing whatever finished as events.
     fn service_clipboard(&mut self) {
-        if let Some(text) = self.state.clipboard.service() {
-            self.state.push_event(ui_core::Event::Paste(text));
+        if let Some(content) = self.state.clipboard.service() {
+            self.state.push_event(ui_core::Event::Paste(content));
         }
         let events = self.state.dnd.service();
         for event in events {

@@ -6,6 +6,7 @@
 //! rather than failing to compile.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ui_core::Event;
@@ -13,6 +14,7 @@ use ui_core::clipboard::ClipboardContent;
 use ui_core::geom::Point;
 
 use crate::present::PresentStats;
+use crate::shell_menu::ShellMenuHost;
 use crate::view::{App, AppLoop, FrameOutcome};
 use crate::window::SurfaceSpec;
 
@@ -78,6 +80,12 @@ pub trait HostSession<A: App>: Sized {
     fn scale(&self) -> f32;
 
     fn request_close(&mut self);
+
+    /// The platform's classic file context menu, when it has one. A desktop with no such
+    /// menu answers `None`, as Wayland's lack of a context-menu protocol does.
+    fn shell_menu(&self) -> Option<Arc<dyn ShellMenuHost>> {
+        None
+    }
 
     /// Put text on the clipboard; false when the host cannot carry this content.
     fn write_clipboard(&mut self, content: ClipboardContent) -> bool;

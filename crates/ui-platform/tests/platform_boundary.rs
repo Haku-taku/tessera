@@ -20,6 +20,7 @@ const PORTABLE: &[&str] = &[
     "ui-text",
     "ui-paint",
     "ui-paint-gpu",
+    "ui-picker",
     "ui-platform",
     "ui-text-fontique",
     "ui-richtext",
@@ -51,6 +52,10 @@ const PLATFORM_BOUND: &[(&str, &str)] = &[
     (
         "ui-host",
         "Host facade: re-exports this target's window backend, so it depends on a platform crate by design",
+    ),
+    (
+        "ui-icon-theme",
+        "Freedesktop icon theme reader: index.theme directories and MIME icon names, with an SVG renderer for themes that ship almost no PNG",
     ),
     (
         "ui-platform-win32",

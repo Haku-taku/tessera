@@ -35,6 +35,8 @@ pub enum Key {
     Down,
     /// Print Screen: the screenshot key, which never types text.
     Print,
+    /// The context-menu key, and Shift+F10 on keyboards without one.
+    Menu,
     /// A function key, 1 through 24.
     Function(u8),
     /// A character pressed with a command modifier (Ctrl/Alt/Logo), so it is a command and
@@ -107,11 +109,12 @@ pub enum Event {
     },
     /// A committed character or string, already decoded by the platform.
     Text(String),
-    /// Clipboard text the platform read for a paste request.
+    /// Clipboard content the platform read for a paste request.
     ///
     /// Separate from `Text`: a paste replaces the selection as one edit, and an app that
-    /// filters typed characters must not filter it the same way.
-    Paste(String),
+    /// filters typed characters must not filter it the same way. A text field takes the
+    /// text variant and ignores the others; a file manager takes [`ClipboardContent::Files`].
+    Paste(crate::clipboard::ClipboardContent),
     KeyPressed {
         key: Key,
     },

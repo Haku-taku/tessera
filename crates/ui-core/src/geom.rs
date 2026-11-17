@@ -329,6 +329,26 @@ impl Color {
         }
     }
 
+    /// This colour drawn over `base`: what a translucent tint shows on the surface under it.
+    ///
+    /// Source-over with straight channels, the same blend the painter applies, so a system
+    /// that expresses a surface as a tint can be resolved to the colour it becomes.
+    pub fn over(self, base: Self) -> Self {
+        let sa = self.a.clamp(0.0, 1.0);
+        let ba = base.a.clamp(0.0, 1.0);
+        let a = sa + ba * (1.0 - sa);
+        if a <= 0.0 {
+            return Self::TRANSPARENT;
+        }
+        let channel = |s: f32, b: f32| (s * sa + b * ba * (1.0 - sa)) / a;
+        Self {
+            r: channel(self.r, base.r),
+            g: channel(self.g, base.g),
+            b: channel(self.b, base.b),
+            a,
+        }
+    }
+
     pub const BLACK: Self = Self::rgb(0.0, 0.0, 0.0);
     pub const WHITE: Self = Self::rgb(1.0, 1.0, 1.0);
 

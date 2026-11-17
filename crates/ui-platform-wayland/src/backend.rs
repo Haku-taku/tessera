@@ -10,10 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ui_platform::clipboard::{ClipboardCopy, ClipboardKind};
+use ui_platform::file_operation::FileOperator;
 use ui_platform::host::{Backend, PresentationOptions, SurfaceHandle};
 use ui_platform::hotkeys::{GlobalHotkeys, NoGlobalHotkeys};
 use ui_platform::ipc::Channel;
 use ui_platform::output::OutputInfo;
+use ui_platform::thumbnails::Thumbnailer;
 use ui_platform::session::SessionOptions;
 use ui_platform::transfer::SelectionReader;
 use ui_platform::window::SurfaceSpec;
@@ -122,7 +124,7 @@ impl Backend for WaylandBackend {
         spec: SurfaceSpec,
         options: PresentationOptions,
     ) -> Result<Box<dyn SurfaceHandle>, String> {
-        let presenter = Presenter::open_on(
+        let mut presenter = Presenter::open_on(
             &self.link,
             SessionOptions {
                 surface: spec,
@@ -130,6 +132,9 @@ impl Backend for WaylandBackend {
                 cpu_presenter: self.cpu_presenter,
             },
         )?;
+        // The portal chooser answers on its own thread; the eventfd is the only thing that
+        // can end a wait with the compositor idle.
+        presenter.set_wake(self.wake.clone());
         Ok(Box::new(presenter))
     }
 
@@ -162,6 +167,54 @@ impl Backend for WaylandBackend {
 
     fn outputs(&mut self) -> Vec<OutputInfo> {
         self.link.outputs()
+    }
+
+    fn thumbnails(&mut self) -> Option<Box<dyn Thumbnailer>> {
+        Some(Box::new(crate::thumbnails::DesktopThumbnailer::new()))
+    }
+
+    /// The desktop's icon theme, when the app asked for it: reading one means rendering
+    /// SVG, which a build with no picker should not link.
+    fn file_icons(&mut self) -> Option<Box<dyn ui_platform::file_icons::FileIconProvider>> {
+        #[cfg(feature = "file-icons")]
+        {
+            Some(Box::new(ui_icon_theme::IconTheme::new()))
+        }
+        #[cfg(not(feature = "file-icons"))]
+        {
+            None
+        }
+    }
+
+    /// The filesystem is the process's own: a directory reads the same on every backend in
+    /// this workspace, so the provider is `std::fs` rather than a Wayland object.
+    fn file_listing(&mut self) -> Option<Box<dyn ui_platform::listing::DirectoryLister>> {
+        Some(Box::new(
+            ui_platform::listing::FsDirectoryLister::dotfiles(),
+        ))
+    }
+
+    fn file_operator(&mut self) -> Option<Box<dyn FileOperator>> {
+        Some(Box::new(crate::file_operation::UnixOperator))
+    }
+
+    /// The same walk and the same dotfile rule, one directory at a time.
+    fn file_search(&mut self) -> Option<Box<dyn ui_platform::search::DirectorySearcher>> {
+        Some(Box::new(
+            ui_platform::search::FsDirectorySearcher::dotfiles(),
+        ))
+    }
+
+    fn file_watch(&mut self) -> Option<Box<dyn ui_platform::watch::DirectoryWatcher>> {
+        Some(Box::new(crate::watch::InotifyWatcher))
+    }
+
+    fn places(&mut self) -> Vec<ui_platform::places::Place> {
+        crate::listing::places()
+    }
+
+    fn devices(&mut self) -> Vec<ui_platform::places::Device> {
+        crate::listing::devices()
     }
 
     fn waker(&mut self) -> Option<Arc<dyn ui_platform::jobs::Waker>> {

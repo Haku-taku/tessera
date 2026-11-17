@@ -368,11 +368,14 @@ impl Container {
 impl Element for Container {
     fn decl(&self, cx: &mut ui_core::cx::Cx<'_>) -> Decl {
         let mut decl = self.own.clone();
-        decl.children = self
-            .children
-            .iter()
-            .map(|c| element_decl(c.as_ref(), cx))
-            .collect();
+        // This container's inertness is a fact for its children now, before the tree is
+        // committed; a child whose look folds it must not have to wait a frame.
+        decl.children = cx.with_disabled_scope(decl.disabled, |cx| {
+            self.children
+                .iter()
+                .map(|c| element_decl(c.as_ref(), cx))
+                .collect()
+        });
         decl
     }
 

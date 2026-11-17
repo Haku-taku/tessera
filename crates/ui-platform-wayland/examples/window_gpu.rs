@@ -30,7 +30,7 @@ fn label(id: &'static str, body: String, size: f32, color: Color) -> Decl {
         shapes: Vec::new(),
         data: NodeData::Text {
             ink: color,
-            block: std::rc::Rc::new(ui_core::TextBlock {
+            block: std::sync::Arc::new(ui_core::TextBlock {
                 runs: vec![ui_core::TextRun::new(body, ui_core::TextStyle::new(size))],
                 align: ui_core::TextAlign::Start,
                 max_lines: None,
@@ -62,6 +62,9 @@ fn label(id: &'static str, body: String, size: f32, color: Color) -> Decl {
         grid: Default::default(),
         placement: Default::default(),
         env: None,
+        drag: None,
+        drag_out: false,
+        drop_types: None,
         children: Vec::new(),
     }
 }
@@ -77,7 +80,7 @@ fn label_dyn(id: Id, body: String, size: f32, color: Color) -> Decl {
 fn bold(id: &'static str, body: String, size: f32, color: Color) -> Decl {
     let mut d = label(id, body, size, color);
     if let ui_core::NodeData::Text { block, .. } = &mut d.data
-        && let Some(run) = std::rc::Rc::make_mut(block).runs.first_mut()
+        && let Some(run) = std::sync::Arc::make_mut(block).runs.first_mut()
     {
         run.style.weight = ui_core::Weight::BOLD;
     }
@@ -88,7 +91,7 @@ fn bold(id: &'static str, body: String, size: f32, color: Color) -> Decl {
 fn paragraph(id: &'static str, body: String, size: f32, color: Color) -> Decl {
     let mut d = label(id, body, size, color);
     if let ui_core::NodeData::Text { block, .. } = &mut d.data {
-        let block = std::rc::Rc::make_mut(block);
+        let block = std::sync::Arc::make_mut(block);
         block.indent = 24.0;
         block.line_gap = 6.0;
         d.size_class.height = ui_core::layout::AxisSize::hug(size, size * 8.0);

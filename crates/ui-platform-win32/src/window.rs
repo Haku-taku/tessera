@@ -29,10 +29,12 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor,
-    GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
+    GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI,
+    SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
+    EnableWindow, GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_ESCAPE,
 };
 use windows::Win32::UI::Shell::{
     ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE,
@@ -41,7 +43,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
+    GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
     HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_CROSS,
     IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
     IsWindow, KillTimer,
@@ -62,9 +64,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_WINDOWPOSCHANGED,
     WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_TIMER,
+    WM_TIMER, WM_APP,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_SYSMENU,
 };
 use windows::core::PCWSTR;
 
@@ -74,6 +77,10 @@ use crate::{WindowError, input};
 /// `WM_MOUSELEAVE` lives with the common controls, whose whole API surface is not worth a
 /// feature flag for one constant.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// Posted by a worker that finished what the next build must see — the shell menu's rows,
+/// or a command whose effect the folder's read now shows.
+pub(crate) const WAKE_MESSAGE: u32 = WM_APP + 0x52;
 
 /// The strip an auto-hidden taskbar needs left free, in physical pixels.
 ///
@@ -92,6 +99,8 @@ enum Kind {
     Layer,
     /// A panel's own window, owned by the surface that opened it.
     Popup,
+    /// A secondary window owned by another, and modal over it when asked.
+    Dialog,
 }
 
 /// What the window procedure has collected since the loop last looked.
@@ -189,6 +198,9 @@ pub struct Win32Window {
     pace: Option<std::sync::Arc<crate::frame_pace::FramePace>>,
     /// The surface this popup hangs off; `None` for a window or a layer.
     owner: Option<Owner>,
+    /// The window this dialog is modal over, disabled while the dialog is up and enabled
+    /// again when it goes. `None` for every other kind, and for a non-modal dialog.
+    dialog_parent: Option<HWND>,
 }
 
 /// The surface a popup hangs off: the window that places and carries it.
@@ -209,8 +221,61 @@ impl Win32Window {
         let opening = match &spec.role {
             SurfaceRole::Window { size } => opening_window(*size)?,
             SurfaceRole::Layer(layer) => opening_layer(layer)?,
+            SurfaceRole::Dialog { .. } => {
+                return Err(WindowError::Win32(String::from(
+                    "a dialog opens through the surface it belongs to",
+                )));
+            }
         };
-        Self::build(spec, opening, None)
+        Self::build(spec, opening, None, None, None)
+    }
+
+    /// A dialog's own window, owned by `parent` and centred on it.
+    ///
+    /// Ownership is what keeps it above its parent, out of the taskbar, and closed with it.
+    /// A modal dialog also disables the parent; `Drop` re-enables it, so a dialog that
+    /// closes itself, is closed by its parent, or fails to open leaves no disabled window
+    /// behind.
+    pub fn new_dialog(parent: &Win32Window, spec: SurfaceSpec) -> Result<Self, WindowError> {
+        Self::open_dialog(parent, spec, WS_OVERLAPPEDWINDOW)
+    }
+
+    /// A panel's window: framed and owned like a dialog, but with no sizing border, because
+    /// its size is its content's and the user must not drag it away from that.
+    pub fn new_panel_dialog(
+        parent: &Win32Window,
+        spec: SurfaceSpec,
+    ) -> Result<Self, WindowError> {
+        Self::open_dialog(parent, spec, WS_CAPTION | WS_SYSMENU)
+    }
+
+    fn open_dialog(
+        parent: &Win32Window,
+        spec: SurfaceSpec,
+        style: WINDOW_STYLE,
+    ) -> Result<Self, WindowError> {
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let size = match &spec.role {
+            SurfaceRole::Dialog { size, .. } => *size,
+            _ => return Err(WindowError::Win32(String::from("not a dialog spec"))),
+        };
+        let modal = spec.dialog_modal().unwrap_or(false);
+        let opening = opening_dialog(parent.hwnd, size, style)?;
+        let window = Self::build(
+            spec,
+            opening,
+            None,
+            Some(parent.hwnd),
+            modal.then_some(parent.hwnd),
+        )?;
+        if modal {
+            // The platform half of modality; the host also filters the parent's events,
+            // because a client that trusts only this would still see them on Wayland.
+            let _ = unsafe { EnableWindow(parent.hwnd, false) };
+        }
+        Ok(window)
     }
 
     /// A panel's own window: undecorated, owned by `parent`, and holding the mouse.
@@ -245,7 +310,7 @@ impl Win32Window {
             keyboard: None,
             alpha: crate::presenter::Alpha::Premultiplied,
         };
-        let window = Self::build(spec, opening, Some((owner, popup)))?;
+        let window = Self::build(spec, opening, Some((owner, popup)), Some(parent.hwnd), None)?;
         // The grab outlives the press that opened the panel: it is released on close, or when
         // the panel's own child takes it.
         let _ = unsafe { SetCapture(window.hwnd) };
@@ -292,6 +357,8 @@ impl Win32Window {
         surface: SurfaceSpec,
         opening: Opening,
         owner: Option<(Owner, PopupSpec)>,
+        z_order_owner: Option<HWND>,
+        dialog_parent: Option<HWND>,
     ) -> Result<Self, WindowError> {
         let app_id = if surface.app_id.is_empty() {
             "crabsnap"
@@ -328,7 +395,7 @@ impl Win32Window {
                 opening.y,
                 opening.width,
                 opening.height,
-                owner.as_ref().map(|(owner, _)| owner.hwnd),
+                z_order_owner,
                 None,
                 Some(instance),
                 Some(raw as *const core::ffi::c_void),
@@ -378,7 +445,7 @@ impl Win32Window {
         // The return value says whether the window was previously visible, which is not
         // an outcome this backend has a use for.
         unsafe {
-            let command = if opening.kind == Kind::Window {
+            let command = if matches!(opening.kind, Kind::Window | Kind::Dialog) {
                 SW_SHOW
             } else {
                 // Showing a layer or a panel must not take the keyboard from what it covers.
@@ -394,8 +461,8 @@ impl Win32Window {
                 let _ = SetForegroundWindow(hwnd);
             }
         }
-        if opening.kind == Kind::Window {
-            // Only a window the manager frames has a caption.
+        if matches!(opening.kind, Kind::Window | Kind::Dialog) {
+            // Only a framed window has a caption, and a dialog is framed the same way.
             theme_caption(hwnd);
         }
         // OLE hands every drag over this window to the target; its callbacks only queue
@@ -416,6 +483,7 @@ impl Win32Window {
             alpha: opening.alpha,
             pace: None,
             owner,
+            dialog_parent,
         })
     }
 
@@ -475,21 +543,17 @@ impl Win32Window {
     /// own resize is what the frame loop sees afterwards.
     pub fn set_client_size(&self, size: (u32, u32)) -> Result<(), WindowError> {
         let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96);
+        // The frame this window really has: a dialog without a sizing border measures
+        // smaller than WS_OVERLAPPEDWINDOW, and the difference shows as a blank strip.
+        let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(self.hwnd, GWL_STYLE) } as u32);
+        let ex_style = WINDOW_EX_STYLE(unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) } as u32);
         let mut frame = RECT {
             left: 0,
             top: 0,
             right: size.0.max(1) as i32,
             bottom: size.1.max(1) as i32,
         };
-        unsafe {
-            AdjustWindowRectExForDpi(
-                &mut frame,
-                WS_OVERLAPPEDWINDOW,
-                false,
-                WINDOW_EX_STYLE(0),
-                dpi,
-            )
-        }
+        unsafe { AdjustWindowRectExForDpi(&mut frame, style, false, ex_style, dpi) }
         .map_err(|error| WindowError::Win32(format!("AdjustWindowRectExForDpi: {error}")))?;
         unsafe {
             SetWindowPos(
@@ -537,6 +601,33 @@ impl Win32Window {
         if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
     }
 
+    /// The monitor's work area, in this window's client coordinates and logical units.
+    ///
+    /// This is the output a panel must fit: the engine places platform panels against it,
+    /// so the surface the host opens for one stands where the tree's geometry says it does.
+    pub fn work_area(&self) -> Option<Rect> {
+        let mut origin = POINT::default();
+        if !unsafe { ClientToScreen(self.hwnd, &mut origin) }.as_bool() {
+            return None;
+        }
+        let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..MONITORINFO::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return None;
+        }
+        let scale = self.scale();
+        let work = info.rcWork;
+        Some(Rect::new(
+            (work.left - origin.x) as f32 / scale,
+            (work.top - origin.y) as f32 / scale,
+            (work.right - work.left) as f32 / scale,
+            (work.bottom - work.top) as f32 / scale,
+        ))
+    }
+
     /// The pointer in logical units, once it has entered the client area.
     pub fn pointer(&self) -> Option<Point> {
         self.state.borrow().pointer
@@ -571,6 +662,24 @@ impl Win32Window {
         // pointer events of the turn ahead of the drag state they produced.
         events.extend(self.drag.take());
         events
+    }
+
+    /// The wheel steps queued since the last call, in arrival order.
+    ///
+    /// A system drag runs its own modal loop on this thread, so a wheel that arrives
+    /// mid-gesture would wait for the turn after the drop; the drag's frame pump takes
+    /// these and leaves the pointer's own messages for that turn.
+    pub(crate) fn take_wheel_events(&mut self) -> Vec<Event> {
+        let mut state = self.state.borrow_mut();
+        let mut wheel = Vec::new();
+        state.events.retain(|event| match event {
+            Event::Scroll { .. } => {
+                wheel.push(event.clone());
+                false
+            }
+            _ => true,
+        });
+        wheel
     }
 
     /// Publish what dropping the drag under the pointer would do, for OLE's own answer.
@@ -813,12 +922,15 @@ impl Win32Window {
         crate::clipboard::write(Some(self.hwnd), &content)
     }
 
-    /// Read the clipboard into a paste event; false when it holds no text.
+    /// Read the clipboard into a paste event; false when it holds nothing this app reads.
     pub fn request_paste(&mut self) -> bool {
-        let Some(text) = crate::clipboard::read_text(Some(self.hwnd)) else {
+        let Some(content) = crate::clipboard::read_paste(Some(self.hwnd)) else {
             return false;
         };
-        self.state.borrow_mut().events.push(Event::Paste(text));
+        self.state
+            .borrow_mut()
+            .events
+            .push(Event::Paste(content));
         true
     }
 }
@@ -871,6 +983,49 @@ fn opening_window(size: (u32, u32)) -> Result<Opening, WindowError> {
         ex_style: WS_EX_NOREDIRECTIONBITMAP,
         dpi,
         kind: Kind::Window,
+        keyboard: None,
+        alpha: crate::presenter::Alpha::Opaque,
+    })
+}
+
+/// A framed window centred on `parent`, sized for `size` logical pixels.
+///
+/// The system frames and decorates a dialog like a window; ownership, not the style, is
+/// what keeps it above the surface that opened it.
+fn opening_dialog(
+    parent: HWND,
+    size: (u32, u32),
+    style: WINDOW_STYLE,
+) -> Result<Opening, WindowError> {
+    let dpi = unsafe { GetDpiForWindow(parent) }.max(96);
+    let scale = dpi as f32 / 96.0;
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: (size.0 as f32 * scale).round().max(1.0) as i32,
+        bottom: (size.1 as f32 * scale).round().max(1.0) as i32,
+    };
+    unsafe {
+        AdjustWindowRectExForDpi(&mut frame, style, false, WS_EX_NOREDIRECTIONBITMAP, dpi)
+    }
+    .map_err(|error| WindowError::Win32(format!("AdjustWindowRectExForDpi: {error}")))?;
+    let width = frame.right - frame.left;
+    let height = frame.bottom - frame.top;
+    let mut bounds = RECT::default();
+    unsafe { GetWindowRect(parent, &mut bounds) }.map_err(|error| {
+        WindowError::Win32(format!("GetWindowRect the parent's rectangle: {error}"))
+    })?;
+    let x = bounds.left + ((bounds.right - bounds.left) - width) / 2;
+    let y = bounds.top + ((bounds.bottom - bounds.top) - height) / 2;
+    Ok(Opening {
+        x,
+        y,
+        width,
+        height,
+        style,
+        ex_style: WS_EX_NOREDIRECTIONBITMAP,
+        dpi,
+        kind: Kind::Dialog,
         keyboard: None,
         alpha: crate::presenter::Alpha::Opaque,
     })
@@ -972,10 +1127,11 @@ fn opening_layer(layer: &LayerSpec) -> Result<Opening, WindowError> {
     })
 }
 
-/// Where a popup goes, in physical screen pixels, from a request in its owner's client space.
+/// Where a popup goes, in physical screen pixels, from the rect the tree placed it at.
 ///
-/// The work area is the bound, expressed in the same space as the request: the panel may sit
-/// on the desktop beyond its window, so the window's own rectangle is not what it must fit.
+/// The engine constrains the panel against the output before the host opens the surface,
+/// so the request is final: moving it here would leave the input the grab routes back into
+/// the tree pointing at geometry the user is not looking at.
 fn popup_rect(owner: HWND, spec: &PopupSpec) -> Result<RECT, WindowError> {
     let mut origin = POINT::default();
     if !unsafe { ClientToScreen(owner, &mut origin) }.as_bool() {
@@ -983,33 +1139,15 @@ fn popup_rect(owner: HWND, spec: &PopupSpec) -> Result<RECT, WindowError> {
             "ClientToScreen: the owner has no client area",
         )));
     }
-    let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..MONITORINFO::default()
-    };
-    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        return Err(WindowError::Win32(String::from(
-            "GetMonitorInfoW: the monitor's work area was refused",
-        )));
-    }
     let scale = unsafe { GetDpiForWindow(owner) }.max(96) as f32 / 96.0;
-    let work = info.rcWork;
-    let bounds = Rect::new(
-        (work.left - origin.x) as f32 / scale,
-        (work.top - origin.y) as f32 / scale,
-        (work.right - work.left) as f32 / scale,
-        (work.bottom - work.top) as f32 / scale,
-    );
-    let placed = ui_platform::window::place_popup(spec, bounds);
     let at = |value: f32, base: i32| base + (value * scale).round() as i32;
-    let left = at(placed.origin.x, origin.x);
-    let top = at(placed.origin.y, origin.y);
+    let left = at(spec.rect.origin.x, origin.x);
+    let top = at(spec.rect.origin.y, origin.y);
     Ok(RECT {
         left,
         top,
-        right: left + (placed.size.w * scale).round().max(1.0) as i32,
-        bottom: top + (placed.size.h * scale).round().max(1.0) as i32,
+        right: left + (spec.rect.size.w * scale).round().max(1.0) as i32,
+        bottom: top + (spec.rect.size.h * scale).round().max(1.0) as i32,
     })
 }
 
@@ -1101,6 +1239,11 @@ impl Span {
 
 impl Drop for Win32Window {
     fn drop(&mut self) {
+        // A modal dialog disabled its parent; the parent must not outlive it disabled,
+        // whether the dialog was dismissed, closed with its parent, or failed to show.
+        if let Some(parent) = self.dialog_parent {
+            let _ = unsafe { EnableWindow(parent, true) };
+        }
         // The owner must stop carrying a window that is about to go, or its next move would
         // place a handle the shell has already freed.
         if let Some(owner) = &self.owner {
@@ -1204,6 +1347,12 @@ unsafe fn handle(
         }
         WM_CLOSE => {
             state.borrow_mut().close_requested = true;
+            Some(LRESULT(0))
+        }
+        WAKE_MESSAGE => {
+            // A message alone only wakes the pump: it carries no event, so the driver would
+            // sleep again without building the frame that reads what the worker finished.
+            state.borrow_mut().silent_change = true;
             Some(LRESULT(0))
         }
         WM_DESTROY => {
@@ -1424,7 +1573,9 @@ unsafe fn handle(
             let grab = window.grab;
             drop(window);
             // A panel's grab outlives the press: it is what hears the click that dismisses it.
-            if !grab {
+            // A window that does not hold the capture must not take it from the panel that
+            // does: the panel would lose the grab it dismisses with.
+            if !grab && unsafe { GetCapture() } == hwnd {
                 let _ = unsafe { ReleaseCapture() };
             }
             Some(LRESULT(0))
@@ -1461,12 +1612,14 @@ unsafe fn handle(
             // Another window took the mouse: the drag ends where the edges already are.
             window.sizing = None;
             // A panel whose grab a foreign window took cannot hear a dismissal any more, so
-            // it closes now. A panel of its own taking the grab is the nested case, which
-            // keeps the topmost one hearing the pointer.
+            // it closes now. Its own grab set again on a press reports the panel itself as
+            // the gainer, and a panel of its own taking it is the nested case: neither is a
+            // loss, and the topmost one keeps hearing the pointer.
             if window.kind == Kind::Popup && window.grab {
                 let gained = HWND(lparam.0 as *mut core::ffi::c_void);
-                let nested = window.popups.borrow().iter().any(|owned| owned.hwnd == gained);
-                if !nested {
+                let kept = gained == hwnd
+                    || window.popups.borrow().iter().any(|owned| owned.hwnd == gained);
+                if !kept {
                     window.close_requested = true;
                 }
             }
@@ -1622,11 +1775,18 @@ fn theme_caption(hwnd: HWND) {
 /// The spec names a client area in logical units; a tracked size is the whole window, so the
 /// frame is added back through the same adjustment the opening size used.
 fn tracked_minimum(hwnd: HWND, declared: Option<(u32, u32)>) -> (i32, i32) {
-    let system = unsafe { (GetSystemMetrics(SM_CXMINTRACK), GetSystemMetrics(SM_CYMINTRACK)) };
+    // The tracking size is per-DPI: the system-wide figure is the 96-DPI one, and using it
+    // on a scaled display lets a window shrink below what its frame can show.
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let system = unsafe {
+        (
+            GetSystemMetricsForDpi(SM_CXMINTRACK, dpi),
+            GetSystemMetricsForDpi(SM_CYMINTRACK, dpi),
+        )
+    };
     let Some((width, height)) = declared else {
         return system;
     };
-    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let scale = dpi as f32 / 96.0;
     let client = (
         (width as f32 * scale).ceil().max(1.0) as i32,
@@ -1682,7 +1842,17 @@ fn key(state: &RefCell<WindowState>, vk: u16, down: bool) {
         state.modifiers = held;
         state.events.push(Event::Modifiers(held));
     }
-    if let Some(named) = input::named(vk) {
+    if input::menu(vk, held.shift) {
+        state.events.push(if down {
+            Event::KeyPressed {
+                key: ui_core::Key::Menu,
+            }
+        } else {
+            Event::KeyReleased {
+                key: ui_core::Key::Menu,
+            }
+        });
+    } else if let Some(named) = input::named(vk) {
         state.events.push(if down {
             Event::KeyPressed { key: named }
         } else {

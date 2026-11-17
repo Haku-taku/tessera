@@ -227,6 +227,19 @@ impl Text {
         self.size_in(cx).map(|size| size.w)
     }
 
+    /// Whether layout at this text's wrap width would end a line with an ellipsis.
+    ///
+    /// `None` when the host supplied no measurer; a caller with no answer must not claim a
+    /// name was cut.
+    pub fn truncated_in(&self, cx: &crate::cx::Cx<'_, '_>) -> Option<bool> {
+        let decl = self.build(None);
+        let ui_core::NodeData::Text { block, .. } = &decl.data else {
+            return None;
+        };
+        let layout = cx.text_layout(block, self.max_width)?;
+        Some(layout.lines.iter().any(|line| line.ellipsis))
+    }
+
     fn build(&self, selection: Option<ui_core::SelectionPrim>) -> Decl {
         Decl {
             id: self.id,

@@ -1465,6 +1465,7 @@ impl TextPass {
             if !slice.is_empty() {
                 self.shape_line(
                     slice,
+                    body.len(),
                     &prep.spans,
                     range.start,
                     baseline,
@@ -1897,6 +1898,7 @@ impl TextPass {
         if !body.is_empty() {
             self.shape_line(
                 body,
+                body.len(),
                 &prep.spans,
                 range.start,
                 baseline,
@@ -2518,6 +2520,7 @@ impl TextPass {
     fn shape_line(
         &mut self,
         line: &str,
+        body_len: usize,
         spans: &[ui_core::Span],
         base: usize,
         baseline: f32,
@@ -2532,6 +2535,10 @@ impl TextPass {
         mut bounds: Option<&mut Vec<Boundary>>,
         paragraph_rtl: bool,
     ) -> f32 {
+        // `line` is the block's own text, plus a truncation ellipsis the painter appended.
+        // Every offset the blocks below clamp against is the body's: the ellipsis has no
+        // byte in the source, and cutting a span at an offset inside it lands mid-glyph.
+        let body_end = base + body_len.min(line.len());
         let end = base + line.len();
         // Bidi is a property of the whole line, and the line's direction is its paragraph's:
         // cutting at a span boundary or a selection edge must not restart either, or the
@@ -2549,17 +2556,17 @@ impl TextPass {
                 .position(|run| run.range.contains(&offset.saturating_sub(base)))
                 .unwrap_or(0)
         };
+        // Selection beats the run's ink, the run beats the node's: a selected link inverts.
+        let ink_of = |at: usize| match ink_override {
+            Some((range, colour)) if range.start <= at && at < range.end => *colour,
+            _ => ui_core::TextBlock::ink_at(spans, at).unwrap_or(ink),
+        };
         // Pieces in logical order. An atom is a piece with no glyph, so the pen still steps
         // over its box; it is painted from the layout, not from a shape.
         let mut pieces: Vec<(usize, usize, ui_core::TextStyle, ui_core::Color)> = Vec::new();
         let mut cursor = base;
-        while cursor < end {
+        while cursor < body_end {
             let style = ui_core::TextBlock::style_at(spans, cursor);
-            // Selection beats the run's ink, the run beats the node's: a selected link inverts.
-            let ink_of = |at: usize| match ink_override {
-                Some((range, colour)) if range.start <= at && at < range.end => *colour,
-                _ => ui_core::TextBlock::ink_at(spans, at).unwrap_or(ink),
-            };
             if let Some(atom) = layout.atoms.iter().find(|atom| atom.at == cursor) {
                 pieces.push((cursor, cursor + atom.len, style, ink));
                 cursor += atom.len;
@@ -2568,11 +2575,11 @@ impl TextPass {
             let span_end = spans
                 .iter()
                 .find(|s| s.range.contains(&cursor))
-                .map_or(end, |s| s.range.end.min(end));
+                .map_or(body_end, |s| s.range.end.min(body_end));
             let run_end = runs
                 .iter()
                 .find(|run| run.range.contains(&(cursor - base)))
-                .map_or(end, |run| base + run.range.end);
+                .map_or(body_end, |run| (base + run.range.end).min(body_end));
             // Stop the piece at the next atom so its U+FFFC is never shaped, and at the
             // run's own end so no piece straddles two directions.
             let next_atom = layout
@@ -2581,10 +2588,10 @@ impl TextPass {
                 .filter(|atom| atom.at > cursor)
                 .map(|atom| atom.at)
                 .min()
-                .unwrap_or(end);
+                .unwrap_or(body_end);
             let piece_end = span_end
                 .max(cursor + 1)
-                .min(end)
+                .min(body_end)
                 .min(next_atom.max(cursor + 1))
                 .min(run_end.max(cursor + 1));
             // Split at the selection boundary so the override ink covers exactly its bytes.
@@ -2603,6 +2610,12 @@ impl TextPass {
             }
             pieces.push((from, piece_end, style, ink_of(from)));
             cursor = piece_end;
+        }
+        // The ellipsis is drawn in the style of the text it replaces, and belongs to the
+        // line's visual end: its own piece, so bidi orders it like the run tail it stands in.
+        if body_end < end {
+            let style = ui_core::TextBlock::style_at(spans, body_end);
+            pieces.push((body_end, end, style, ink_of(body_end)));
         }
         // A gap opens between two shaped pieces, so a piece that spans one would shape its
         // word pair as a single run and could never make room inside it.
@@ -2659,7 +2672,9 @@ impl TextPass {
             // An atom occupies the bytes it stands for: no glyph, but it paints its box and
             // moves the pen past its width, with both edges still caret positions. It is
             // read before the collapse branch because those bytes are unpainted by design.
-            if let Some(atom) = layout.atoms.iter().find(|atom| atom.at == start) {
+            if start < body_end
+                && let Some(atom) = layout.atoms.iter().find(|atom| atom.at == start)
+            {
                 // The layout knows nothing of gaps, so the atom's own x is shifted here.
                 let shift: f32 = gaps
                     .iter()
@@ -2756,6 +2771,12 @@ impl TextPass {
             } else {
                 None
             };
+            // The ellipsis stands at no source byte, so it adds no caret position.
+            let piece_bounds = if start < body_end {
+                bounds.as_deref_mut()
+            } else {
+                None
+            };
             pen_x += self.shape_span(
                 slice,
                 start - base,
@@ -2765,7 +2786,7 @@ impl TextPass {
                 scale,
                 piece_ink,
                 glyphs,
-                bounds.as_deref_mut(),
+                piece_bounds,
                 paragraph_rtl,
             );
             pen_x += gap_after;

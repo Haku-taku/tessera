@@ -69,18 +69,14 @@ impl FramePace {
     /// Consume a signal that is already set without blocking; true when there was one.
     ///
     /// The host's wait can return on the event; consuming it there keeps the next wake
-    /// meaningful. The render thread already recorded readiness when it set the event.
+    /// meaningful. It opens no gate: `finished` records readiness before it sets the event,
+    /// and a signal the loop sent a frame after is an older frame's, not this one's.
     pub(crate) fn take_signal(&self) -> bool {
         let Some(handle) = self.handle() else {
             return false;
         };
         // SAFETY: the event belongs to this object for as long as it is held.
-        if unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0 {
-            self.ready.store(true, Ordering::Release);
-            true
-        } else {
-            false
-        }
+        (unsafe { WaitForSingleObject(handle, 0) }) == WAIT_OBJECT_0
     }
 }
 
@@ -91,5 +87,26 @@ impl Drop for FramePace {
             // Nothing else waits on it: every holder is an `Arc` that is gone by now.
             let _ = unsafe { CloseHandle(HANDLE(raw as *mut core::ffi::c_void)) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame the loop sent while the previous one's signal was still set must keep the
+    /// gate shut: building over a frame the render thread has not taken throws that frame
+    /// away, and with it the atlas page it carried.
+    #[test]
+    fn a_signal_from_the_previous_frame_does_not_open_the_gate() {
+        let pace = FramePace::new();
+        pace.presented();
+        pace.finished();
+        assert!(pace.can_draw());
+        // The next frame goes out before the host consumed the last signal, which is what
+        // a turn that had input to dispatch does.
+        pace.presented();
+        assert!(pace.take_signal(), "the stale signal is there to be drained");
+        assert!(!pace.can_draw(), "the frame just sent is still in flight");
     }
 }

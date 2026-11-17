@@ -15,10 +15,20 @@ const DEFAULT_PATH: &str = "/home/ollie/Pictures/Wallpapers/140959926_p0.png";
 /// Register the wallpaper. A missing or undecodable file leaves the window's flat surface,
 /// because the gallery must still run on a machine that does not have this photo.
 pub fn install(lp: &mut AppLoop<Gallery>) {
+    if let Some(entry) = entry() {
+        lp.register_image(entry);
+    }
+}
+
+/// The photo as an entry a host can open a surface with, if the file can be read.
+pub fn entry() -> Option<ImageEntry> {
     let path = std::env::var("GALLERY_WALLPAPER").unwrap_or_else(|_| DEFAULT_PATH.to_string());
     match decode(&path) {
-        Some(entry) => lp.register_image(entry),
-        None => eprintln!("wallpaper: {path} could not be read; the window keeps its flat surface"),
+        Some(entry) => Some(entry),
+        None => {
+            eprintln!("wallpaper: {path} could not be read; the window keeps its flat surface");
+            None
+        }
     }
 }
 

@@ -97,6 +97,7 @@ impl FluentToolTip {
                 tint: recipe.tint,
                 luminosity: recipe.luminosity,
                 noise: recipe.noise,
+                fallback: recipe.fallback,
             },
             blur_sigma: recipe.blur_sigma,
             alpha,

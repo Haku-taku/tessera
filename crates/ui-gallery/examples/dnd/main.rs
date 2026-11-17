@@ -162,7 +162,8 @@ impl App for Dnd {
 
     fn changed(&mut self, id: Id, change: Change) -> bool {
         match change {
-            Change::DroppedOn(data) => {
+            Change::DroppedOn(report) => {
+                let data = &report.data;
                 let what = data
                     .text()
                     .map(|text| text.lines().next().unwrap_or_default().to_owned())
@@ -176,7 +177,7 @@ impl App for Dnd {
                 true
             }
             // The source side: another app took the payload, or the gesture was cancelled.
-            Change::Dropped(None) => {
+            Change::Dropped { target: None, .. } => {
                 if let Some(name) = NAMES.iter().find(|name| source_id(name) == id) {
                     self.log.insert(0, format!("{name} left the app"));
                 }

@@ -289,8 +289,6 @@ const ADAPTER: &[(CommonColor, &str)] = &[
     (CommonColor::TextSelection, "primary"),
     (CommonColor::Divider, "outline_variant"),
     (CommonColor::Stroke, "outline"),
-    (CommonColor::SurfaceHover, "surface_container_high"),
-    (CommonColor::SurfacePressed, "surface_container_highest"),
     (CommonColor::SurfaceSelected, "secondary_container"),
     (CommonColor::Error, "error"),
     (CommonColor::OnError, "on_error"),
@@ -310,6 +308,24 @@ impl StyleSystem for Md3Scheme {
     }
 
     fn common_colour(&self, role: CommonColor) -> Resolution<Resolved<Rgba>> {
+        // Material's hover and pressed are state layers over whatever is beneath, not
+        // container tokens. Mapping them onto `surface_container_high` made a row inside a
+        // dialog — itself `surface_container_high` — highlight to the colour it already had,
+        // and on the sidebar it painted a solid block instead of a wash.
+        if matches!(role, CommonColor::SurfaceHover | CommonColor::SurfacePressed) {
+            let Some(native) = Role::by_name("on_surface") else {
+                return Resolution::Unmapped;
+            };
+            let alpha = if role == CommonColor::SurfaceHover {
+                20 // 8% of 255
+            } else {
+                26 // 10% of 255
+            };
+            return Resolution::Value(Resolved::new(
+                self.color(native).with_alpha(alpha),
+                Source::Spec("m3 state layers: onSurface @ 8% hover, 10% pressed"),
+            ));
+        }
         let Some((_, name)) = ADAPTER.iter().find(|(r, _)| *r == role) else {
             return Resolution::Absent(Reason::NotAConcept);
         };
@@ -378,6 +394,34 @@ mod tests {
 
     fn tone(s: &Md3Scheme, role: &str) -> f64 {
         s.tone_of(Role::by_name(role).unwrap())
+    }
+
+    // A state layer is a wash of `on_surface`; an opaque container hides what it highlights.
+    #[test]
+    fn the_state_layers_are_translucent_and_take_their_ink_from_on_surface() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let system = scheme(appearance);
+            let ink = system
+                .common_colour(CommonColor::OnSurface)
+                .value()
+                .expect("on_surface resolves");
+            for role in [CommonColor::SurfaceHover, CommonColor::SurfacePressed] {
+                let layer = system
+                    .common_colour(role)
+                    .value()
+                    .unwrap_or_else(|| panic!("{role:?} resolves"))
+                    .value;
+                assert!(
+                    layer.alpha() < 0xff,
+                    "{role:?} in {appearance:?} is opaque"
+                );
+                assert_eq!(
+                    layer.argb() & 0x00ff_ffff,
+                    ink.value.argb() & 0x00ff_ffff,
+                    "{role:?} in {appearance:?} does not wash the content ink"
+                );
+            }
+        }
     }
 
     // The documented defaults: primary 40, onPrimary 100, light surface 98, dark surface 6.

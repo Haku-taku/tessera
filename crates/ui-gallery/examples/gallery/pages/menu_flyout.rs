@@ -1,6 +1,6 @@
 // The menu flyout page.
 
-use ui_core::layout::Anchor;
+use ui_core::layout::{Anchor, Presentation};
 use ui_widgets_fluent::{MenuFlyoutEntry, MenuFlyoutItem, MenuFlyoutParams};
 use ui_widgets_glass::{
     GlassButton, GlassButtonParams, GlassMenu, GlassMenuEntry, GlassMenuParams, GlassPopover,
@@ -150,7 +150,13 @@ pub(crate) fn menu_flyout_page(g: &Gallery, cx: &mut Cx<'_, '_>) -> Box<dyn Elem
 
     let mut scoped = cx.at_scope(style_env("fluent"));
     let params = MenuFlyoutParams::new(menu_flyout_id(), Anchor::Node(menu_anchor_id()), &entries)
-        .open(g.menu_open);
+        .open(g.menu_open)
+        // A host can give the panel a surface of its own, so a menu near the window's edge
+        // keeps its whole height; a single-window session paints it in the parent instead.
+        .presentation(match g.host {
+            true => Presentation::Platform,
+            false => Presentation::Parent,
+        });
     let control = g.fluent.menu_flyout(params, &mut scoped);
     body = body.child(scoped.element(control));
 

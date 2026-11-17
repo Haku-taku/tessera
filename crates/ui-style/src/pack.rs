@@ -125,6 +125,21 @@ impl Style {
             .unwrap_or(fallback)
     }
 
+    /// A cross-system role as the colour of a surface that has to hide what it covers.
+    ///
+    /// WinUI expresses a raised surface as a tint over the page — its card fill is white at
+    /// five percent — which reads as coloured glass when it covers text rather than the
+    /// page. A menu or a dialog composites the role over `Surface`, which is what the
+    /// system's own compositor does, so the result is opaque whatever the pack's alpha.
+    pub fn opaque_or(
+        &self,
+        role: ui_design::CommonColor,
+        fallback: ui_core::geom::Color,
+    ) -> ui_core::geom::Color {
+        let base = self.colour_or(ui_design::CommonColor::Surface, fallback);
+        self.colour_or(role, base).over(base)
+    }
+
     /// What the pack may draw given what the backend can do.
     pub fn frost_allowed(&self, device: Capability) -> bool {
         device.supports_frost()

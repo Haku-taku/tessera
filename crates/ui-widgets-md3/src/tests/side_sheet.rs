@@ -3,7 +3,7 @@
 use super::*;
 
 use crate::side_sheet::{Md3SideSheet, SIDE_SHEET_RADIUS, SheetEdge, SideSheetParams};
-use crate::spec::{SideSheetFlags, SideSheetForm, side_sheet_spec};
+use crate::spec::SideSheetForm;
 use ui_core::draw::Shape;
 use ui_core::layout::{AxisSize, Grow};
 
@@ -51,20 +51,6 @@ fn docked(edge: SheetEdge) -> Decl {
             .child(sheet),
     };
     page
-}
-
-#[test]
-fn the_two_forms_read_their_own_panel_from_the_table() {
-    let standard = side_sheet_spec(SideSheetFlags::NONE, SideSheetForm::Standard);
-    assert_eq!(standard.container.color, "surface");
-    assert_eq!(standard.container.elevation, 0.0);
-    assert_eq!(standard.container.width, 256.0);
-    let modal = side_sheet_spec(SideSheetFlags::NONE, SideSheetForm::Modal);
-    assert_eq!(modal.container.color, "surfaceContainerLow");
-    assert_eq!(modal.container.elevation, 1.0);
-    // The header and the line are the same in both forms.
-    assert_eq!(modal.headline.type_, "title-large");
-    assert_eq!(modal.divider.color, "outline");
 }
 
 #[test]

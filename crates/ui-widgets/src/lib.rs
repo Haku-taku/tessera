@@ -6,11 +6,13 @@ pub mod button;
 pub mod cx;
 pub mod fingerprint;
 pub mod group;
+pub mod file_icon;
 pub mod icon;
 mod icon_codepoints;
 pub mod list;
 pub mod markdown;
 pub mod math;
+pub mod pressable;
 pub mod scaffold;
 pub mod scroll;
 mod sf_symbol_codepoints;
@@ -25,12 +27,14 @@ pub mod widget;
 pub use button::Button;
 pub use cx::{Cx, NodeCx};
 pub use group::GroupPosition;
+pub use file_icon::file_icon;
 pub use icon::{Icon, IconSet, IconSource, SF_SYMBOLS_FAMILY};
 pub use list::List;
 pub use markdown::{
     CodeHeight, CodeOptions, CodeStyle, ImageSource, ImageTexture, Markdown, MathEditing,
 };
 pub use math::{Math, MathErrorStyle};
+pub use pressable::Pressable;
 pub use scaffold::ScaffoldSpec;
 pub use scroll::{RowHeights, RowWindow, Scroll};
 pub use shortcut::{modifiers_label, shortcut_label, shortcut_label_in};

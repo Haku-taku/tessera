@@ -28,12 +28,24 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 memmap2 = "0.9"
 xkbcommon = "0.8"
 tempfile = "3"
+log = "0.4"
 # Pipes and poll for the clipboard: a paste is a pipe read the event loop must not block on.
-rustix = { version = "1", features = ["event", "net", "pipe"] }
+# `fs` is the inotify face behind a live directory watch.
+rustix = { version = "1", features = ["event", "fs", "net", "pipe"] }
 # D-Bus client for the XDG portals: the settings object behind the light/dark preference, and
 # the GlobalShortcuts transport. This crate is Linux's platform layer, so D-Bus is part of it;
 # which hotkey transport runs is still decided at runtime.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# The freedesktop thumbnail cache is named by the MD5 of the file URI, and the URI escapes
+# every byte a URI does not carry; both are the standard's, not ours.
+md-5 = "0.10"
+percent-encoding = "2"
+# Cache entries are PNG with `tEXt` metadata. Nothing here decodes a *file*: the pictures come
+# from the desktop's own thumbnailers, so the framework bundles no codec for any file type.
+png = "0.18"
+# The desktop's file-type icons, from its icon theme. Optional: the reader carries an SVG
+# renderer, and a build without a picker should not link one.
+ui-icon-theme = { path = "../ui-icon-theme", optional = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
@@ -45,6 +57,7 @@ gpu = ["dep:ui-paint-gpu", "dep:ui-gpu-egl"]
 # Times the present path; the gallery's own `profile` feature turns it on.
 profile = ["dep:hotpath", "hotpath/hotpath", "ui-paint-gpu?/profile"]
 global-hotkeys = []
+file-icons = ["dep:ui-icon-theme"]
 default = ["global-hotkeys"]
 system-fonts = ["ui-text-fontique/system", "ui-platform/system-fonts"]
 

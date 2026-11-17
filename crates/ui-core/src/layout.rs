@@ -342,9 +342,13 @@ pub enum Presentation {
     /// The parent's surface, laid out against it and clamped into its viewport.
     #[default]
     Parent,
-    /// A surface of the platform's own: measured here as content, positioned there
-    /// against an output this tree knows nothing about.
+    /// A surface of the platform's own: measured here as content and placed against the
+    /// output the tree was given, because the surface must stand where the tree says.
     Platform,
+    /// A window of the platform's own rather than a popup: it carries its own frame, takes
+    /// the keyboard like any window, and stands until the app stops declaring it. The rect
+    /// is the panel's measured size, not a place the platform must hold it at.
+    Window,
 }
 
 /// An anchored overlay: where it unfolds from, how far off, and what to do at an edge.
@@ -368,11 +372,168 @@ pub struct OverlayPlacement {
     pub presentation: Presentation,
 }
 
+/// What an anchored placement may do when the panel does not fit its bounds.
+///
+/// The set is `xdg_positioner`'s, and the tree and the backends apply one rule: a surface
+/// that stood anywhere else would map the input its grab routes back into the tree wrongly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fit {
+    /// Mirror to the anchor's other side.
+    pub flip_along: bool,
+    /// Mirror to the anchor's other end along the cross axis.
+    pub flip_across: bool,
+    pub slide_x: bool,
+    pub slide_y: bool,
+}
+
+impl Fit {
+    /// Leave the request alone; the bounds' edge cuts the panel.
+    pub const NONE: Self = Self {
+        flip_along: false,
+        flip_across: false,
+        slide_x: false,
+        slide_y: false,
+    };
+
+    /// Flip first, then slide. No resize: the size is the layout result.
+    pub const FLIP_AND_SLIDE: Self = Self {
+        flip_along: true,
+        flip_across: true,
+        slide_x: true,
+        slide_y: true,
+    };
+}
+
+/// Where an anchored panel lands: the preferred placement, adjusted against `bounds`.
+///
+/// `bounds` is the space the panel must stay inside, in the anchor's own coordinates: the
+/// layout gives it the surface's output, and a backend that has no positioner of its own
+/// would give it the monitor's work area instead.
+pub fn place_anchored(
+    anchor: Rect,
+    size: crate::geom::Size,
+    side: Side,
+    align: OverlayAlign,
+    offset: f32,
+    fit: Fit,
+    bounds: Rect,
+) -> Rect {
+    let vertical = matches!(side, Side::Below | Side::Above);
+    let mut side = side;
+    let mut rect = preferred(anchor, size, side, align, offset);
+
+    // Flipping along the unfolding axis changes which side of the anchor the panel is on.
+    if fit.flip_along && !fits(rect, bounds, vertical) {
+        let flipped = opposite(side);
+        let alternative = preferred(anchor, size, flipped, align, offset);
+        if overflow(alternative, bounds, vertical) < overflow(rect, bounds, vertical) {
+            side = flipped;
+            rect = alternative;
+        }
+    }
+    // The cross axis has no other side, only the anchor's other end.
+    if fit.flip_across
+        && !fits(rect, bounds, !vertical)
+        && let Some(align) = flipped_align(align)
+    {
+        let alternative = preferred(anchor, size, side, align, offset);
+        if overflow(alternative, bounds, !vertical) < overflow(rect, bounds, !vertical) {
+            rect = alternative;
+        }
+    }
+    if fit.slide_x {
+        rect.origin.x = slide(rect.origin.x, rect.size.w, bounds.min_x(), bounds.max_x());
+    }
+    if fit.slide_y {
+        rect.origin.y = slide(rect.origin.y, rect.size.h, bounds.min_y(), bounds.max_y());
+    }
+    rect
+}
+
+/// The placement the side, alignment and offset ask for, before any adjustment.
+fn preferred(anchor: Rect, size: crate::geom::Size, side: Side, align: OverlayAlign, offset: f32) -> Rect {
+    let (x, y) = match side {
+        Side::Below => (
+            along(anchor.min_x(), anchor.size.w, size.w, align),
+            anchor.max_y() + offset,
+        ),
+        Side::Above => (
+            along(anchor.min_x(), anchor.size.w, size.w, align),
+            anchor.min_y() - offset - size.h,
+        ),
+        Side::Right => (
+            anchor.max_x() + offset,
+            along(anchor.min_y(), anchor.size.h, size.h, align),
+        ),
+        Side::Left => (
+            anchor.min_x() - offset - size.w,
+            along(anchor.min_y(), anchor.size.h, size.h, align),
+        ),
+    };
+    Rect::from_origin_size(crate::geom::Point::new(x, y), size)
+}
+
+fn along(start: f32, span: f32, length: f32, align: OverlayAlign) -> f32 {
+    match align {
+        OverlayAlign::Start => start,
+        OverlayAlign::Center => start + (span - length) * 0.5,
+        OverlayAlign::End => start + span - length,
+    }
+}
+
+fn opposite(side: Side) -> Side {
+    match side {
+        Side::Below => Side::Above,
+        Side::Above => Side::Below,
+        Side::Left => Side::Right,
+        Side::Right => Side::Left,
+    }
+}
+
+/// A centered panel has no other end to move to; only sliding can help it.
+fn flipped_align(align: OverlayAlign) -> Option<OverlayAlign> {
+    match align {
+        OverlayAlign::Start => Some(OverlayAlign::End),
+        OverlayAlign::End => Some(OverlayAlign::Start),
+        OverlayAlign::Center => None,
+    }
+}
+
+fn fits(rect: Rect, bounds: Rect, vertical: bool) -> bool {
+    let (start, end) = axis(rect, vertical);
+    let (low, high) = axis(bounds, vertical);
+    start >= low && end <= high
+}
+
+fn overflow(rect: Rect, bounds: Rect, vertical: bool) -> f32 {
+    let (start, end) = axis(rect, vertical);
+    let (low, high) = axis(bounds, vertical);
+    (low - start).max(0.0) + (end - high).max(0.0)
+}
+
+fn axis(rect: Rect, vertical: bool) -> (f32, f32) {
+    if vertical {
+        (rect.min_y(), rect.max_y())
+    } else {
+        (rect.min_x(), rect.max_x())
+    }
+}
+
+/// Move `value` the least distance that puts `length` inside `low..=high`.
+fn slide(value: f32, length: f32, low: f32, high: f32) -> f32 {
+    if length >= high - low {
+        low
+    } else {
+        value.clamp(low, high - length)
+    }
+}
+
 /// A panel the layout pass measured for a surface of the platform's own.
 ///
-/// The rect is where the panel would be if its parent painted it: the platform may put
-/// the surface somewhere else entirely, so this is a request, not a position.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// The rect is where the surface must stand: it was placed against the output the tree was
+/// given, so a platform that routes the surface's input back into the tree shifts every
+/// position by that same origin. A platform that moved it would leave the two disagreeing.
+#[derive(Clone, Debug, PartialEq)]
 pub struct PlatformPanel {
     /// The panel subtree's root, laid out in the parent tree.
     pub node: crate::id::NodeId,
@@ -383,6 +544,10 @@ pub struct PlatformPanel {
     pub side: Side,
     pub align: OverlayAlign,
     pub offset: f32,
+    /// Whether the surface is a window rather than a popup.
+    pub window: bool,
+    /// The title a window surface carries; a popup never uses it.
+    pub title: Option<String>,
 }
 
 impl OverlayPlacement {

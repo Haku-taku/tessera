@@ -42,29 +42,6 @@ mod token_parity;
 mod toolbar;
 mod tooltip;
 
-/// The track *fill*: the 52×32 box. An outlined switch paints a 2pt wider ring before it, so
-/// the fill is not always the first shape, but it is always the first 52×32 rect.
-/// The fill colour of a rect shape (transparent for non-rects).
-fn shape_fill(shape: &ui_core::draw::Shape) -> Color {
-    match shape {
-        ui_core::draw::Shape::Rect { fill, .. } => *fill,
-        _ => Color::TRANSPARENT,
-    }
-}
-
-fn track_shape(decl: &Decl) -> &ui_core::draw::Shape {
-    decl.shapes
-        .iter()
-        .find(|s| match s {
-            ui_core::draw::Shape::Rect { rect, .. } => {
-                (rect.size.w - crate::toggle::TRACK.0).abs() < 0.01
-                    && (rect.size.h - crate::toggle::TRACK.1).abs() < 0.01
-            }
-            _ => false,
-        })
-        .expect("the track fill is the 52x32 rect")
-}
-
 /// Rest sizes, as if nothing was ever pressed.
 /// A content widget that knows nothing but its own fixed square.
 struct Square {

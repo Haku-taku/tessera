@@ -1,25 +1,31 @@
 //! One engine-owned session: window, presenter, driver and teardown order.
 
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ui_core::geom::Point;
+use ui_platform::chooser::{
+    ChooserAnswer, ChooserCapabilities, ChooserError, ChooserId, ChooserRequest,
+};
 #[cfg(feature = "gpu")]
 use ui_core::timed;
 use ui_platform::clipboard::{ClipboardCommand, ClipboardCopy, ClipboardKind};
 use ui_platform::driver::{Driver, Turn};
-use ui_platform::host::{Engine, SurfaceHandle, SurfaceStep};
+use ui_platform::host::{Engine, PresentationOptions, SurfaceHandle, SurfaceStep};
 #[cfg(feature = "gpu")]
 use ui_platform::present::{PresentStats, SceneTarget};
 use ui_platform::session::{HostSession, SessionOptions, Tick};
 #[cfg(feature = "gpu")]
 use ui_platform::text_pass::TextPass;
 use ui_platform::view::{App, AppLoop};
+use ui_platform::window::SurfaceSpec;
 
 #[cfg(feature = "gpu")]
 use crate::gpu_window::{GpuWindow, GpuWindowConfig};
 use crate::window::WaylandWindow;
 #[cfg(feature = "gpu")]
-use ui_platform::window::{PopupSpec, SurfaceRole, SurfaceSpec};
+use ui_platform::window::{PopupSpec, SurfaceRole};
 
 /// The GPU presenter as the engine's scene target.
 #[cfg(feature = "gpu")]
@@ -107,6 +113,11 @@ pub struct Presenter {
     pointer: Option<Point>,
     /// The app asked for this surface to close; the host decides what that means.
     closed: bool,
+    /// The backend's eventfd: a portal answer arrives on a D-Bus reader thread, which the
+    /// compositor connection knows nothing about, so the thread bumps this to end the wait.
+    wake: Option<Arc<OwnedFd>>,
+    /// This surface's portal file chooser, connected on first use.
+    chooser: std::cell::RefCell<crate::chooser::PortalChooser>,
 }
 
 /// An app and the one surface it drives, for code that runs a single window itself.
@@ -133,19 +144,31 @@ impl Presenter {
         opts: SessionOptions,
         link: Option<&crate::link::WaylandLink>,
     ) -> Result<Self, String> {
-        #[cfg(feature = "gpu")]
         let spec = opts.surface.clone();
+        let uncapped = opts.uncapped;
+        let want_gpu = !opts.cpu_presenter;
         let win = match link {
             Some(link) => link.surface(opts.surface),
             None => WaylandWindow::new(opts.surface),
         }
         .map_err(|e| format!("cannot open a Wayland surface: {e}"))?;
+        Self::with_window(win, spec, uncapped, want_gpu)
+    }
+
+    /// Wrap an already created window in a presenter.
+    ///
+    /// `want_gpu` asks for the accelerated presenter; a surface without one still presents
+    /// through the CPU rasterizer, which is what a dialog opened by a CPU surface uses.
+    fn with_window(
+        win: WaylandWindow,
+        spec: SurfaceSpec,
+        uncapped: bool,
+        want_gpu: bool,
+    ) -> Result<Self, String> {
         #[cfg(feature = "gpu")]
         let (win, gpu) = {
             let mut win = win;
-            let gpu = if opts.cpu_presenter {
-                None
-            } else {
+            let gpu = if want_gpu {
                 match GpuWindow::open(&mut win, GpuWindowConfig::default()) {
                     Ok(gpu) => Some(gpu),
                     Err(e) => {
@@ -154,19 +177,30 @@ impl Presenter {
                         ));
                     }
                 }
+            } else {
+                None
             };
             (win, gpu)
         };
+        #[cfg(not(feature = "gpu"))]
+        let _ = (want_gpu, &spec);
         Ok(Self {
             #[cfg(feature = "gpu")]
             gpu,
-            driver: Driver::new().uncapped(opts.uncapped),
+            driver: Driver::new().uncapped(uncapped),
             #[cfg(feature = "gpu")]
             spec,
             win,
             pointer: None,
             closed: false,
+            wake: None,
+            chooser: std::cell::RefCell::new(crate::chooser::PortalChooser::default()),
         })
+    }
+
+    /// Give this surface the backend's wake counter, so a portal answer can end the wait.
+    pub(crate) fn set_wake(&mut self, wake: Option<Arc<OwnedFd>>) {
+        self.wake = wake;
     }
 
     /// The pointer to build the next frame with, overriding the seat's — scripted input
@@ -307,6 +341,10 @@ impl Presenter {
         if !steps.is_empty() {
             lp.request_frame();
         }
+        // A platform menu is the Windows shell's; this backend answers no shell host, so no
+        // build here asks for one. The slot is emptied so a request cannot outlive its turn.
+        lp.take_shell_menu();
+        self.win.set_drop_effect(lp.drop_effect());
         // A drag that asked to leave the app becomes the compositor's; the outcome comes
         // back as an event once the target is done with it.
         if let Some(drag) = lp.take_native_drag()
@@ -314,7 +352,7 @@ impl Presenter {
         {
             // The host refused, so the gesture ends without a drop.
             lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Finished {
-                dropped: false,
+                outcome: None,
             }));
             lp.request_frame();
         }
@@ -346,6 +384,9 @@ pub struct PopupPresenter {
     presented: Option<u64>,
     /// The compositor took the popup back; the host dismisses the panel.
     closed: bool,
+    /// Whether this surface is a window rather than a popup: the compositor owns its size,
+    /// so a changed panel asks for a new surface instead of a resize.
+    window: bool,
 }
 
 /// The surface spec a panel's window is opened with.
@@ -391,6 +432,42 @@ fn open_panel(
         origin: parent_origin + spec.rect.origin,
         presented: None,
         closed: false,
+        window: false,
+    })
+}
+
+/// Open a floating window hung off `parent_window` that shows the panel `node`.
+#[cfg(feature = "gpu")]
+fn open_panel_window(
+    parent_window: &WaylandWindow,
+    parent_spec: &SurfaceSpec,
+    parent_origin: Point,
+    node: ui_core::NodeId,
+    spec: PopupSpec,
+    title: &str,
+) -> Result<PopupPresenter, String> {
+    let size = (
+        spec.rect.size.w.round().max(1.0) as u32,
+        spec.rect.size.h.round().max(1.0) as u32,
+    );
+    let surface = SurfaceSpec::dialog(parent_spec.app_id.clone(), title, size).with_modal(false);
+    let mut win = WaylandWindow::create_dialog(parent_window, surface.clone())
+        .map_err(|e| format!("cannot open the panel's window: {e}"))?;
+    // The panel is the window's whole content, so the compositor must not offer another size.
+    win.set_content_size(size)
+        .map_err(|e| format!("cannot pin the panel's window size: {e}"))?;
+    let gpu = GpuWindow::open(&mut win, GpuWindowConfig::default())
+        .map_err(|e| format!("GPU presenter unavailable: {e}"))?;
+    Ok(PopupPresenter {
+        gpu,
+        win,
+        spec: surface,
+        node,
+        parent_origin,
+        origin: parent_origin + spec.rect.origin,
+        presented: None,
+        closed: false,
+        window: true,
     })
 }
 
@@ -442,16 +519,24 @@ impl PopupPresenter {
 
 #[cfg(feature = "gpu")]
 impl SurfaceHandle for PopupPresenter {
-    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+    fn intake(&mut self, engine: &mut Engine) -> Result<(), String> {
         self.win
             .pump_checked()
             .map_err(|error| format!("wayland: {error}"))?;
         if self.win.should_close() {
             self.closed = true;
-            return Ok(SurfaceStep::default());
+            return Ok(());
         }
         self.route_input(engine);
         self.follow_cursor(engine);
+        Ok(())
+    }
+
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        self.intake(engine)?;
+        if self.closed {
+            return Ok(SurfaceStep::default());
+        }
         let frame = engine.frame_number();
         // Nothing new since the last show, nothing painted for it, or no frame window yet.
         if self.presented == Some(frame)
@@ -462,6 +547,11 @@ impl SurfaceHandle for PopupPresenter {
         }
         self.present(engine, frame)?;
         Ok(SurfaceStep { drew: true })
+    }
+
+    fn pointer(&self) -> Option<Point> {
+        // The panel's own pointer is surface-local: the tree places the panel at `origin`.
+        self.win.pointer().map(|local| local + self.origin)
     }
 
     fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
@@ -490,6 +580,20 @@ impl SurfaceHandle for PopupPresenter {
     }
 
     fn reconfigure(&mut self, spec: PopupSpec) -> Result<(), String> {
+        if self.window {
+            // Where the window stands is the compositor's; its size follows its content, so
+            // the constraints move with the panel instead of a new window being made.
+            let size = (
+                spec.rect.size.w.round().max(1.0) as u32,
+                spec.rect.size.h.round().max(1.0) as u32,
+            );
+            self.win.set_content_size(size)?;
+            self.spec.role = SurfaceRole::Dialog {
+                size,
+                modal: false,
+            };
+            return Ok(());
+        }
         self.win.reposition_popup(spec)?;
         self.origin = self.parent_origin + spec.rect.origin;
         Ok(())
@@ -750,6 +854,10 @@ impl SurfaceHandle for Presenter {
             .map(|tick| SurfaceStep { drew: tick.drew })
     }
 
+    fn pointer(&self) -> Option<Point> {
+        self.win.pointer()
+    }
+
     fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
         [
             self.driver.deadline(),
@@ -781,6 +889,61 @@ impl SurfaceHandle for Presenter {
         let root = Point::new(0.0, 0.0);
         let presenter = open_panel(&self.win, &self.spec, root, node, spec, grab)?;
         Ok(Box::new(presenter))
+    }
+
+    /// A panel presented as a window: a toplevel floating beside this surface.
+    #[cfg(feature = "gpu")]
+    fn open_panel_window(
+        &mut self,
+        node: ui_core::NodeId,
+        spec: PopupSpec,
+        title: &str,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        if self.gpu.is_none() {
+            return Err("the CPU presenter cannot show a panel in a window of its own".into());
+        }
+        let root = Point::new(0.0, 0.0);
+        let presenter = open_panel_window(&self.win, &self.spec, root, node, spec, title)?;
+        Ok(Box::new(presenter))
+    }
+
+    /// A dialog belonging to this surface: a toplevel with this one as its transient parent.
+    fn open_dialog(
+        &mut self,
+        spec: SurfaceSpec,
+        options: PresentationOptions,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        let win = WaylandWindow::create_dialog(&self.win, spec.clone())
+            .map_err(|e| format!("cannot open a Wayland dialog: {e}"))?;
+        // The dialog presents the way this surface does: accelerated when it has a GPU,
+        // through the CPU rasterizer when it does not.
+        #[cfg(feature = "gpu")]
+        let want_gpu = self.gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let want_gpu = false;
+        let mut presenter = Presenter::with_window(win, spec, options.uncapped, want_gpu)?;
+        // A dialog answers for the same process, so its chooser ends the same wait.
+        presenter.set_wake(self.wake.clone());
+        Ok(Box::new(presenter))
+    }
+
+    /// The desktop's own chooser; `None` when no portal answers on this bus.
+    fn chooser_capabilities(&self) -> Option<ChooserCapabilities> {
+        self.chooser.borrow_mut().capabilities()
+    }
+
+    fn choose(
+        &mut self,
+        id: ChooserId,
+        request: ChooserRequest,
+    ) -> Result<(), ChooserError> {
+        self.chooser
+            .borrow_mut()
+            .choose(id, request, self.wake.clone())
+    }
+
+    fn chooser_events(&mut self) -> Vec<(ChooserId, ChooserAnswer)> {
+        self.chooser.borrow_mut().take_events()
     }
 
     /// Copies go to the process's clipboard host, not to this window's own source: a window

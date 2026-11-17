@@ -26,3 +26,7 @@ hotpath = { version = "0.30", optional = true, default-features = false }
 system-fonts = ["ui-text-fontique/system"]
 # Times each phase of one frame; the gallery's own `profile` feature turns it on.
 profile = ["dep:hotpath", "hotpath/hotpath"]
+
+[dev-dependencies]
+# Temporary directories for the file-operation tests, removed when the guard drops.
+tempfile = "3"

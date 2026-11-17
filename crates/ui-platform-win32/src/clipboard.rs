@@ -46,15 +46,51 @@ pub(crate) fn write(owner: Option<HWND>, content: &ClipboardContent) -> bool {
     }
 }
 
-/// The clipboard's text; `None` when it holds none.
-pub(crate) fn read_text(owner: Option<HWND>) -> Option<String> {
+/// The clipboard as a paste: a file list first, then a picture, then text.
+///
+/// One open covers the whole decision, so a copy arriving between the availability test and
+/// the read cannot hand over a format the other side never offered.
+pub(crate) fn read_paste(owner: Option<HWND>) -> Option<ClipboardContent> {
     unsafe {
         if OpenClipboard(owner).is_err() {
             return None;
         }
-        let text = clipboard_text();
+        let content = if IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() {
+            clipboard_paths().map(|paths| ClipboardContent::Files {
+                paths: paths.into_iter().map(std::path::PathBuf::from).collect(),
+                effect: clipboard_effect(),
+            })
+        } else if registered("PNG").is_some_and(|format| registered_available(format))
+            || IsClipboardFormatAvailable(CF_DIBV5.0 as u32).is_ok()
+            || IsClipboardFormatAvailable(CF_DIB.0 as u32).is_ok()
+        {
+            clipboard_picture().map(|data| ClipboardContent::Bytes {
+                mime: "image/png".to_owned(),
+                data: std::sync::Arc::new(data),
+            })
+        } else {
+            clipboard_text().map(ClipboardContent::Text)
+        };
         let _ = CloseClipboard();
-        text
+        content
+    }
+}
+
+/// Whether the clipboard has `format`; the caller already holds it open.
+fn registered_available(format: u32) -> bool {
+    unsafe { IsClipboardFormatAvailable(format).is_ok() }
+}
+
+/// The effect a copied file list asks for: cut is `DROPEFFECT_MOVE`, everything else copies.
+fn clipboard_effect() -> ui_core::DropEffect {
+    let cut = registered("Preferred DropEffect")
+        .and_then(block)
+        .and_then(|bytes| bytes.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        .is_some_and(|effect| effect & 0x2 != 0);
+    if cut {
+        ui_core::DropEffect::Move
+    } else {
+        ui_core::DropEffect::Copy
     }
 }
 
@@ -100,7 +136,7 @@ fn read_payload(mime: &str) -> Option<Vec<u8>> {
             return None;
         }
         let payload = match mime {
-            "text/uri-list" => clipboard_paths().map(uri_list),
+            "text/uri-list" => clipboard_paths().map(|paths| uri_bytes(&paths)),
             "image/png" => clipboard_picture(),
             "text/plain" => clipboard_text().map(String::into_bytes),
             _ => None,
@@ -162,51 +198,6 @@ fn clipboard_paths() -> Option<Vec<String>> {
         // A block that names no path is not a file list, whatever else it holds.
         (!paths.is_empty()).then_some(paths)
     }
-}
-
-/// The copied paths as a `text/uri-list`, the Web's file-list form: one `file:` URI a line.
-fn uri_list(paths: Vec<String>) -> Vec<u8> {
-    let mut list = String::new();
-    for path in paths {
-        list.push_str(&file_uri(&path));
-        list.push_str("\r\n");
-    }
-    list.into_bytes()
-}
-
-/// One Windows path as a `file:` URI.
-///
-/// `\\server\share\x` is another machine's share, which a URI names as its host; every other
-/// path has an empty authority, so its own path starts after the third slash.
-fn file_uri(path: &str) -> String {
-    let (authority, path) = match path.strip_prefix(r"\\") {
-        Some(unc) => match unc.split_once('\\') {
-            Some((host, rest)) => (format!("//{host}"), rest.to_owned()),
-            // A share with no path in it still names the share, which has a URI form of its own.
-            None => (format!("//{unc}"), String::new()),
-        },
-        None => ("//".to_owned(), path.to_owned()),
-    };
-    let slash = if path.is_empty() { "" } else { "/" };
-    format!("file:{authority}{slash}{}", encode_path(&path))
-}
-
-/// The path's separators made URI ones and every byte a URI does not carry escaped.
-///
-/// The colon after a drive letter is a path character under RFC 3986 and stays as it is; a
-/// space, a `%` or any non-ASCII byte is escaped from its UTF-8 encoding.
-fn encode_path(path: &str) -> String {
-    let mut encoded = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        match byte {
-            b'\\' => encoded.push('/'),
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
-                encoded.push(byte as char)
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
 }
 
 /// The clipboard's picture as PNG: `"PNG"` already is one, and a DIB is decoded into one.
@@ -321,6 +312,18 @@ fn formats(content: &ClipboardContent) -> Option<Vec<(u32, Vec<u8>)>> {
     match content {
         ClipboardContent::Text(text) => Some(vec![(CF_UNICODETEXT.0 as u32, utf16_bytes(text))]),
         ClipboardContent::Bytes { mime, data } => item_formats(mime, data),
+        ClipboardContent::Files { paths, effect } => {
+            let list = ui_platform::uri_list::encode(paths);
+            let mut formats = uri_formats(&list)?;
+            let effect = match effect {
+                ui_core::DropEffect::Move => 0x2u32,
+                ui_core::DropEffect::Copy | ui_core::DropEffect::Link => 0x1u32,
+            };
+            if let Some(format) = registered("Preferred DropEffect") {
+                formats.push((format, effect.to_le_bytes().to_vec()));
+            }
+            Some(formats)
+        }
     }
 }
 
@@ -338,6 +341,22 @@ pub(crate) fn item_formats(mime: &str, data: &[u8]) -> Option<Vec<(u32, Vec<u8>)
         // No other MIME type has a Windows format this backend can produce.
         _ => None,
     }
+}
+
+/// The format a dropped path list travels under.
+///
+/// A target that moves the files itself signals the source by clearing this format on the
+/// source's data object; the source then leaves the originals alone.
+pub(crate) fn hdrop_format() -> u32 {
+    CF_HDROP.0 as u32
+}
+
+/// The format a payload's stated drop effect travels under, when the system has one.
+///
+/// The same format a clipboard's cut marker uses: a drag source writes its preference
+/// here, and a target reads it instead of guessing.
+pub(crate) fn preferred_effect_format() -> Option<u32> {
+    registered("Preferred DropEffect")
 }
 
 /// The formats a drop may offer, in the order the engine prefers them.
@@ -376,7 +395,7 @@ pub(crate) fn mime_of(format: u32) -> Option<&'static str> {
 /// `None` for a format the engine does not understand, or bytes that do not decode.
 pub(crate) fn decode(format: u32, bytes: &[u8]) -> Option<(String, Vec<u8>)> {
     if format == CF_HDROP.0 as u32 {
-        return Some(("text/uri-list".to_owned(), uri_list(hdrop_paths(bytes)?)));
+        return Some(("text/uri-list".to_owned(), uri_bytes(&hdrop_paths(bytes)?)));
     }
     if format == CF_UNICODETEXT.0 as u32 {
         return Some(("text/plain".to_owned(), utf16_text(bytes)?.into_bytes()));
@@ -578,53 +597,33 @@ fn header(start_html: usize, end_html: usize, start_fragment: usize, end_fragmen
 
 /// A uri-list of `file:` URIs as `CF_HDROP`: paths, because the format carries no contents.
 fn uri_formats(data: &[u8]) -> Option<Vec<(u32, Vec<u8>)>> {
-    let list = std::str::from_utf8(data).ok()?;
-    let paths: Vec<String> = list.lines().filter_map(file_path).collect();
+    let paths = ui_platform::uri_list::decode(data).ok()?;
     if paths.is_empty() {
         return None;
     }
-    Some(vec![(CF_HDROP.0 as u32, hdrop(&paths))])
+    Some(vec![(CF_HDROP.0 as u32, hdrop(&windows_paths(paths)))])
 }
 
-/// One uri-list line as a Windows path; `None` for a comment, an empty line, or anything
-/// that is not a `file:` URI.
-fn file_path(line: &str) -> Option<String> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
-    }
-    let rest = line.strip_prefix("file://")?;
-    let (path, unc) = match rest.strip_prefix('/') {
-        Some(local) => (local, false),
-        // `file://server/share` is another machine, which a UNC path names with two leading
-        // backslashes.
-        None => (rest, true),
-    };
-    let path = percent_decode(path)?;
-    if path.is_empty() || path.contains('\0') {
-        // An empty or NUL-bearing path would end the list early and leave the rest unread.
-        return None;
-    }
-    let path = path.replace('/', "\\");
-    Some(if unc { format!("\\\\{path}") } else { path })
+/// The URI list's paths in the shell's spelling: backslashes, and a UNC authority as the
+/// two leading backslashes `CF_HDROP` expects.
+fn windows_paths(paths: Vec<std::path::PathBuf>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = path.to_string_lossy().into_owned();
+            match text.strip_prefix("//") {
+                Some(rest) => format!("\\\\{}", rest.replace('/', "\\")),
+                None => text.replace('/', "\\"),
+            }
+        })
+        .collect()
 }
 
-/// RFC 2483 percent-escapes, decoded as the UTF-8 they encode.
-fn percent_decode(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let hex = text.get(index + 1..index + 3)?;
-            decoded.push(u8::from_str_radix(hex, 16).ok()?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).ok()
+/// The shell's paths as the Web's file-list form, through the one URI builder both
+/// clipboard directions share.
+fn uri_bytes(paths: &[String]) -> Vec<u8> {
+    let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    ui_platform::uri_list::encode(&paths)
 }
 
 /// The `DROPFILES` header and its wide, double-NUL-terminated path list.
@@ -793,22 +792,17 @@ mod tests {
         );
     }
 
-    /// A copied file is handed over as `CF_HDROP`, whose paths become the Web's file-list
-    /// form; a path the URI cannot spell put another file on the paste.
+    /// The URI list's paths reach a drop target in the shell's spelling, where a remote
+    /// share is the UNC prefix the format expects.
     #[test]
-    fn a_copied_path_becomes_a_file_uri() {
+    fn uri_list_paths_become_shell_paths() {
+        let paths = ui_platform::uri_list::decode(
+            b"file:///C:/one.png\r\nfile://build/share/two.png\r\n",
+        )
+        .expect("the list decodes");
         assert_eq!(
-            file_uri(r"C:\Users\a b\shot #1.png"),
-            "file:///C:/Users/a%20b/shot%20%231.png"
-        );
-        assert_eq!(
-            file_uri(r"\\build\share\one.png"),
-            "file://build/share/one.png"
-        );
-        let list = uri_list(vec![r"C:\one.png".into(), r"\\build\share\two.png".into()]);
-        assert_eq!(
-            String::from_utf8(list).expect("a URI list is text"),
-            "file:///C:/one.png\r\nfile://build/share/two.png\r\n"
+            windows_paths(paths),
+            [r"C:\one.png".to_owned(), r"\\build\share\two.png".to_owned()]
         );
     }
 }

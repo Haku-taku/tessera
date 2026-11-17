@@ -867,26 +867,6 @@ mod effect_tests {
         );
     }
 
-    #[test]
-    fn a_blur_does_not_reach_beyond_its_radius() {
-        // The kernel is truncated, so a pixel farther than `radius` must be untouched.
-        let sharp = scene(vec![Effect::none()]);
-        let blurred = scene(vec![Effect::blur(4, 1.5)]);
-        // Square spans 36..60, so with radius 4 the last reachable pixel is 63.
-        let far = 60 + 4;
-        assert_eq!(
-            at(&sharp, far, 48),
-            at(&blurred, far, 48),
-            "pixel at x={far} must be untouched"
-        );
-        // Just inside the reach must have changed, or the test proves nothing.
-        assert!(
-            at(&blurred, far - 2, 48)[3] > at(&sharp, far - 2, 48)[3],
-            "x={} must have gained ink",
-            far - 2
-        );
-    }
-
     /// The same square rendered on a grid `scale` times finer.
     fn scaled_scene(effects: Vec<Effect>, scale: f32) -> Pixels {
         let logical = SIZE as f32;

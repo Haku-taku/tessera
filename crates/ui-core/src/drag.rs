@@ -1,5 +1,6 @@
 //! Drag: a press that turns into a movement, and the four things it can become.
 
+use crate::event::PointerButton;
 use crate::geom::Point;
 use crate::id::Id;
 
@@ -23,10 +24,19 @@ pub enum DragState {
     /// Nothing pressed.
     #[default]
     Idle,
-    /// Pressed on `on` at `at`, but not yet past the threshold.
-    Pressed { on: Id, at: Point },
+    /// Pressed on `on` at `at` with `button`, but not yet past the threshold.
+    Pressed {
+        on: Id,
+        at: Point,
+        button: PointerButton,
+    },
     /// Moving; `on` keeps receiving moves even outside its own rect.
-    Dragging { on: Id, from: Point, current: Point },
+    Dragging {
+        on: Id,
+        from: Point,
+        current: Point,
+        button: PointerButton,
+    },
 }
 
 impl DragState {
@@ -61,8 +71,14 @@ pub enum DragEvent {
     /// The press passed the threshold; the drag is live.
     ///
     /// `local` is the press point in the dragged node's own space. The tracker has no tree,
-    /// so it fills it with the surface point and the platform rewrites it.
-    Started { on: Id, from: Point, local: Point },
+    /// so it fills it with the surface point and the platform rewrites it. `button` is the
+    /// one that started the gesture, so a right drag is distinguishable from a left one.
+    Started {
+        on: Id,
+        from: Point,
+        local: Point,
+        button: PointerButton,
+    },
     /// The pointer moved; `delta` is from the press point, `step` is since the previous
     /// event, `local` is the current pointer.
     Moved {
@@ -71,8 +87,13 @@ pub enum DragEvent {
         step: Point,
         local: Point,
     },
-    /// Released over `target` (or over nothing).
-    Dropped { on: Id, target: Option<Id> },
+    /// Released over `target` (or over nothing), at `at`.
+    Dropped {
+        on: Id,
+        target: Option<Id>,
+        at: Point,
+        button: PointerButton,
+    },
     /// Cancelled by `Escape`; the app should restore its starting state.
     Cancelled { on: Id },
 }
@@ -97,15 +118,15 @@ impl DragTracker {
     }
 
     /// A button went down on `on`.
-    pub fn press(&mut self, on: Id, at: Point) {
-        self.state = DragState::Pressed { on, at };
+    pub fn press(&mut self, on: Id, at: Point, button: PointerButton) {
+        self.state = DragState::Pressed { on, at, button };
     }
 
     /// The pointer moved to `to`; returns `Started` exactly once per drag.
     pub fn moved(&mut self, to: Point) -> Option<DragEvent> {
         match self.state {
             DragState::Idle => None,
-            DragState::Pressed { on, at } => {
+            DragState::Pressed { on, at, button } => {
                 if !past_threshold(at, to) {
                     return None;
                 }
@@ -113,18 +134,26 @@ impl DragTracker {
                     on,
                     from: at,
                     current: to,
+                    button,
                 };
                 Some(DragEvent::Started {
                     on,
                     from: at,
                     local: at,
+                    button,
                 })
             }
-            DragState::Dragging { on, from, current } => {
+            DragState::Dragging {
+                on,
+                from,
+                current,
+                button,
+            } => {
                 self.state = DragState::Dragging {
                     on,
                     from,
                     current: to,
+                    button,
                 };
                 Some(DragEvent::Moved {
                     on,
@@ -140,11 +169,16 @@ impl DragTracker {
     ///
     /// A press that never passed the threshold produces nothing: it was a click, and
     /// the click path already handled it.
-    pub fn release(&mut self, target: Option<Id>) -> Option<DragEvent> {
+    pub fn release(&mut self, target: Option<Id>, at: Point) -> Option<DragEvent> {
         let state = std::mem::take(&mut self.state);
         match state {
             DragState::Idle | DragState::Pressed { .. } => None,
-            DragState::Dragging { on, .. } => Some(DragEvent::Dropped { on, target }),
+            DragState::Dragging { on, button, .. } => Some(DragEvent::Dropped {
+                on,
+                target,
+                at,
+                button,
+            }),
         }
     }
 
@@ -176,9 +210,9 @@ mod tests {
         // Below the threshold the press is a click; emitting `Started` would make every
         // click also drag whatever it hit.
         let mut t = DragTracker::new();
-        t.press(id(1), Point::new(10.0, 10.0));
+        t.press(id(1), Point::new(10.0, 10.0), PointerButton::Primary);
         assert_eq!(t.moved(Point::new(12.0, 11.0)), None);
-        assert_eq!(t.release(Some(id(1))), None);
+        assert_eq!(t.release(Some(id(1)), Point::new(12.0, 11.0)), None);
         assert!(!t.is_dragging());
     }
 
@@ -187,10 +221,14 @@ mod tests {
         // A cancelled drag must not also report a drop: the app would apply the move it
         // was told to abandon.
         let mut t = DragTracker::new();
-        t.press(id(1), Point::new(10.0, 10.0));
+        t.press(id(1), Point::new(10.0, 10.0), PointerButton::Primary);
         t.moved(Point::new(50.0, 50.0));
         assert_eq!(t.cancel(), Some(DragEvent::Cancelled { on: id(1) }));
-        assert_eq!(t.release(Some(id(2))), None, "cancel already ended it");
+        assert_eq!(
+            t.release(Some(id(2)), Point::new(50.0, 50.0)),
+            None,
+            "cancel already ended it"
+        );
         assert_eq!(t.state(), DragState::Idle);
     }
 }

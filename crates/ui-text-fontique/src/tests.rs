@@ -126,4 +126,32 @@ mod contracts {
         );
         assert_eq!(p.face_data(face).map(|d| d.len()), Some(len));
     }
+
+    /// The same bundled font handed over by a second surface is admitted once: the provider
+    /// is shared by every surface on the thread and fontique keeps every face it is given,
+    /// so a picker opened ten times would otherwise hold ten copies of its icon font.
+    #[test]
+    fn registering_a_family_again_keeps_one() {
+        fn faces(p: &FontiqueProvider, name: &str) -> usize {
+            let family = p.exact_family(name).expect("registered");
+            let mut inner = p.inner.lock().expect("not poisoned");
+            inner.family(family).map_or(0, |info| info.fonts().len())
+        }
+
+        let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(
+            include_bytes!("../../assets/fonts/InterVariable.ttf").as_slice(),
+        );
+        let mut p = FontiqueProvider::new_isolated();
+        assert!(p.register("Bundled Text", std::sync::Arc::clone(&bytes)));
+        let admitted = faces(&p, "Bundled Text");
+        assert!(admitted > 0, "the bytes must admit at least one face");
+        // A second surface copies the same bytes, as `OpenOptions` does from a static.
+        let copy: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes.as_ref());
+        assert!(p.register("Bundled Text", copy));
+        assert_eq!(
+            faces(&p, "Bundled Text"),
+            admitted,
+            "one set of faces, not a second admission of them"
+        );
+    }
 }

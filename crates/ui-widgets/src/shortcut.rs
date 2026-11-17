@@ -57,6 +57,7 @@ fn key_label_in(catalog: &Catalog, key: Key) -> String {
         Key::Down => catalog.text(Msg::WIDGETS_SHORTCUT_DOWN).to_string(),
         // A keyboard legend, not UI copy: no locale spells these differently.
         Key::Print => "Print".to_string(),
+        Key::Menu => "Menu".to_string(),
         Key::Function(n) => format!("F{n}"),
         // Letters are data, not UI copy: the chord keeps the character the user typed.
         Key::Char(c) => c.to_uppercase().to_string(),

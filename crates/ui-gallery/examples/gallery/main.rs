@@ -1,6 +1,7 @@
 //! Acceptance gallery: one window, a nav tree on the left, three styles per section.
 
 use ui_core::timed;
+use ui_platform::host::{FontFace, Host, OpenOptions};
 use ui_platform::window::SurfaceSpec;
 
 /// Heap traffic per frame: `GALLERY_ALLOC=1` for the `[hb]` counters, `GALLERY_ALLOC_SIZES=1`
@@ -487,6 +488,15 @@ fn main() {
         || std::env::var_os("GALLERY_ALLOC_SITES").is_some();
     ALLOC_ON.store(want_allocs, std::sync::atomic::Ordering::Relaxed);
     SIZES_ON.store(want_sizes, std::sync::atomic::Ordering::Relaxed);
+    let uncapped = std::env::var_os("GALLERY_UNCAPPED").is_some();
+    if uncapped {
+        eprintln!("[uncapped] frame pacing disabled: fps is throughput, not refresh");
+    }
+    // `GALLERY_HOST=1` runs the app on the process loop instead of a one-window session.
+    if std::env::var_os("GALLERY_HOST").is_some() {
+        run_host(uncapped);
+        return;
+    }
     // Layout must measure with the same faces the painter rasterises: the monospace
     // estimate calls an icon 1 em wide at 0.6 em and its box no longer holds the glyph.
     let mut lp = AppLoop::with_stack(Gallery::new(), TEXT_STACK);
@@ -513,10 +523,6 @@ fn main() {
             .as_slice()
             .into(),
     );
-    let uncapped = std::env::var_os("GALLERY_UNCAPPED").is_some();
-    if uncapped {
-        eprintln!("[uncapped] frame pacing disabled: fps is throughput, not refresh");
-    }
     let opts = SessionOptions {
         surface: SurfaceSpec::window(
             "dev.crabsnap.ui.gallery",
@@ -537,6 +543,57 @@ fn main() {
         println!("gpu presenter: {name}");
     }
     run(session);
+}
+
+/// Run the gallery the way an application runs: the process loop, which is the only path that
+/// reconciles platform panels, so a menu that asks for its own surface gets one.
+fn run_host(uncapped: bool) {
+    let backend = match ui_host::connect() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let mut host = Host::new(Box::new(backend));
+    let face = |name: &str, data: &[u8]| FontFace {
+        name: name.to_string(),
+        data: data.into(),
+    };
+    let options = OpenOptions {
+        uncapped,
+        images: wallpaper::entry().into_iter().collect(),
+        fonts: vec![
+            face(
+                ui_widgets::SF_SYMBOLS_FAMILY,
+                include_bytes!("../../../assets/fonts/SFSymbols.ttf"),
+            ),
+            face(
+                TEXT_FAMILY,
+                include_bytes!("../../../assets/fonts/InterVariable.ttf"),
+            ),
+            face(
+                ui_widgets_fluent::glyphs::ICON_FAMILY,
+                include_bytes!("../../../assets/fonts/FluentSystemIcons-Regular.ttf"),
+            ),
+        ],
+        stack: TEXT_STACK.iter().map(|family| (*family).to_string()).collect(),
+        ..OpenOptions::default()
+    };
+    let spec = SurfaceSpec::window(
+        "dev.crabsnap.ui.gallery",
+        "crabsnap-ui   gallery",
+        (WIN_W, WIN_H),
+    );
+    if let Err(e) = host.open(spec, Gallery::new(), options) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+    let until = Instant::now() + std::time::Duration::from_secs_f32(lifetime());
+    if let Err(e) = host.run_until(Some(until)) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 }
 
 /// Write the last presented frame into the temp directory; the path is the one printed.
@@ -1009,8 +1066,10 @@ fn run<H: HostSession<Gallery>>(mut session: H) {
         }
         for ev in session.events() {
             // The one event a screenshot cannot show: what the peer actually handed us.
-            if let ui_core::Event::Paste(text) = ev {
-                println!("clipboard pasted: {text:?}");
+            if let ui_core::Event::Paste(content) = ev {
+                if let Some(text) = content.text() {
+                    println!("clipboard pasted: {text:?}");
+                }
             }
         }
         if !tick.drew {

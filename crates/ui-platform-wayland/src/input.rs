@@ -137,6 +137,20 @@ impl InputState {
         keysym_char(raw)
     }
 
+    /// Whether this key asks for a menu: the Menu keysym, or Shift+F10 where there is none.
+    ///
+    /// Win32 names the same pair, so a client binding the Menu key hears both desktops
+    /// alike and a keyboard without the key keeps the chord.
+    pub fn menu_key(&mut self, evdev_code: u32) -> bool {
+        let Some(state) = self.xkb_state.as_mut() else {
+            return false;
+        };
+        let keycode = xkb::Keycode::new(evdev_code + 8);
+        let symbol = state.key_get_one_sym(keycode).raw();
+        symbol == 0xff67
+            || (symbol == 0xffc7 && state.mod_name_is_active("Shift", xkb::STATE_MODS_EFFECTIVE))
+    }
+
     /// The text this key types right now, composed with any dead key before it.
     ///
     /// Differs from [`Self::key`] where the layout composes: a dead key followed by `e`

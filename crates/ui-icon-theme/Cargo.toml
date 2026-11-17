@@ -1,0 +1,19 @@
+[package]
+name = "ui-icon-theme"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Freedesktop icon themes: index.theme lookup, MIME icon names, PNG and SVG pixels."
+
+[lib]
+name = "ui_icon_theme"
+path = "src/icon_theme.rs"
+
+[dependencies]
+ui-platform = { workspace = true }
+log = "0.4"
+# Theme icons are PNG or SVG, and the themes on a typical desktop ship almost no PNG.
+# The renderer is confined to this crate so a build without a picker never links it.
+png = "0.18"
+resvg = { version = "0.50", default-features = false }

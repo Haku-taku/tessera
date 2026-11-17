@@ -7,6 +7,10 @@ use ui_widgets_glass::{GlassSheetDetent, detent_id_of};
 
 pub(crate) struct Gallery {
     pub(crate) page: Page,
+    /// Whether the gallery runs on the host, where a panel can have a surface of its own.
+    /// `GALLERY_HOST=1` turns it on; a single-window session cannot honour the request, so
+    /// the pages that would use it keep painting in the parent.
+    pub(crate) host: bool,
     pub(crate) on: bool,
     pub(crate) value: f32,
     /// Whether the whole gallery renders in the light or the dark appearance. The toolbar's
@@ -374,6 +378,7 @@ impl Gallery {
                 .ok()
                 .and_then(|want| PAGES.into_iter().find(|p| p.tag() == want))
                 .unwrap_or(Page::Switch),
+            host: std::env::var_os("GALLERY_HOST").is_some(),
             on: false,
             value: 0.35,
             dark,
@@ -1299,7 +1304,7 @@ impl App for Gallery {
                     drag_block(&mut self.materials, k, false, dx as f32, dy as f32);
                     return true;
                 }
-                C::Dropped(_) | C::Cancelled => {
+                C::Dropped { .. } | C::Cancelled => {
                     end_drag(&mut self.materials, k);
                     return true;
                 }

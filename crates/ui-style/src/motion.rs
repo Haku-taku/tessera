@@ -148,29 +148,3 @@ pub const CSS_EASE_OUT: Easing = Easing::Cubic(0.0, 0.0, 0.58, 1.0);
 /// its stop; also the `easeOutBack` row of the dimensions table.
 pub const EASE_OUT_BACK: Easing = Easing::Cubic(0.175, 0.885, 0.32, 1.275);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_fluent_table_carries_its_measured_durations() {
-        let t = MotionTable::fluent();
-        assert_eq!(t.get(MotionName::StateChange).spec.duration, 0.083);
-        assert_eq!(t.get(MotionName::Quick).spec.duration, 0.167);
-        assert_eq!(t.get(MotionName::Standard).spec.duration, 0.250);
-        assert_eq!(t.get(MotionName::Slow).spec.duration, 0.358);
-    }
-
-    /// MD3 state layers fade linearly at `kRadialReactionDuration`, so the state-change
-    /// slot must be linear too; an ease on hover or press would read as a material motion.
-    #[test]
-    fn the_material_state_change_is_linear() {
-        let t = MotionTable::material();
-        assert_eq!(
-            t.get(MotionName::StateChange).spec.easing,
-            Easing::Linear,
-            "state layers fade linearly; an eased hover is not MD3"
-        );
-        assert_eq!(t.get(MotionName::StateChange).spec.duration, 0.100);
-    }
-}

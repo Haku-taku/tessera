@@ -7,9 +7,12 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ui_core::clipboard::ClipboardContent;
+use ui_core::dnd::DropEffect;
 use wayland_client::protocol::{
     wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
 };
@@ -20,6 +23,15 @@ use crate::window::WindowState;
 /// The mime types we offer, most specific first; a peer picks the first it understands.
 pub(crate) const MIMES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 
+/// The baseline file-list type every desktop understands.
+const URI_LIST: &str = "text/uri-list";
+/// GNOME's file-list type that carries the copy/cut mark in its header.
+const GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
+/// KDE's cut mark: the payload is just `1`, read beside `text/uri-list`.
+const KDE_CUT: &str = "application/x-kde-cutselection";
+/// A raster image, offered by picture tools and some browsers.
+const PNG: &str = "image/png";
+
 /// What we are serving while our selection is on the clipboard.
 #[derive(Clone, Debug)]
 pub(crate) enum Contents {
@@ -29,13 +41,61 @@ pub(crate) enum Contents {
         mime: String,
         data: std::sync::Arc<Vec<u8>>,
     },
+    /// Copied files, served as a URI list and the desktop's cut marks.
+    Files { paths: Vec<PathBuf>, cut: bool },
+}
+
+impl Contents {
+    /// The MIME types this payload answers. Peers pick the first they understand.
+    pub(crate) fn mimes(&self) -> Vec<String> {
+        match self {
+            Contents::Text(_) => MIMES.iter().map(|mime| (*mime).to_owned()).collect(),
+            // One MIME type, so a peer cannot ask for a text reading of an image.
+            Contents::Bytes { mime, .. } => vec![mime.clone()],
+            // The GNOME type comes first: it carries the cut mark in the same transfer, so
+            // a reader needs no second read to know what the copy means.
+            Contents::Files { cut, .. } => {
+                let mut mimes = vec![GNOME_COPIED_FILES.to_owned(), URI_LIST.to_owned()];
+                if *cut {
+                    mimes.push(KDE_CUT.to_owned());
+                }
+                mimes
+            }
+        }
+    }
+
+    /// The bytes for one of [`mimes`](Self::mimes). Another type gets an empty payload.
+    fn bytes_for(&self, mime: &str) -> Arc<Vec<u8>> {
+        match self {
+            Contents::Text(text) => Arc::new(text.clone().into_bytes()),
+            Contents::Bytes { data, .. } => Arc::clone(data),
+            Contents::Files { paths, cut } => {
+                let list = ui_platform::uri_list::encode(paths);
+                let bytes = if mime.eq_ignore_ascii_case(GNOME_COPIED_FILES) {
+                    let head: &[u8] = if *cut { b"cut\n" } else { b"copy\n" };
+                    let mut bytes = head.to_vec();
+                    bytes.extend_from_slice(&list);
+                    bytes
+                } else if mime.eq_ignore_ascii_case(URI_LIST) {
+                    list
+                } else if mime.eq_ignore_ascii_case(KDE_CUT) {
+                    if *cut { b"1".to_vec() } else { Vec::new() }
+                } else {
+                    Vec::new()
+                };
+                Arc::new(bytes)
+            }
+        }
+    }
 }
 /// How long a paste waits for the other side before giving up.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A pipe we are reading a peer's clipboard text from.
+/// A pipe we are reading a peer's clipboard payload from.
 struct ReadJob {
     fd: File,
+    /// The type that was asked for; it decides how the bytes are read.
+    mime: String,
     bytes: Vec<u8>,
     deadline: Instant,
 }
@@ -142,10 +202,9 @@ impl Payload {
     }
 
     /// Queue our payload for a peer's `send` request.
-    pub(crate) fn serve(&mut self, fd: OwnedFd) {
+    pub(crate) fn serve(&mut self, mime: &str, fd: OwnedFd) {
         let bytes = match self.contents.as_ref() {
-            Some(Contents::Text(text)) => Arc::new(text.clone().into_bytes()),
-            Some(Contents::Bytes { data, .. }) => Arc::clone(data),
+            Some(contents) => contents.bytes_for(mime),
             None => Arc::new(Vec::new()),
         };
         self.outbox.push(fd, bytes);
@@ -197,14 +256,8 @@ impl SelectionSource {
             old.destroy();
         }
         let source = manager.create_data_source(qh, ());
-        match &contents {
-            Contents::Text(_) => {
-                for mime in MIMES {
-                    source.offer(mime.to_string());
-                }
-            }
-            // One MIME type, so a peer cannot ask for a text reading of an image.
-            Contents::Bytes { mime, .. } => source.offer(mime.clone()),
+        for mime in contents.mimes() {
+            source.offer(mime);
         }
         device.set_selection(Some(&source), serial);
         // The payload stays here: the peer will ask for it later, through `send`.
@@ -215,8 +268,8 @@ impl SelectionSource {
     }
 
     /// Queue our payload for a peer's `send` request.
-    pub(crate) fn serve(&mut self, fd: OwnedFd) {
-        self.payload.serve(fd);
+    pub(crate) fn serve(&mut self, mime: &str, fd: OwnedFd) {
+        self.payload.serve(mime, fd);
     }
 
     /// Move pending writes along. Safe to call every frame; it never blocks.
@@ -253,6 +306,8 @@ impl Drop for SelectionSource {
 struct PendingOffer {
     offer: wl_data_offer::WlDataOffer,
     mimes: Vec<String>,
+    /// The actions a drag source permits; only a drag announces them.
+    actions: wl_data_device_manager::DndAction,
 }
 
 /// Everything the seat's clipboard owns.
@@ -270,6 +325,10 @@ pub(crate) struct Clipboard {
     /// Serial of the latest input event; `set_selection` is ignored without a fresh one.
     serial: u32,
     read: Option<ReadJob>,
+    /// Paths read before the KDE cut mark that follows them.
+    pending_paths: Option<Vec<PathBuf>>,
+    /// The effect a marker already read states, waiting for the paths or a second marker.
+    pending_effect: Option<DropEffect>,
 }
 
 impl Clipboard {
@@ -283,6 +342,8 @@ impl Clipboard {
             source: SelectionSource::new(),
             serial: 0,
             read: None,
+            pending_paths: None,
+            pending_effect: None,
         }
     }
 
@@ -341,17 +402,26 @@ impl Clipboard {
             .offer(contents, &manager, &device, self.serial, qh, conn)
     }
 
-    /// Ask the current offer for its text; the answer arrives as `Event::Paste`.
+    /// Ask the current offer for its payload; the answer arrives as `Event::Paste`.
+    ///
+    /// Files win over pictures, pictures over text: the same order a Windows paste takes,
+    /// and a picture tool's offer usually carries all three readings.
     pub(crate) fn request_paste(&mut self, conn: &Connection) -> bool {
-        let Some(offer) = self.offer.clone() else {
+        self.pending_paths = None;
+        self.pending_effect = None;
+        let Some(mime) = paste_mime(&self.mimes) else {
             return false;
         };
-        let Some(mime) = self
-            .mimes
-            .iter()
-            .find(|m| MIMES.contains(&m.as_str()))
-            .cloned()
-        else {
+        let started = self.start_read(mime);
+        if started {
+            let _ = conn.flush();
+        }
+        started
+    }
+
+    /// Open one pipe for `mime` on the current offer.
+    fn start_read(&mut self, mime: String) -> bool {
+        let Some(offer) = self.offer.clone() else {
             return false;
         };
         let Ok((read_fd, write_fd)) = rustix::pipe::pipe_with(
@@ -359,28 +429,28 @@ impl Clipboard {
         ) else {
             return false;
         };
-        offer.receive(mime, write_fd.as_fd());
+        offer.receive(mime.clone(), write_fd.as_fd());
         // Our end of the write side must close, or the reader never sees EOF.
         drop(write_fd);
         self.read = Some(ReadJob {
             fd: File::from(read_fd),
+            mime,
             bytes: Vec::new(),
             deadline: Instant::now() + READ_TIMEOUT,
         });
-        let _ = conn.flush();
         true
     }
 
-    /// Move bytes on every pipe we hold. Returns the text of a paste that finished.
-    pub(crate) fn service(&mut self) -> Option<String> {
+    /// Move bytes on every pipe we hold. Returns the payload of a paste that finished.
+    pub(crate) fn service(&mut self) -> Option<ClipboardContent> {
         let mut done = None;
         if let Some(read) = &mut self.read {
             let mut buf = [0u8; 8192];
             loop {
                 match (&read.fd).read(&mut buf) {
                     Ok(0) => {
-                        // EOF: the peer closed its side, so the text is complete.
-                        done = Some(String::from_utf8_lossy(&read.bytes).into_owned());
+                        // EOF: the peer closed its side, so the payload is complete.
+                        done = Some((read.mime.clone(), std::mem::take(&mut read.bytes)));
                         break;
                     }
                     Ok(n) => read.bytes.extend_from_slice(&buf[..n]),
@@ -388,22 +458,83 @@ impl Clipboard {
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => {
                         // A broken pipe is an empty paste, not a stuck one.
-                        done = Some(String::new());
+                        done = Some((read.mime.clone(), Vec::new()));
                         break;
                     }
                 }
             }
             if done.is_none() && Instant::now() > read.deadline {
                 // A peer that never answers must not hold the clipboard hostage.
-                done = Some(String::new());
+                done = Some((read.mime.clone(), Vec::new()));
             }
         }
-        if done.is_some() {
-            self.read = None;
-        }
+        let content = match done {
+            Some((mime, bytes)) => {
+                self.read = None;
+                self.finish_read(&mime, bytes)
+            }
+            None => None,
+        };
         // Peers waiting on our own payload, in the same pass as the paste read.
         self.source.service();
-        done
+        content
+    }
+
+    /// Turn one finished transfer into the paste, or start the second transfer a KDE cut
+    /// mark or a GNOME list needs.
+    fn finish_read(&mut self, mime: &str, bytes: Vec<u8>) -> Option<ClipboardContent> {
+        if mime.eq_ignore_ascii_case(GNOME_COPIED_FILES) {
+            let (paths, effect) = decode_gnome(bytes);
+            if self.offers(KDE_CUT) {
+                // The two marks must agree; KDE can only veto a cut, never invent one.
+                self.pending_paths = Some(paths);
+                self.pending_effect = Some(effect);
+                if self.start_read(KDE_CUT.to_owned()) {
+                    return None;
+                }
+                let paths = self.pending_paths.take().unwrap_or_default();
+                return Some(ClipboardContent::Files { paths, effect });
+            }
+            return Some(ClipboardContent::Files { paths, effect });
+        }
+        if mime.eq_ignore_ascii_case(KDE_CUT) {
+            let cut = bytes.first() == Some(&b'1');
+            if let Some(paths) = self.pending_paths.take() {
+                let effect = if cut && self.pending_effect.take() == Some(DropEffect::Move) {
+                    DropEffect::Move
+                } else {
+                    DropEffect::Copy
+                };
+                return Some(ClipboardContent::Files { paths, effect });
+            }
+            self.pending_effect = Some(if cut {
+                DropEffect::Move
+            } else {
+                DropEffect::Copy
+            });
+            if self.start_read(URI_LIST.to_owned()) {
+                return None;
+            }
+            return Some(ClipboardContent::Files {
+                paths: Vec::new(),
+                effect: DropEffect::Copy,
+            });
+        }
+        if mime.eq_ignore_ascii_case(URI_LIST) {
+            let paths = ui_platform::uri_list::decode(&bytes).unwrap_or_default();
+            return Some(ClipboardContent::Files {
+                paths,
+                effect: self.pending_effect.take().unwrap_or(DropEffect::Copy),
+            });
+        }
+        Some(paste_content(mime, bytes))
+    }
+
+    /// Whether the current offer announced `mime`.
+    fn offers(&self, mime: &str) -> bool {
+        self.mimes
+            .iter()
+            .any(|offered| offered.eq_ignore_ascii_case(mime))
     }
 
     /// Take the offer `data_offer` announced, so the following `selection` or `enter`
@@ -418,27 +549,59 @@ impl Clipboard {
         self.pending = Some(PendingOffer {
             offer,
             mimes: Vec::new(),
+            actions: wl_data_device_manager::DndAction::empty(),
         });
     }
 
-    /// Claim the pending offer `id` names, with the MIME types announced for it.
+    /// Claim the pending offer `id` names, with the MIME types and actions announced for it.
     ///
     /// A drag takes it into the drag state, a selection into the paste state. The caller
     /// owns the returned object and destroys it.
     pub(crate) fn take_pending(
         &mut self,
         id: &wl_data_offer::WlDataOffer,
-    ) -> (wl_data_offer::WlDataOffer, Vec<String>) {
+    ) -> (
+        wl_data_offer::WlDataOffer,
+        Vec<String>,
+        wl_data_device_manager::DndAction,
+    ) {
         match self.pending.take() {
-            Some(pending) if &pending.offer == id => (pending.offer, pending.mimes),
+            Some(pending) if &pending.offer == id => {
+                (pending.offer, pending.mimes, pending.actions)
+            }
             Some(pending) => {
                 // The announcement and the claim disagree; keep the claimed object, which
                 // is the one the compositor names, and let the other go.
                 pending.offer.destroy();
-                (id.clone(), Vec::new())
+                (
+                    id.clone(),
+                    Vec::new(),
+                    wl_data_device_manager::DndAction::empty(),
+                )
             }
-            None => (id.clone(), Vec::new()),
+            None => (
+                id.clone(),
+                Vec::new(),
+                wl_data_device_manager::DndAction::empty(),
+            ),
         }
+    }
+
+    /// Record the actions a drag source permits on the pending offer; false when the
+    /// offer is not pending (the drag module keeps it once `enter` claimed it).
+    pub(crate) fn note_actions(
+        &mut self,
+        offer: &wl_data_offer::WlDataOffer,
+        actions: wl_data_device_manager::DndAction,
+    ) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return false;
+        };
+        if &pending.offer != offer {
+            return false;
+        }
+        pending.actions = actions;
+        true
     }
 
     /// Record a MIME type on whichever offer it belongs to. False when it is neither the
@@ -462,7 +625,7 @@ impl Clipboard {
         // A `selection` with no offer also drops an announcement the compositor abandoned.
         let (offer, mimes) = match id {
             Some(id) => {
-                let (offer, mimes) = self.take_pending(&id);
+                let (offer, mimes, _) = self.take_pending(&id);
                 (Some(offer), mimes)
             }
             None => {
@@ -496,8 +659,8 @@ impl Clipboard {
     }
 
     /// Queue a peer's request for our selection's bytes.
-    pub(crate) fn serve_source(&mut self, fd: OwnedFd) {
-        self.source.serve(fd);
+    pub(crate) fn serve_source(&mut self, mime: &str, fd: OwnedFd) {
+        self.source.serve(mime, fd);
     }
 
     /// The compositor took the selection away from us.
@@ -514,6 +677,56 @@ impl Drop for Clipboard {
         if let Some(pending) = self.pending.take() {
             pending.offer.destroy();
         }
+    }
+}
+
+/// The type to read from an offer, best first.
+///
+/// The GNOME file type is read before `text/uri-list` because its header says whether the
+/// copy was a cut, and both carry the same list. KDE's mark is a separate transfer, so it
+/// is read first and the list follows; with neither mark the paste is a copy.
+fn paste_mime(offered: &[String]) -> Option<String> {
+    let has = |mime: &str| {
+        offered
+            .iter()
+            .find(|known| known.eq_ignore_ascii_case(mime))
+            .cloned()
+    };
+    if let Some(mime) = has(GNOME_COPIED_FILES) {
+        return Some(mime);
+    }
+    if has(URI_LIST).is_some() {
+        return has(KDE_CUT).or_else(|| has(URI_LIST));
+    }
+    has(PNG).or_else(|| MIMES.iter().find_map(|mime| has(mime)))
+}
+
+/// Split a GNOME file transfer into its list and the effect its header states.
+fn decode_gnome(bytes: Vec<u8>) -> (Vec<PathBuf>, DropEffect) {
+    let split = bytes.iter().position(|byte| *byte == b'\n');
+    let (head, list) = match split {
+        Some(at) => (&bytes[..at], &bytes[at + 1..]),
+        None => (&[][..], &bytes[..]),
+    };
+    let effect = if head.eq_ignore_ascii_case(b"cut") {
+        DropEffect::Move
+    } else {
+        DropEffect::Copy
+    };
+    (
+        ui_platform::uri_list::decode(list).unwrap_or_default(),
+        effect,
+    )
+}
+
+/// Read a finished transfer that is not a file list, according to the type asked for.
+fn paste_content(mime: &str, bytes: Vec<u8>) -> ClipboardContent {
+    if MIMES.iter().any(|known| mime.eq_ignore_ascii_case(known)) {
+        return ClipboardContent::Text(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    ClipboardContent::Bytes {
+        mime: mime.to_owned(),
+        data: Arc::new(bytes),
     }
 }
 

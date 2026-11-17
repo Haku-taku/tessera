@@ -11,15 +11,27 @@ use std::time::{Duration, Instant};
 use ui_core::draw::ImageEntry;
 use ui_core::shortcut::{KeyChord, ShortcutId};
 
+use crate::chooser::{
+    ChooserAnswer, ChooserCapabilities, ChooserError, ChooserId, ChooserRequest,
+};
 use crate::clipboard::ClipboardContent;
 use crate::clipboard::{ClipboardCopy, ClipboardKind};
 use crate::hotkeys::{GlobalHotkeyError, GlobalHotkeys};
 use crate::ipc::{Channel, Reply};
+use crate::file_icons::{FileIconProvider, FileIcons};
+use crate::file_operation::{FileOperations, FileOperator};
 use crate::jobs::{Jobs, Waker};
+use crate::listing::{DirectoryLister, Listings};
 use crate::output::OutputInfo;
+use crate::places::{Device, Place};
+use crate::search::{DirectorySearcher, Searches};
+use crate::shell_menu::ShellMenuHost;
 use crate::transfer::{Selection, SelectionReader};
 use crate::tray::{Icon, Tray, TrayEvent, TrayHandle, TrayId};
+use crate::thumbnails::{Thumbnailer, Thumbnails};
 use crate::view::{App, AppLoop};
+use crate::volumes::Volumes;
+use crate::watch::{DirectoryWatcher, Watches};
 use crate::window::{PopupSpec, SurfaceSpec};
 use ui_core::layout::PlatformPanel;
 
@@ -63,6 +75,27 @@ pub struct SurfaceStep {
 pub trait SurfaceHandle {
     /// Take what arrived and draw a frame for `engine` if one is due.
     fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String>;
+
+    /// Read what the platform delivered for this surface and hand it to `engine`, without
+    /// drawing.
+    ///
+    /// This is the pass a group makes over its panels before it builds a frame: the
+    /// pointer crossing from a window onto a panel leaves one surface and enters another
+    /// in the same batch, and only the panel's queue holds the half that says where it
+    /// went. `step` calls it too, so a surface that has already taken its input this turn
+    /// finds nothing left.
+    fn intake(&mut self, engine: &mut Engine) -> Result<(), String> {
+        let _ = engine;
+        Ok(())
+    }
+
+    /// Where the pointer stands on this surface, in the tree's coordinates, when it is on it.
+    ///
+    /// A surface has a pointer only while the pointer is over it; the host asks every
+    /// surface of a group so the frame they share is built with the one pointer they share.
+    fn pointer(&self) -> Option<ui_core::geom::Point> {
+        None
+    }
 
     /// Whether a move or resize loop the platform started owns this surface right now.
     ///
@@ -120,6 +153,22 @@ pub trait SurfaceHandle {
         Err("this presentation has no popup surfaces".into())
     }
 
+    /// Open a window of this one's own for the panel `node`.
+    ///
+    /// Unlike a popup it carries the platform's frame and takes the keyboard like any
+    /// window, and it stays until the app stops declaring the panel. `title` is the app's
+    /// localized name for it. A surface whose platform has no windows returns the refusal,
+    /// and the host falls back to a popup and then to painting the panel in this surface.
+    fn open_panel_window(
+        &mut self,
+        node: ui_core::NodeId,
+        spec: PopupSpec,
+        title: &str,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        let _ = (node, spec, title);
+        Err("this presentation has no window surfaces".into())
+    }
+
     /// Move or resize a popup this surface opened, per `spec`.
     ///
     /// The default keeps the surface where it is: a platform that cannot reposition a popup
@@ -127,6 +176,56 @@ pub trait SurfaceHandle {
     fn reconfigure(&mut self, spec: PopupSpec) -> Result<(), String> {
         let _ = spec;
         Ok(())
+    }
+
+    /// Open a dialog window belonging to this surface, per `spec`.
+    ///
+    /// The dialog is a surface of its own with an engine of its own; the platform stacks it
+    /// above this one, and closes it when this one goes. A modal dialog's input filtering is
+    /// enforced by the host, not only asked of the platform: Wayland's `xdg-dialog` is a
+    /// hint and tells the client to filter the parent's events itself.
+    ///
+    /// The default is a presentation with no dialog windows. The host then reports the
+    /// refusal to the caller, which can present the same content in its own window.
+    fn open_dialog(
+        &mut self,
+        spec: SurfaceSpec,
+        options: PresentationOptions,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        let _ = (spec, options);
+        Err("this presentation has no dialog surfaces".into())
+    }
+
+    /// What this surface's platform offers as a native file chooser, when it offers one.
+    ///
+    /// `None` means the platform has no chooser for this surface — the drawn picker is the
+    /// only implementation there. The capabilities are read before every request, so a
+    /// backend that loses its portal service simply stops answering here.
+    fn chooser_capabilities(&self) -> Option<ChooserCapabilities> {
+        None
+    }
+
+    /// Start a native file chooser parented to this surface.
+    ///
+    /// A backend that can answer at once may return the answer through
+    /// [`chooser_events`](Self::chooser_events) in the same call; one that cannot (a
+    /// portable portal dialog, a Windows dialog that runs its own message loop) queues it
+    /// and returns. `Ok` means the chooser is running, and the host now expects exactly
+    /// one event carrying `id`. An `Err` means nothing started and no event will come.
+    fn choose(
+        &mut self,
+        id: ChooserId,
+        request: ChooserRequest,
+    ) -> Result<(), ChooserError> {
+        let _ = (id, request);
+        Err(ChooserError::Unavailable(
+            "this presentation has no native file chooser".into(),
+        ))
+    }
+
+    /// Answers that finished since the last turn, each exactly once.
+    fn chooser_events(&mut self) -> Vec<(ChooserId, ChooserAnswer)> {
+        Vec::new()
     }
 }
 
@@ -153,6 +252,10 @@ pub struct OpenOptions {
     /// Families registered before the first frame, so a build that draws an icon by name
     /// finds its glyph.
     pub fonts: Vec<FontFace>,
+    /// The fallback families text resolves through, in order: the same stack an `AppLoop`
+    /// takes at construction. A surface opened through the host lays its text out with these,
+    /// so a build that needs a CJK face does not silently fall to the host's default.
+    pub stack: Vec<String>,
 }
 
 /// What an application message may ask of the loop.
@@ -190,8 +293,23 @@ impl LoopCtx<'_> {
 ///
 /// Stable for the surface's whole life: closing another surface must not make a held id
 /// name a different one, which an index into the live list would do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SurfaceId(u64);
+
+/// The surface a dialog belongs to, and whether it holds that surface's input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DialogLink {
+    parent: SurfaceId,
+    modal: bool,
+}
+
+/// A native chooser that is running, and the one callback its answer may reach.
+struct PendingChooser {
+    id: ChooserId,
+    /// The surface whose input the chooser holds, and whose life the chooser shares.
+    parent: SurfaceId,
+    done: Option<ChooserCallback>,
+}
 
 /// What a message handler may ask of the loop: the outputs it can see, and a surface.
 ///
@@ -202,9 +320,43 @@ pub struct MessageCtx<'a> {
     backend: &'a mut dyn Backend,
     surfaces: &'a mut Vec<LiveSurface>,
     next_surface: &'a mut u64,
+    /// Native choosers this process is waiting for; the answer is delivered by the host.
+    choosers: &'a mut ChooserQueue,
     /// A surface appeared or took a texture while the loop was turning. It has drawn
     /// nothing yet, so the loop must turn again before it blocks.
     pending_draw: &'a mut bool,
+}
+
+/// The callback a chooser's answer reaches, on the loop's own thread.
+///
+/// It gets no context on purpose: a drawn picker answers from its own `App`, where no
+/// message door exists, and the two implementations must be indistinguishable to a caller.
+/// Work that needs the loop — opening the next dialog — belongs to the app's next turn,
+/// which sees the answer in its own state.
+pub type ChooserCallback = Box<dyn FnOnce(ChooserAnswer)>;
+
+/// Native choosers waiting for an answer, and the ids they were given.
+///
+/// The queue lives in the host, not in a surface: a platform may run the dialog on a thread
+/// of its own, and the answer must come back through the surface that owns it, never
+/// through whichever surface happened to be stepped first.
+#[derive(Default)]
+struct ChooserQueue {
+    next: u64,
+    pending: Vec<PendingChooser>,
+}
+
+impl ChooserQueue {
+    fn next_id(&mut self) -> ChooserId {
+        let id = ChooserId::from_u64(self.next);
+        self.next += 1;
+        id
+    }
+
+    fn take(&mut self, id: ChooserId) -> Option<PendingChooser> {
+        let index = self.pending.iter().position(|pending| pending.id == id)?;
+        Some(self.pending.remove(index))
+    }
 }
 
 /// A surface, its id, and the engine it presents, with the panels it put on surfaces of
@@ -212,6 +364,13 @@ pub struct MessageCtx<'a> {
 struct LiveSurface {
     id: SurfaceId,
     root: Box<dyn SurfaceHandle>,
+    /// The surface this one is a dialog of, when it is one.
+    dialog: Option<DialogLink>,
+    /// A modal dialog of this surface is open: it paints, but takes no input.
+    blocked: bool,
+    /// A native chooser owned by this surface is running. It is not a dialog surface the
+    /// host steps, so its input hold is remembered here and folded into `blocked` each turn.
+    native_blocked: bool,
     panels: Vec<PanelBinding>,
     /// Panels whose surface the platform took back — a click outside, Escape. The panel
     /// still being declared does not reopen it: the app is about to undeclare it.
@@ -244,10 +403,17 @@ fn popup_spec(panel: &PlatformPanel) -> PopupSpec {
 }
 
 /// The nearest panel an inner one hangs off, so a nested panel parents the outer one.
+///
+/// A window panel holds nothing: it is a top-level of its own, and a panel declared inside
+/// one still belongs to the surface behind it.
 fn panel_parent(tree: &ui_core::tree::Tree, node: ui_core::NodeId) -> Option<ui_core::NodeId> {
     let mut cursor = tree.get(node)?.parent;
     while let Some(nid) = cursor {
-        if tree.platform_panels().iter().any(|panel| panel.node == nid) {
+        if tree
+            .platform_panels()
+            .iter()
+            .any(|panel| panel.node == nid && !panel.window)
+        {
             return Some(nid);
         }
         cursor = tree.get(nid)?.parent;
@@ -257,8 +423,14 @@ fn panel_parent(tree: &ui_core::tree::Tree, node: ui_core::NodeId) -> Option<ui_
 
 /// Build the engine a surface presents for: the app plus everything the open declared
 /// before its first frame.
-fn engine_for(app: Box<dyn App>, options: &mut OpenOptions) -> Result<Engine, String> {
-    let mut engine = AppLoop::with_stack(app, &[]);
+fn engine_for(
+    app: Box<dyn App>,
+    options: &mut OpenOptions,
+    timing: PointerTiming,
+) -> Result<Engine, String> {
+    let stack: Vec<&str> = options.stack.iter().map(String::as_str).collect();
+    let mut engine = AppLoop::with_stack(app, &stack);
+    engine.set_pointer_timing(timing);
     for image in options.images.drain(..) {
         engine.register_image(image);
     }
@@ -270,6 +442,10 @@ fn engine_for(app: Box<dyn App>, options: &mut OpenOptions) -> Result<Engine, St
     for (chord, id) in options.shortcuts.drain(..) {
         engine.bind_shortcut(chord, id);
     }
+    // The loop reconciles a panel binding for every frame it presents, so its windows can
+    // show a panel on a surface of their own; an engine built without it keeps panels inside
+    // the window, where nobody would otherwise paint them.
+    engine.set_panel_surfaces(true);
     Ok(engine)
 }
 
@@ -287,7 +463,8 @@ impl MessageCtx<'_> {
         mut options: OpenOptions,
     ) -> Result<SurfaceId, String> {
         let uncapped = options.uncapped;
-        let engine = engine_for(app, &mut options)?;
+        let timing = self.backend.pointer_timing();
+        let engine = engine_for(app, &mut options, timing)?;
         let handle = self.backend.open(spec, PresentationOptions { uncapped })?;
         let id = SurfaceId(*self.next_surface);
         *self.next_surface += 1;
@@ -297,11 +474,134 @@ impl MessageCtx<'_> {
         self.surfaces.push(LiveSurface {
             id,
             root: handle,
+            dialog: None,
+            blocked: false,
+            native_blocked: false,
             panels: Vec::new(),
             dismissed: FastSet::default(),
             refused: FastSet::default(),
             engine,
         });
+        Ok(id)
+    }
+
+    /// Open a dialog window belonging to `parent`; the loop ticks it from then on.
+    ///
+    /// The dialog's engine is its own, like every surface's. The parent stays on screen and
+    /// keeps painting; while a modal dialog is open the host drops the parent's input, and
+    /// the platform is asked for the same where it can express it.
+    pub fn open_dialog(
+        &mut self,
+        parent: SurfaceId,
+        spec: SurfaceSpec,
+        app: Box<dyn App>,
+        mut options: OpenOptions,
+    ) -> Result<SurfaceId, String> {
+        let modal = spec
+            .dialog_modal()
+            .ok_or("a dialog surface is opened with SurfaceSpec::dialog")?;
+        let index = self
+            .surfaces
+            .iter()
+            .position(|group| group.id == parent)
+            .ok_or("no such surface")?;
+        let uncapped = options.uncapped;
+        let timing = self.backend.pointer_timing();
+        let engine = engine_for(app, &mut options, timing)?;
+        let handle = self.surfaces[index]
+            .root
+            .open_dialog(spec, PresentationOptions { uncapped })?;
+        let id = SurfaceId(*self.next_surface);
+        *self.next_surface += 1;
+        // The dialog has not been stepped either, for the same reason a new surface has not.
+        *self.pending_draw = true;
+        self.surfaces.push(LiveSurface {
+            id,
+            root: handle,
+            dialog: Some(DialogLink { parent, modal }),
+            blocked: false,
+            native_blocked: false,
+            panels: Vec::new(),
+            dismissed: FastSet::default(),
+            refused: FastSet::default(),
+            engine,
+        });
+        Ok(id)
+    }
+
+    /// What `parent`'s platform offers as a native chooser, if anything.
+    pub fn chooser_capabilities(&self, parent: SurfaceId) -> Option<ChooserCapabilities> {
+        self.surfaces
+            .iter()
+            .find(|group| group.id == parent)
+            .and_then(|group| group.root.chooser_capabilities())
+    }
+
+    /// Ask the platform to run its own file chooser for `parent`.
+    ///
+    /// The request is checked against the provider's capabilities first: a feature the
+    /// provider cannot honour is [`ChooserError::Unsupported`], so the caller can fall back
+    /// to the drawn picker rather than accept a dialog missing what it asked for. On `Ok`
+    /// the parent's input is held until the answer arrives, exactly like a modal dialog
+    /// surface, and `done` runs once on the loop's thread — even when the parent closes
+    /// first, where the answer is [`ChooserError::Cancelled`].
+    pub fn choose_native(
+        &mut self,
+        parent: SurfaceId,
+        request: ChooserRequest,
+        done: impl FnOnce(ChooserAnswer) + 'static,
+    ) -> Result<ChooserId, ChooserError> {
+        request.validate().map_err(ChooserError::Failed)?;
+        let index = self
+            .surfaces
+            .iter()
+            .position(|group| group.id == parent)
+            .ok_or_else(|| ChooserError::Failed("no such surface".to_string()))?;
+        if self
+            .choosers
+            .pending
+            .iter()
+            .any(|pending| pending.parent == parent)
+        {
+            // One parent has one input state; a second dialog would make the first's
+            // completion unblock a surface the second still holds.
+            return Err(ChooserError::Failed(
+                "a chooser is already open for this surface".to_string(),
+            ));
+        }
+        let capabilities = self.surfaces[index]
+            .root
+            .chooser_capabilities()
+            .ok_or_else(|| {
+                ChooserError::Unavailable(
+                    "this presentation has no native file chooser".to_string(),
+                )
+            })?;
+        if let Some(feature) = capabilities.missing(&request) {
+            return Err(ChooserError::Unsupported(feature));
+        }
+        let modal = request.modal;
+        let id = self.choosers.next_id();
+        self.choosers.pending.push(PendingChooser {
+            id,
+            parent,
+            done: Some(Box::new(done)),
+        });
+        // The hold is set before the call: a Windows dialog runs its own message loop from
+        // inside it, and the parent must already be untouchable if that loop turns.
+        self.surfaces[index].native_blocked = modal;
+        if let Err(error) = self.surfaces[index].root.choose(id, request) {
+            if let Some(pending) = self.choosers.take(id) {
+                let _ = pending.done;
+            }
+            self.surfaces[index].native_blocked = false;
+            return Err(error);
+        }
+        // A backend that answered inside `choose` has no other chance to wake the loop: the
+        // answer is queued, but nothing arrived on the platform's wait. One extra turn
+        // drains it; an asynchronous provider takes a no-op turn and then waits for its
+        // own wake.
+        *self.pending_draw = true;
         Ok(id)
     }
 
@@ -412,6 +712,29 @@ impl MessageCtx<'_> {
     }
 }
 
+/// How a desktop decides that two presses are one multi-click.
+///
+/// Both rules must hold: a press inside the window is still a new click when it lands away
+/// from the last one. The engine reports the burst length (1, 2, 3, …) with the click, and
+/// every pointer button is counted on its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerTiming {
+    /// The longest gap between two presses of one button that still joins them.
+    pub multi_click: Duration,
+    /// How far apart two presses may land, in logical points.
+    pub multi_click_slop: f32,
+}
+
+impl Default for PointerTiming {
+    fn default() -> Self {
+        // The desktop convention: Windows' default 500 ms and a four-point rectangle.
+        Self {
+            multi_click: Duration::from_millis(500),
+            multi_click_slop: 4.0,
+        }
+    }
+}
+
 /// The platform half: open surfaces, hold the connection, wait, serve the clipboard.
 ///
 /// `wait` is the only blocking call in the process's loop. It polls the platform's handles
@@ -424,6 +747,14 @@ pub trait Backend {
         spec: SurfaceSpec,
         options: PresentationOptions,
     ) -> Result<Box<dyn SurfaceHandle>, String>;
+
+    /// How this desktop decides that two presses are one multi-click.
+    ///
+    /// The default is the desktop convention; a platform with a system setting overrides it
+    /// so a picker follows what the user tuned in the control panel.
+    fn pointer_timing(&self) -> PointerTiming {
+        PointerTiming::default()
+    }
 
     /// Publish a copy the loop drained from a surface. False when no clipboard exists.
     fn set_clipboard_copy(&mut self, copy: ClipboardCopy) -> bool;
@@ -501,6 +832,67 @@ pub trait Backend {
     fn tray_events(&mut self) -> Vec<(TrayId, TrayEvent)> {
         Vec::new()
     }
+
+    /// The platform's thumbnail source, or `None` where the platform has no thumbnail
+    /// system. Called once, when the host is built; the provider runs on its own worker.
+    fn thumbnails(&mut self) -> Option<Box<dyn Thumbnailer>> {
+        None
+    }
+
+    /// The platform's file-type icons, or `None` where it has none. Called once, when the
+    /// host is built; the provider runs on its own worker.
+    fn file_icons(&mut self) -> Option<Box<dyn FileIconProvider>> {
+        None
+    }
+
+    /// The platform's directory lister, or `None` where it cannot list directories. Called
+    /// once, when the host is built; the provider runs on its own worker.
+    fn file_listing(&mut self) -> Option<Box<dyn DirectoryLister>> {
+        None
+    }
+
+    /// The platform's file operations, or `None` where it cannot copy, trash or link files.
+    /// Called once, when the host is built; the service runs on its own worker.
+    fn file_operator(&mut self) -> Option<Box<dyn FileOperator>> {
+        None
+    }
+
+    /// The platform's classic file context menu, or `None` where its desktop has none. The
+    /// answer is stateless: every call builds the menu for the selection it is given.
+    fn shell_menu(&mut self) -> Option<Arc<dyn ShellMenuHost>> {
+        None
+    }
+
+    /// The platform's recursive search, or `None` where it cannot walk directories. Called
+    /// once, when the host is built; the walk runs on its own worker.
+    fn file_search(&mut self) -> Option<Box<dyn DirectorySearcher>> {
+        None
+    }
+
+    /// The platform's directory watcher, or `None` where it cannot watch one. Called once,
+    /// when the host is built; a watch runs on a thread of its own.
+    fn file_watch(&mut self) -> Option<Box<dyn DirectoryWatcher>> {
+        None
+    }
+
+    /// The platform's mounting of volumes that are not mounted, or `None` where it has no
+    /// removable media to mount. Called once, when the host is built; enumeration and
+    /// mounting run on the service's own worker.
+    fn volume_mounter(&mut self) -> Option<Box<dyn crate::volumes::VolumeMounter>> {
+        None
+    }
+
+    /// The places a file picker offers. Read once, when the host is built: the desktop's
+    /// user directories are a small, synchronous table.
+    fn places(&mut self) -> Vec<Place> {
+        Vec::new()
+    }
+
+    /// The mounted volumes a file picker offers beside the places. Read once, when the host
+    /// is built, for the same reason: a mount table is a small, synchronous read.
+    fn devices(&mut self) -> Vec<Device> {
+        Vec::new()
+    }
 }
 
 /// A platform with no wait to interrupt: a finished job waits for the next turn.
@@ -519,32 +911,150 @@ fn step_surfaces(
     surfaces: &mut [LiveSurface],
     stats: &mut RunStats,
 ) -> (Vec<ClipboardCopy>, Vec<(SurfaceId, String)>) {
+    mark_modality(surfaces);
     let mut copies = Vec::new();
     let mut retired = Vec::new();
     for group in surfaces {
         let id = group.id;
-        // A surface the platform's own move loop is moving draws from that loop's tick and
-        // nowhere else: a step here would pump the queue the loop is reading.
-        if group.root.moving() {
-            if group.root.pump_moved(&mut group.engine) {
-                stats.frames += 1;
-            }
-            step_panels(group, stats, &mut copies);
-            continue;
-        }
-        match group.root.step(&mut group.engine) {
-            Ok(step) => {
-                if step.drew {
-                    stats.frames += 1;
-                }
-                copies.extend(group.root.take_copies(&mut group.engine));
-                reconcile_panels(group);
-                step_panels(group, stats, &mut copies);
-            }
-            Err(reason) => retired.push((id, reason)),
+        if let Err(reason) = step_group(group, stats, &mut copies) {
+            retired.push((id, reason));
         }
     }
     (copies, retired)
+}
+
+/// Mark every surface whose input a modal dialog holds.
+///
+/// The platform's modal hint is advisory — Wayland's `xdg-dialog` says the client filters
+/// the parent's events itself — so the engine is told directly, and a surface blocked this
+/// way still paints.
+fn mark_modality(surfaces: &mut [LiveSurface]) {
+    let mut blocked: FastSet<SurfaceId> = FastSet::default();
+    for group in surfaces.iter() {
+        if let Some(dialog) = group.dialog
+            && dialog.modal
+        {
+            blocked.insert(dialog.parent);
+        }
+    }
+    for group in surfaces {
+        // A native chooser is not a surface the host steps, so its hold is carried on the
+        // parent itself; folding it in here keeps one answer to "may this surface take
+        // input", whatever holds it.
+        group.blocked = blocked.contains(&group.id) || group.native_blocked;
+        group.engine.set_input_blocked(group.blocked);
+    }
+}
+
+/// Drop retired and closed surfaces, then every dialog whose parent has gone.
+///
+/// A dialog belongs to the surface that opened it. One whose parent closed has nobody to
+/// answer it, so it closes too; the chain is walked until nothing more is orphaned. Returns
+/// how many surfaces left.
+fn retain_live(surfaces: &mut Vec<LiveSurface>, retired: &[(SurfaceId, String)]) -> usize {
+    let before = surfaces.len();
+    surfaces.retain(|group| {
+        !retired.iter().any(|(retired, _)| retired == &group.id) && !group.root.is_closed()
+    });
+    loop {
+        let live: FastSet<SurfaceId> = surfaces.iter().map(|group| group.id).collect();
+        let count = surfaces.len();
+        surfaces.retain(|group| {
+            group
+                .dialog
+                .is_none_or(|dialog| live.contains(&dialog.parent))
+        });
+        if surfaces.len() == count {
+            break;
+        }
+    }
+    before - surfaces.len()
+}
+
+/// Draw every remaining surface once after another left.
+///
+/// What a surface was showing is gone — a dialog answered the app that opened it, a window
+/// closed under the pointer — and the surfaces around the hole may depend on it. Only a
+/// build reads app state, so a departure is a frame request, like a finished job.
+fn wake_after_departure(surfaces: &mut [LiveSurface], pending_draw: &mut bool) {
+    for group in surfaces {
+        group.engine.request_frame();
+        group.root.frame_requested();
+    }
+    *pending_draw = true;
+}
+
+/// One group's turn: every panel takes its input, the tree builds one frame with the
+/// pointer resolved across all its surfaces, and each panel then shows its part of it.
+fn step_group(
+    group: &mut LiveSurface,
+    stats: &mut RunStats,
+    copies: &mut Vec<ClipboardCopy>,
+) -> Result<(), String> {
+    // The panels read their queues first: a pointer crossing from the window onto a panel
+    // leaves one surface and enters the other in the same batch, and only the panel's
+    // queue holds the half that says where it went. The frame built below is the one that
+    // has to show it, and neither surface alone can say where the pointer is.
+    intake_panels(group);
+    // A surface a modal dialog holds neither reads the pointer nor takes events; its frame
+    // still builds, so it stays painted behind the dialog.
+    let pointer = if group.blocked {
+        None
+    } else {
+        group_pointer(group)
+    };
+    // A surface the platform's own move loop is moving draws from that loop's tick and
+    // nowhere else: a step here would pump the queue the loop is reading.
+    if group.root.moving() {
+        group.engine.set_pointer_hint(pointer);
+        let drew = group.root.pump_moved(&mut group.engine);
+        group.engine.clear_pointer_hint();
+        if drew {
+            stats.frames += 1;
+        }
+        step_panels(group, stats, copies);
+        return Ok(());
+    }
+    group.engine.set_pointer_hint(pointer);
+    let stepped = group.root.step(&mut group.engine);
+    group.engine.clear_pointer_hint();
+    let step = stepped?;
+    if step.drew {
+        stats.frames += 1;
+    }
+    copies.extend(group.root.take_copies(&mut group.engine));
+    // The frame just built names the panels: bind what is new, move what moved, and let
+    // each panel show its own part of it.
+    reconcile_panels(group);
+    step_panels(group, stats, copies);
+    Ok(())
+}
+
+/// Let every panel take the input that arrived for it, before the group's frame is built.
+fn intake_panels(group: &mut LiveSurface) {
+    for binding in &mut group.panels {
+        // A surface that cannot read its queue is retired by its own step below, which
+        // fails on the same queue rather than losing the panel here.
+        if let Err(reason) = binding.handle.intake(&mut group.engine) {
+            log::warn!("ui-platform: a panel could not take its input: {reason}");
+        }
+    }
+}
+
+/// The one pointer a group's surfaces share, in the tree's coordinates.
+///
+/// The panels are asked first because their intake has just run, so their answer is this
+/// turn's; the root's queue is read by its own step, later, and a stale answer from it must
+/// not shadow a panel that really has the pointer. Panels are asked deepest-first: a flyout
+/// opened off another panel is declared after it, and while the pointer is on the flyout
+/// the outer panel still remembers where it last was, which would freeze the shared hover.
+fn group_pointer(group: &LiveSurface) -> Option<ui_core::geom::Point> {
+    group
+        .panels
+        .iter()
+        .rev()
+        .find_map(|binding| binding.handle.pointer())
+        .or_else(|| group.root.pointer())
 }
 
 /// Give every panel the last frame laid out a surface, and let go of the ones that left.
@@ -595,7 +1105,7 @@ fn reconcile_panels(group: &mut LiveSurface) {
                 }
             }
         }
-        match open_panel(group, panel.node, spec) {
+        match open_panel(group, panel, spec) {
             Ok(handle) => {
                 group.engine.set_panel_presentation(panel.node, true);
                 group.panels.push(PanelBinding {
@@ -616,9 +1126,10 @@ fn reconcile_panels(group: &mut LiveSurface) {
 /// Ask the surface that holds `node` for one of the panel's own.
 fn open_panel(
     group: &mut LiveSurface,
-    node: ui_core::NodeId,
+    panel: &PlatformPanel,
     spec: PopupSpec,
 ) -> Result<Box<dyn SurfaceHandle>, String> {
+    let node = panel.node;
     match panel_parent(group.engine.tree(), node) {
         // A panel inside a panel hangs off the outer one, so the topmost holds the grab.
         Some(outer) => {
@@ -632,6 +1143,18 @@ fn open_panel(
             {
                 Some(binding) => binding.handle.open_popup(node, rebase(spec, origin)),
                 None => Err("the panel that holds it has no surface".into()),
+            }
+        }
+        None if panel.window => {
+            let title = panel.title.as_deref().unwrap_or_default();
+            match group.root.open_panel_window(node, spec, title) {
+                Ok(handle) => Ok(handle),
+                Err(reason) => {
+                    // A panel that only reports must not vanish because the platform has
+                    // no windows: the popup form still shows it.
+                    log::info!("ui-platform: a window panel fell back to a popup: {reason}");
+                    group.root.open_popup(node, spec)
+                }
             }
         }
         None => group.root.open_popup(node, spec),
@@ -738,6 +1261,42 @@ pub struct Host {
     jobs: Jobs,
     /// Jobs completed as of the last turn.
     completed_seen: u64,
+    /// The platform's thumbnail source, when it has one; a finished request forces a frame.
+    thumbnails: Option<Thumbnails>,
+    /// Thumbnail requests completed as of the last turn.
+    thumbnails_seen: u64,
+    /// The platform's file-type icons, when it has them; a finished request forces a frame.
+    file_icons: Option<FileIcons>,
+    /// File-icon requests completed as of the last turn.
+    file_icons_seen: u64,
+    /// The platform's directory lister, when it has one; a finished read forces a frame.
+    listings: Option<Listings>,
+    /// Listings completed as of the last turn.
+    listings_seen: u64,
+    /// The platform's copy, move, delete and link service, when it has one.
+    file_operations: Option<FileOperations>,
+    /// Operations completed as of the last turn.
+    file_operations_seen: u64,
+    /// The platform's classic file context menu, when its desktop has one.
+    shell_menu: Option<Arc<dyn ShellMenuHost>>,
+    /// The platform's recursive search, when it has one; an answer forces a frame.
+    searches: Option<Searches>,
+    /// Search answers as of the last turn.
+    searches_seen: u64,
+    /// The platform's directory watcher, when it has one; a change forces a frame.
+    watches: Option<Watches>,
+    /// Watch changes as of the last turn.
+    watches_seen: u64,
+    /// The platform's mounting of unmounted volumes, when it has one.
+    volumes: Option<Volumes>,
+    /// Volume list and mount completions as of the last turn.
+    volumes_seen: u64,
+    /// Native choosers waiting for an answer.
+    choosers: ChooserQueue,
+    /// The places the platform's desktop names, read once at construction.
+    places: Vec<Place>,
+    /// The mounted volumes the platform offers, read once at construction.
+    devices: Vec<Device>,
 }
 
 type MessageHandler = Box<dyn FnMut(&mut dyn Reply, &[u8], &mut MessageCtx<'_>) -> Effect>;
@@ -751,9 +1310,52 @@ impl Host {
         let waker = backend
             .waker()
             .unwrap_or_else(|| Arc::new(NoWaker) as Arc<dyn Waker>);
+        let jobs = Jobs::new(Arc::clone(&waker));
+        let thumbnails = backend
+            .thumbnails()
+            .map(|provider| Thumbnails::new(provider, Arc::clone(&waker)));
+        let file_icons = backend
+            .file_icons()
+            .map(|provider| FileIcons::new(provider, Arc::clone(&waker)));
+        let listings = backend
+            .file_listing()
+            .map(|provider| Listings::new(provider, Arc::clone(&waker)));
+        let file_operations = backend
+            .file_operator()
+            .map(|operator| FileOperations::new(operator, Arc::clone(&waker)));
+        let shell_menu = backend.shell_menu();
+        let searches = backend
+            .file_search()
+            .map(|provider| Searches::new(provider, Arc::clone(&waker)));
+        let watches = backend
+            .file_watch()
+            .map(|provider| Watches::new(provider, Arc::clone(&waker)));
+        let volumes = backend
+            .volume_mounter()
+            .map(|provider| Volumes::new(provider, Arc::clone(&waker)));
+        let places = backend.places();
+        let devices = backend.devices();
         Self {
-            jobs: Jobs::new(waker),
+            jobs,
             completed_seen: 0,
+            thumbnails,
+            thumbnails_seen: 0,
+            file_icons,
+            file_icons_seen: 0,
+            listings,
+            listings_seen: 0,
+            file_operations,
+            file_operations_seen: 0,
+            shell_menu,
+            searches,
+            searches_seen: 0,
+            watches,
+            watches_seen: 0,
+            volumes,
+            volumes_seen: 0,
+            choosers: ChooserQueue::default(),
+            places,
+            devices,
             backend,
             surfaces: Vec::new(),
             next_surface: 0,
@@ -774,6 +1376,65 @@ impl Host {
     /// so an app may read the result in `view`.
     pub fn jobs(&self) -> Jobs {
         self.jobs.clone()
+    }
+
+    /// The platform's thumbnails, when it has a thumbnail system. A finished request wakes
+    /// the loop and forces one frame, exactly as a job does, so the next `view` sees it.
+    pub fn thumbnails(&self) -> Option<Thumbnails> {
+        self.thumbnails.clone()
+    }
+
+    /// The platform's file-type icons, when it has them. A lookup answers from the cache or
+    /// queues the provider; a finished request wakes the loop and forces one frame, exactly
+    /// as a thumbnail does.
+    pub fn file_icons(&self) -> Option<FileIcons> {
+        self.file_icons.clone()
+    }
+
+    /// The platform's directory listings, when it can read directories. A finished read
+    /// wakes the loop and forces one frame, exactly as a thumbnail does.
+    pub fn listings(&self) -> Option<Listings> {
+        self.listings.clone()
+    }
+
+    /// The platform's file operations, when it can move files. A finished operation forces
+    /// a frame, and the exit policy waits for one that is still running.
+    pub fn file_operations(&self) -> Option<FileOperations> {
+        self.file_operations.clone()
+    }
+
+    /// The platform's classic file context menu, when its desktop has one. The picker may
+    /// merge its readable rows or host the native menu; another desktop answers `None`.
+    pub fn shell_menu(&self) -> Option<Arc<dyn ShellMenuHost>> {
+        self.shell_menu.clone()
+    }
+
+    /// The platform's recursive search, when it can walk directories. Each answer wakes the
+    /// loop and forces one frame, so the picker's next `view` sees the matches.
+    pub fn searches(&self) -> Option<Searches> {
+        self.searches.clone()
+    }
+
+    /// The platform's directory watches, when it can watch one. A change wakes the loop and
+    /// forces one frame, so the picker's next `view` can read the directory again.
+    pub fn watches(&self) -> Option<Watches> {
+        self.watches.clone()
+    }
+
+    /// The platform's mounting of volumes that are not mounted, when it can mount one. A
+    /// finished list or mount wakes the loop and forces one frame, as every service does.
+    pub fn volumes(&self) -> Option<Volumes> {
+        self.volumes.clone()
+    }
+
+    /// The places the desktop names, in the order the platform returned them.
+    pub fn places(&self) -> &[Place] {
+        &self.places
+    }
+
+    /// The mounted volumes the platform offers, in the order it returned them.
+    pub fn devices(&self) -> &[Device] {
+        &self.devices
     }
 
     /// Serve the process's local channel: every message goes to `handler`, which answers
@@ -824,6 +1485,7 @@ impl Host {
             backend: &mut *self.backend,
             surfaces: &mut self.surfaces,
             next_surface: &mut self.next_surface,
+            choosers: &mut self.choosers,
             pending_draw: &mut self.pending_draw,
         }
     }
@@ -845,13 +1507,57 @@ impl Host {
         mut options: OpenOptions,
     ) -> Result<SurfaceId, String> {
         let uncapped = options.uncapped;
-        let engine = engine_for(Box::new(app), &mut options)?;
+        let timing = self.backend.pointer_timing();
+        let engine = engine_for(Box::new(app), &mut options, timing)?;
         let handle = self.backend.open(spec, PresentationOptions { uncapped })?;
         let id = SurfaceId(self.next_surface);
         self.next_surface += 1;
         self.surfaces.push(LiveSurface {
             id,
             root: handle,
+            dialog: None,
+            blocked: false,
+            native_blocked: false,
+            panels: Vec::new(),
+            dismissed: FastSet::default(),
+            refused: FastSet::default(),
+            engine,
+        });
+        Ok(id)
+    }
+
+    /// Open a dialog window belonging to `parent`; the loop ticks it from then on.
+    ///
+    /// The same contract as [`MessageCtx::open_dialog`], for work between turns.
+    pub fn open_dialog<A: App + 'static>(
+        &mut self,
+        parent: SurfaceId,
+        spec: SurfaceSpec,
+        app: A,
+        mut options: OpenOptions,
+    ) -> Result<SurfaceId, String> {
+        let modal = spec
+            .dialog_modal()
+            .ok_or("a dialog surface is opened with SurfaceSpec::dialog")?;
+        let index = self
+            .surfaces
+            .iter()
+            .position(|group| group.id == parent)
+            .ok_or("no such surface")?;
+        let uncapped = options.uncapped;
+        let timing = self.backend.pointer_timing();
+        let engine = engine_for(Box::new(app), &mut options, timing)?;
+        let handle = self.surfaces[index]
+            .root
+            .open_dialog(spec, PresentationOptions { uncapped })?;
+        let id = SurfaceId(self.next_surface);
+        self.next_surface += 1;
+        self.surfaces.push(LiveSurface {
+            id,
+            root: handle,
+            dialog: Some(DialogLink { parent, modal }),
+            blocked: false,
+            native_blocked: false,
             panels: Vec::new(),
             dismissed: FastSet::default(),
             refused: FastSet::default(),
@@ -917,11 +1623,16 @@ impl Host {
             self.turn()?;
             self.backend.flush();
             if self.stopped() || (exit_when_empty && self.surfaces.is_empty()) {
-                if self.jobs.outstanding() == 0 {
+                if self.jobs.outstanding() == 0
+                    && self
+                        .file_operations
+                        .as_ref()
+                        .is_none_or(|operations| operations.outstanding() == 0)
+                {
                     break;
                 }
-                // A window that closed while a save ran must not take the save with it.
-                // The worker's wake ends this wait early; the timeout covers a platform
+                // A window that closed while a save or a transfer ran must not take it with
+                // it. The worker's wake ends this wait early; the timeout covers a platform
                 // with no waker at all.
                 self.backend.wait(Some(Duration::from_millis(50)))?;
                 continue;
@@ -1010,6 +1721,86 @@ impl Host {
                 group.root.frame_requested();
             }
         }
+        // A thumbnail arrived; turning it into a picture is the app's view, so it needs a
+        // frame for the same reason a job result does.
+        if let Some(thumbnails) = &self.thumbnails {
+            let done = thumbnails.completed();
+            if done != self.thumbnails_seen {
+                self.thumbnails_seen = done;
+                for group in &mut self.surfaces {
+                    group.engine.request_frame();
+                    group.root.frame_requested();
+                }
+            }
+        }
+        // An icon arrived; like a thumbnail, the row that shows it is the app's view.
+        if let Some(file_icons) = &self.file_icons {
+            let done = file_icons.completed();
+            if done != self.file_icons_seen {
+                self.file_icons_seen = done;
+                for group in &mut self.surfaces {
+                    group.engine.request_frame();
+                    group.root.frame_requested();
+                }
+            }
+        }
+        // A listing arrived; the rows it names are the app's view as well.
+        if let Some(listings) = &self.listings {
+            let done = listings.completed();
+            if done != self.listings_seen {
+                self.listings_seen = done;
+                for group in &mut self.surfaces {
+                    group.engine.request_frame();
+                    group.root.frame_requested();
+                }
+            }
+        }
+        // A transfer progressed, asked a conflict question, or finished; the footer and the
+        // conflict panel are the app's view.
+        if let Some(operations) = &self.file_operations {
+            let revision = operations.revision();
+            if revision != self.file_operations_seen {
+                self.file_operations_seen = revision;
+                for group in &mut self.surfaces {
+                    group.engine.request_frame();
+                    group.root.frame_requested();
+                }
+            }
+        }
+        // A search found more entries, or stopped; the rows are the app's view.
+        if let Some(searches) = &self.searches {
+            let done = searches.completed();
+            if done != self.searches_seen {
+                self.searches_seen = done;
+                for group in &mut self.surfaces {
+                    group.engine.request_frame();
+                    group.root.frame_requested();
+                }
+            }
+        }
+        // Something inside a watched directory changed; its listing is stale now.
+        if let Some(watches) = &self.watches {
+            let done = watches.completed();
+            if done != self.watches_seen {
+                self.watches_seen = done;
+                for group in &mut self.surfaces {
+                    group.engine.request_frame();
+                    group.root.frame_requested();
+                }
+            }
+        }
+        // A volume list arrived or a mount finished; the sidebar and the directory it
+        // names are the app's view.
+        if let Some(volumes) = &self.volumes {
+            let done = volumes.completed();
+            if done != self.volumes_seen {
+                self.volumes_seen = done;
+                for group in &mut self.surfaces {
+                    group.engine.request_frame();
+                    group.root.frame_requested();
+                }
+            }
+        }
         // Before anything answers a command: a status reply or a pin placement must not use
         // yesterday's outputs.
         self.outputs = self.backend.outputs();
@@ -1017,25 +1808,16 @@ impl Host {
         // loop does not return until the pointer is released. The surface is taken out of
         // the list while its step runs, so the gesture's own timer can reach the rest of
         // the process through [`modal::pump_others`](crate::modal::pump_others).
+        mark_modality(&mut self.surfaces);
         let mut index = 0;
         while index < self.surfaces.len() {
             let mut group = self.surfaces.remove(index);
             let mut others = || self.pump_others();
             crate::modal::arm(&mut others);
-            let stepped = group.root.step(&mut group.engine);
+            let stepped = step_group(&mut group, &mut self.stats, &mut copies);
             crate::modal::disarm();
-            match stepped {
-                Ok(step) => {
-                    if step.drew {
-                        self.stats.frames += 1;
-                    }
-                    copies.extend(group.root.take_copies(&mut group.engine));
-                    // The frame just built names the panels: bind what is new, move what
-                    // moved, and let each panel show its own part of it.
-                    reconcile_panels(&mut group);
-                    step_panels(&mut group, &mut self.stats, &mut copies);
-                }
-                Err(reason) => retired.push((group.id, reason)),
+            if let Err(reason) = stepped {
+                retired.push((group.id, reason));
             }
             self.surfaces.insert(index, group);
             index += 1;
@@ -1051,14 +1833,83 @@ impl Host {
         for (id, reason) in &retired {
             log::warn!("ui-platform: surface {id:?} was retired: {reason}");
         }
-        self.surfaces.retain(|group| {
-            !retired.iter().any(|(retired, _)| retired == &group.id) && !group.root.is_closed()
-        });
+        if retain_live(&mut self.surfaces, &retired) > 0 {
+            wake_after_departure(&mut self.surfaces, &mut self.pending_draw);
+        }
+        self.serve_choosers();
         self.serve_hotkeys();
         self.serve_tray();
         self.serve_channel();
         self.serve_turn();
         Ok(())
+    }
+
+    /// Hand every native chooser answer to the one callback waiting for it.
+    ///
+    /// Answers are drained from every surface before a callback runs: a callback may open
+    /// the next dialog, and the surface list must not be borrowed while it does.
+    fn serve_choosers(&mut self) {
+        let mut answers = Vec::new();
+        for group in &mut self.surfaces {
+            answers.extend(group.root.chooser_events());
+        }
+        for (id, answer) in answers {
+            let Some(pending) = self.choosers.take(id) else {
+                log::warn!("ui-platform: a chooser answered with an unknown id {id:?}");
+                continue;
+            };
+            self.release_parent(pending.parent);
+            if let Some(done) = pending.done {
+                // The callback runs after the queue entry is gone, so it may start another
+                // chooser through the app's next turn without finding this one again.
+                done(answer);
+            }
+        }
+        self.abandon_dead_choosers();
+    }
+
+    /// Give a surface its input back and make it draw: the chooser covered part of it.
+    fn release_parent(&mut self, parent: SurfaceId) {
+        let released = match self.surfaces.iter_mut().find(|group| group.id == parent) {
+            Some(group) => {
+                group.native_blocked = false;
+                group.engine.request_frame();
+                group.root.frame_requested();
+                true
+            }
+            None => false,
+        };
+        self.pending_draw |= released;
+    }
+
+    /// Answer the choosers whose parent went away while they were running.
+    ///
+    /// A dialog that loses its parent has nobody to answer; the portal may answer later, but
+    /// its callback must still run exactly once, and the surface it would have answered for
+    /// is gone. The parent's disappearance is the close the user could not give.
+    fn abandon_dead_choosers(&mut self) {
+        if self.choosers.pending.is_empty() {
+            return;
+        }
+        let live: FastSet<SurfaceId> = self.surfaces.iter().map(|group| group.id).collect();
+        let dead: Vec<ChooserId> = self
+            .choosers
+            .pending
+            .iter()
+            .filter(|pending| !live.contains(&pending.parent))
+            .map(|pending| pending.id)
+            .collect();
+        if dead.is_empty() {
+            return;
+        }
+        for id in dead {
+            let Some(pending) = self.choosers.take(id) else {
+                continue;
+            };
+            if let Some(done) = pending.done {
+                done(ChooserAnswer::native(Err(ChooserError::Cancelled)));
+            }
+        }
     }
 
     /// Step every surface but the one a modal gesture is running for.
@@ -1083,9 +1934,9 @@ impl Host {
         for (id, reason) in &retired {
             log::warn!("ui-platform: surface {id:?} was retired: {reason}");
         }
-        self.surfaces.retain(|group| {
-            !retired.iter().any(|(retired, _)| retired == &group.id) && !group.root.is_closed()
-        });
+        if retain_live(&mut self.surfaces, &retired) > 0 {
+            wake_after_departure(&mut self.surfaces, &mut self.pending_draw);
+        }
     }
 
     /// Hand every hotkey the backend queued to the application's handler.
@@ -1106,6 +1957,7 @@ impl Host {
                 backend: &mut *self.backend,
                 surfaces: &mut self.surfaces,
                 next_surface: &mut self.next_surface,
+                choosers: &mut self.choosers,
                 pending_draw: &mut self.pending_draw,
             };
             if handler(id, &mut context) == Effect::Quit {
@@ -1131,6 +1983,7 @@ impl Host {
                 backend: &mut *self.backend,
                 surfaces: &mut self.surfaces,
                 next_surface: &mut self.next_surface,
+                choosers: &mut self.choosers,
                 pending_draw: &mut self.pending_draw,
             };
             if handler(id, event, &mut context) == Effect::Quit {
@@ -1150,6 +2003,7 @@ impl Host {
             quit,
             deadline,
             pending_draw,
+            choosers,
             on_turn,
             ..
         } = self;
@@ -1161,6 +2015,7 @@ impl Host {
             backend: &mut **backend,
             surfaces,
             next_surface,
+            choosers,
             pending_draw,
         };
         let mut loop_context = LoopCtx {
@@ -1181,6 +2036,7 @@ impl Host {
             next_surface,
             quit: host_quit,
             pending_draw,
+            choosers,
             ..
         } = self;
         let Some((channel, handler)) = channel.as_mut() else {
@@ -1193,6 +2049,7 @@ impl Host {
                 backend: &mut **backend,
                 surfaces,
                 next_surface,
+                choosers,
                 pending_draw,
             };
             if handler(reply, bytes, &mut context) == Effect::Quit {

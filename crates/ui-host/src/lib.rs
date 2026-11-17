@@ -22,6 +22,10 @@ pub use ui_platform_win32::{
 // on the platform side would give one app two structs that drift apart.
 pub use ui_platform::{HostSession, SessionOptions, Tick};
 
+// The classic shell menu is a capability, not a backend choice: the portable row and host
+// contracts are re-exported so an app needs only this crate to name them.
+pub use ui_platform::shell_menu::{ShellMenuHost, ShellMenuRow};
+
 /// The process's backend, opened.
 ///
 /// A Wayland session has a display connection to make, so this can fail there; on Windows

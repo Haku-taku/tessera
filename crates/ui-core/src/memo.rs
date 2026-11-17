@@ -28,6 +28,8 @@ pub enum Dep {
     HoveredWithin(Id, bool),
     PressedWithin(Id, bool),
     ClickedWithin(Id, bool),
+    /// The burst length of this frame's click on `id`, or zero when it got none.
+    ClicksWithin(Id, u32),
     ActivatedWithin(Id, bool),
     DroppedWithin(Id, bool),
     /// A live drag is over this node or a descendant and the node takes what it offers.

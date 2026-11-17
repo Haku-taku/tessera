@@ -113,6 +113,35 @@ fn an_engine_owned_scroller_accumulates_the_wheel_and_clamps_to_its_content() {
     );
 }
 
+/// The painted offset lands on the grid text is rasterized on while the stored offset keeps
+/// the exact wheel sum. At a fractional scale an unsnapped origin gives every scroll step a
+/// new glyph rasterization: the text shimmers against rows and fills that move smoothly.
+#[test]
+fn an_engine_owned_offset_paints_on_the_text_grid() {
+    let mut lp = AppLoop::new(ScrollApp);
+    lp.set_scale(1.5);
+    let mut target = OffscreenTarget::new(150, 150);
+    lp.frame(&mut target, None);
+    let pos = geom::Point::new(50.0, 50.0);
+    lp.dispatch(ui_core::Event::PointerMoved { pos });
+    lp.dispatch(ui_core::Event::wheel(pos, 10.5));
+    lp.frame(&mut target, None);
+    let painted = scroll_y_of(&lp);
+    let device = painted * 1.5;
+    assert!(
+        (device - device.round()).abs() < 1e-3,
+        "the painted offset must land on a whole device pixel, got {device}"
+    );
+    let stored = lp
+        .scroll_offset(Id::str("scroller"))
+        .map(|offset| offset.y)
+        .unwrap_or_default();
+    assert!(
+        (stored - 10.5).abs() < 1e-3,
+        "the stored offset must keep the exact wheel sum, got {stored}"
+    );
+}
+
 #[test]
 fn a_build_reads_the_engine_owned_offset_and_content_extent_from_the_context() {
     // A control that draws a scrollbar or follows the scroll must read the engine's stored

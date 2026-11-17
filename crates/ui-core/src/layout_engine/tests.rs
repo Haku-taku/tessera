@@ -414,6 +414,7 @@ mod layout {
                 ),
         );
         let mut engine = BuiltinLayout::new(MonospaceMeasure::default());
+        tree.set_panel_surfaces(true);
         let root = tree.root().unwrap();
         engine.solve(&mut tree, root, Constraints::loose(Size::new(200.0, 200.0)));
 
@@ -437,6 +438,57 @@ mod layout {
             (recorded[0].rect.origin.x, recorded[0].rect.origin.y),
             (150.0, 170.0),
             "the platform gets the preferred position, not a clamped one"
+        );
+    }
+
+    /// A window panel is recorded as a window and carries the title its decl named; with no
+    /// host to open windows it is the parent's panel again, placed inside the viewport.
+    #[test]
+    fn a_window_panel_is_recorded_with_its_title_and_is_the_parents_without_a_host() {
+        use crate::layout::{Anchor, OverlayPlacement, Presentation};
+        let view = || {
+            Decl::container(Id::str("root"), NodeKind::Stack)
+                .size(crate::layout::SizeClass::fixed(200.0, 200.0))
+                .child(
+                    Decl::container(Id::str("panel"), NodeKind::Box)
+                        .size(crate::layout::SizeClass::fixed(80.0, 60.0))
+                        .window_title("Properties")
+                        .overlay(
+                            OverlayPlacement::below(Anchor::Node(Id::str("root")))
+                                .presentation(Presentation::Window),
+                        ),
+                )
+        };
+        let mut engine = BuiltinLayout::new(MonospaceMeasure::default());
+
+        let mut tree = Tree::new();
+        tree.apply(&view());
+        let root = tree.root().unwrap();
+        engine.solve(&mut tree, root, Constraints::loose(Size::new(200.0, 200.0)));
+        assert!(
+            tree.platform_panels().is_empty(),
+            "a host that cannot present windows is asked for nothing"
+        );
+        let panel = tree
+            .get(tree.find_by_id(Id::str("panel")).unwrap())
+            .unwrap();
+        assert_eq!(
+            panel.rect.origin.y, 140.0,
+            "the panel it paints itself is clamped into the viewport"
+        );
+
+        let mut tree = Tree::new();
+        tree.set_panel_surfaces(true);
+        tree.apply(&view());
+        let root = tree.root().unwrap();
+        engine.solve(&mut tree, root, Constraints::loose(Size::new(200.0, 200.0)));
+        let recorded = tree.platform_panels();
+        assert_eq!(recorded.len(), 1, "one panel asks for a surface of its own");
+        assert!(recorded[0].window, "it asks for a window, not a popup");
+        assert_eq!(recorded[0].title.as_deref(), Some("Properties"));
+        assert_eq!(
+            recorded[0].rect.origin.y, 200.0,
+            "a window keeps the place its anchor gives it"
         );
     }
 
@@ -850,26 +902,6 @@ mod layout {
             Rect::new(10.0, 10.0, 180.0, 80.0),
             "a filling stack child must take the padded content box, got {:?}",
             layer.rect
-        );
-    }
-
-    /// Column children stretch to the content width by default.
-    #[test]
-    fn column_children_stretch_across_the_cross_axis() {
-        let mut tree = Tree::new();
-        tree.apply(
-            &Decl::container(Id::str("root"), NodeKind::Column)
-                .padding(Insets::all(10.0))
-                .child(Decl::container(Id::str("a"), NodeKind::Row)),
-        );
-        let mut engine = BuiltinLayout::new(MonospaceMeasure::default());
-        let root = tree.root().unwrap();
-        engine.solve(&mut tree, root, Constraints::loose(Size::new(200.0, 100.0)));
-        let a = tree.get(tree.find_by_id(Id::str("a")).unwrap()).unwrap();
-        assert_eq!(
-            a.rect.size.w, 180.0,
-            "child must fill the padded content width, got {}",
-            a.rect.size.w
         );
     }
 

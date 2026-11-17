@@ -45,7 +45,10 @@ pub use anim::{AnimSpec, AnimStore, Easing, PieceCubic, Status, Travel};
 pub use cursor::CursorShape;
 pub use cx::MathLayout;
 pub use damage::{Damage, DamageAccum};
-pub use dnd::{DndEvent, DragData, DragItem, DropEffect, mime_matches, offered_matches};
+pub use dnd::{
+    DndEvent, DragData, DragItem, DropEffect, DropEffects, DropOutcome, DropReport, Performer,
+    mime_matches, negotiate_effect, offered_matches,
+};
 pub use drag::{DRAG_THRESHOLD, DragEvent, DragState, DragTracker, past_threshold};
 pub use draw::{
     Batch, Caret, DrawList, GlyphKind, GlyphPrim, InkRadius, InkTarget, LinePrim, MathPrim,
@@ -67,7 +70,7 @@ pub use math::{
     EditKey, Formula, InlineObject, MathAttach, MathCaret, MathEdit, MathEditRect, MathItem,
 };
 pub use memo::{CachedKey, DeclCache, Dep};
-pub use menu::MenuItem;
+pub use menu::{MenuIcon, MenuItem, MenuRow};
 pub use selection::{
     SelectionFragment, SelectionGeometry, SelectionPaint, SelectionPainter, SelectionPainterRef,
     SelectionPrim, TextSelection, flat_selection,

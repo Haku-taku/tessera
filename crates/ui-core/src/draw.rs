@@ -1084,6 +1084,9 @@ pub struct Acrylic {
     pub luminosity: Color,
     /// Grain layer opacity; the reference tiles a 2% noise image here.
     pub noise: f32,
+    /// The opaque paint used where no backdrop can be sampled: a surface of the window's
+    /// own has nothing behind it, and WinUI's acrylic names a stand-in for exactly that.
+    pub fallback: Color,
 }
 
 /// What glass does to its capture before any colour: a neutral luminance transfer plus a
@@ -1188,6 +1191,18 @@ pub enum BackdropMaterial {
 impl BackdropMaterial {
     /// The material that leaves the blur untouched.
     pub const PLAIN: Self = Self::Plain;
+
+    /// What to paint where the backdrop cannot be sampled, if the material names anything.
+    ///
+    /// A panel lives on a surface of its own, so the parent's pixels are not behind it; the
+    /// acrylic's stand-in is what WinUI itself draws in that case. Glass names no stand-in:
+    /// it is defined over content, so a glass panel keeps its declared fill and nothing more.
+    pub fn fallback(&self) -> Option<Color> {
+        match self {
+            Self::Plain | Self::LiquidGlass(_) => None,
+            Self::Acrylic(acrylic) => Some(acrylic.fallback),
+        }
+    }
 }
 
 /// A backdrop blur recorded by `Op::Backdrop`.

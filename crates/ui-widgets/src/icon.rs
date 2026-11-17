@@ -83,6 +83,11 @@ impl IconSource {
         }
     }
 
+    /// The menu-row form of `glyph(name, set)`: a menu draws the mark and none of its axes.
+    pub fn menu_glyph(name: &str, set: IconSet) -> ui_core::menu::MenuIcon {
+        ui_core::menu::MenuIcon::new(Family::Named(set.family()), lookup(name))
+    }
+
     /// Builder: the `FILL` axis; the slot resolves it per state.
     pub fn fill(mut self, fill: f32) -> Self {
         if let Self::Glyph { fill: f, .. } = &mut self {

@@ -218,7 +218,7 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for HostState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wl_data_source::Event::Send { fd, .. } => state.seat.serve(fd),
+            wl_data_source::Event::Send { mime_type, fd } => state.seat.serve(&mime_type, fd),
             wl_data_source::Event::Cancelled => state.seat.cancelled(),
             _ => {}
         }
@@ -317,7 +317,9 @@ impl Dispatch<ext_data_control_source_v1::ExtDataControlSourceV1, ()> for HostSt
         _: &QueueHandle<Self>,
     ) {
         match event {
-            ext_data_control_source_v1::Event::Send { fd, .. } => state.control.serve(fd),
+            ext_data_control_source_v1::Event::Send { mime_type, fd } => {
+                state.control.serve(&mime_type, fd)
+            }
             ext_data_control_source_v1::Event::Cancelled => state.control.clear(),
             _ => {}
         }
@@ -394,14 +396,12 @@ impl ClipboardHost {
         let contents = match content {
             ClipboardContent::Text(text) => Contents::Text(text),
             ClipboardContent::Bytes { mime, data } => Contents::Bytes { mime, data },
+            ClipboardContent::Files { paths, effect } => Contents::Files {
+                paths,
+                cut: effect == ui_core::DropEffect::Move,
+            },
         };
-        let mimes: Vec<String> = match &contents {
-            Contents::Text(_) => crate::clipboard::MIMES
-                .iter()
-                .map(|m| m.to_string())
-                .collect(),
-            Contents::Bytes { mime, .. } => vec![mime.clone()],
-        };
+        let mimes = contents.mimes();
         let qh = self.queue.handle();
         match &mut self.writer {
             Writer::Control {

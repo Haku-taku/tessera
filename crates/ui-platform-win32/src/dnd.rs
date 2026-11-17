@@ -11,7 +11,9 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use ui_core::Event;
-use ui_core::dnd::{DndEvent, DragData, DragItem, DropEffect};
+use ui_core::dnd::{
+    DndEvent, DragData, DragItem, DropEffect, DropEffects, DropOutcome, Performer,
+};
 use ui_core::geom::{Point, Rect};
 use ui_platform::view::{DragImage, NativeDrag};
 use windows::Win32::Foundation::{
@@ -35,7 +37,7 @@ use windows::Win32::System::Ole::{
     ReleaseStgMedium, RevokeDragDrop,
 };
 use windows::Win32::System::SystemServices::{
-    MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS,
+    MK_CONTROL, MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{
@@ -51,6 +53,12 @@ pub(crate) struct DragQueue {
     events: RefCell<Vec<Event>>,
     /// The effect of the drop under the pointer, in `DROPEFFECT` bits; 0 for none.
     effect: Cell<u32>,
+    /// The button the drag is being carried with, read from the keys OLE reports: the
+    /// release callback arrives before the button-up, so the drag's own state is the
+    /// only place that still knows which button started it.
+    button: Cell<ui_core::PointerButton>,
+    /// The modifiers last reported, so a drag does not flood the queue with unchanged ones.
+    mods: Cell<ui_core::Modifiers>,
     hwnd: HWND,
 }
 
@@ -59,7 +67,34 @@ impl DragQueue {
         Self {
             events: RefCell::new(Vec::new()),
             effect: Cell::new(0),
+            button: Cell::new(ui_core::PointerButton::Primary),
+            mods: Cell::new(ui_core::Modifiers::NONE),
             hwnd,
+        }
+    }
+
+    /// Report the keyboard state OLE carried, if it changed since the last callback.
+    ///
+    /// The app's own key events do not arrive while another application's drag is modal,
+    /// so the drop callback's `grfKeyState` is the only source of the modifiers held.
+    fn keys(&self, keys: MODIFIERKEYS_FLAGS) {
+        self.keys_with(keys, false);
+    }
+
+    /// Report the keyboard state OLE carried, pushing it even when unchanged if `force`.
+    ///
+    /// A new drag starts from whatever the app last heard; the source's own state is the
+    /// truth for the whole gesture, so the entry always announces it.
+    fn keys_with(&self, keys: MODIFIERKEYS_FLAGS, force: bool) {
+        let modifiers = carried_modifiers(keys);
+        if force || modifiers != self.mods.get() {
+            self.mods.set(modifiers);
+            self.push(Event::Modifiers(modifiers));
+        }
+        // An absent button bit does not mean "no button": the release callback can run
+        // with the button already up, and the last held button is the one that started it.
+        if keys.contains(MK_LBUTTON) || keys.contains(MK_RBUTTON) || keys.contains(MK_MBUTTON) {
+            self.button.set(carried_button(keys));
         }
     }
 
@@ -165,18 +200,22 @@ pub(crate) fn begin(
     if formats.is_empty() {
         return false;
     }
-    let allowed = match drag.data.effect {
-        DropEffect::Copy => DROPEFFECT_COPY,
-        DropEffect::Move => DROPEFFECT_MOVE,
-        DropEffect::Link => DROPEFFECT_LINK,
-    };
+    let allowed = DROPEFFECT(ole_effects(drag.data.effects));
+    if allowed.0 == 0 {
+        return false;
+    }
     // The window's drop target started OLE when it registered; this only covers a window
     // that takes drags out but never any in.
     if !ensure_ole() {
         return false;
     }
+    // A target that performs an optimized move signals it by setting our data to a null
+    // medium; without that signal the source still owns the originals and must remove
+    // them itself when OLE reports a move.
+    let moved = Rc::new(Cell::new(false));
     let object: IDataObject = DataObject {
         formats: RefCell::new(formats),
+        moved: Rc::clone(&moved),
     }
     .into();
     attach_image(hwnd, &drag, &object);
@@ -188,7 +227,7 @@ pub(crate) fn begin(
         let result = unsafe { DoDragDrop(&object, &source, allowed, &mut effect) };
         crate::modal::disarm(hwnd, timer);
         queue.push(Event::Dnd(DndEvent::Finished {
-            dropped: result.is_ok() && effect != DROPEFFECT_NONE,
+            outcome: ole_outcome(result.is_ok(), effect, moved.get()),
         }));
         return true;
     }
@@ -197,9 +236,89 @@ pub(crate) fn begin(
     // Queued behind the callbacks OLE just made: any drop this window took is processed
     // before the source hears the gesture is over.
     queue.push(Event::Dnd(DndEvent::Finished {
-        dropped: result.is_ok() && effect != DROPEFFECT_NONE,
+        outcome: ole_outcome(result.is_ok(), effect, moved.get()),
     }));
     true
+}
+
+/// The `DROPEFFECT_*` bits for a payload's permitted effects.
+fn ole_effects(effects: DropEffects) -> u32 {
+    [DropEffect::Copy, DropEffect::Move, DropEffect::Link]
+        .into_iter()
+        .filter(|effect| effects.contains(*effect))
+        .fold(0, |bits, effect| bits | ole_effect(effect).0)
+}
+
+/// One effect as its `DROPEFFECT_*` value.
+fn ole_effect(effect: DropEffect) -> DROPEFFECT {
+    match effect {
+        DropEffect::Copy => DROPEFFECT_COPY,
+        DropEffect::Move => DROPEFFECT_MOVE,
+        DropEffect::Link => DROPEFFECT_LINK,
+    }
+}
+
+/// The engine's effects for the `DROPEFFECT_*` bits OLE reports.
+fn drop_effects(bits: DROPEFFECT) -> DropEffects {
+    let mut effects = DropEffects::NONE;
+    if bits.0 & DROPEFFECT_COPY.0 != 0 {
+        effects |= DropEffects::COPY;
+    }
+    if bits.0 & DROPEFFECT_MOVE.0 != 0 {
+        effects |= DropEffects::MOVE;
+    }
+    if bits.0 & DROPEFFECT_LINK.0 != 0 {
+        effects |= DropEffects::LINK;
+    }
+    effects
+}
+
+/// How a finished `DoDragDrop` ended, normalized for the engine.
+///
+/// An optimized move is the target's; any other move is still the source's to finish,
+/// because the target copied the data and left the originals in place.
+fn ole_outcome(succeeded: bool, effect: DROPEFFECT, moved: bool) -> Option<DropOutcome> {
+    if !succeeded || effect == DROPEFFECT_NONE {
+        return None;
+    }
+    let action = if effect == DROPEFFECT_MOVE {
+        DropEffect::Move
+    } else if effect == DROPEFFECT_LINK {
+        DropEffect::Link
+    } else {
+        DropEffect::Copy
+    };
+    Some(DropOutcome {
+        action,
+        performed_by: if action == DropEffect::Move && !moved {
+            Performer::Source
+        } else {
+            Performer::Target
+        },
+    })
+}
+
+/// The keyboard modifiers OLE reports with a drag callback.
+fn carried_modifiers(keys: MODIFIERKEYS_FLAGS) -> ui_core::Modifiers {
+    /// `MK_ALT`; the windows metadata keeps every other `MK_*` in this module but this one.
+    const MK_ALT: u32 = 0x0020;
+    ui_core::Modifiers {
+        shift: keys.contains(MK_SHIFT),
+        ctrl: keys.contains(MK_CONTROL),
+        alt: keys.0 & MK_ALT != 0,
+        logo: false,
+    }
+}
+
+/// The button a drag is being carried with, from the mouse bits OLE reports.
+fn carried_button(keys: MODIFIERKEYS_FLAGS) -> ui_core::PointerButton {
+    if keys.contains(MK_RBUTTON) {
+        ui_core::PointerButton::Secondary
+    } else if keys.contains(MK_MBUTTON) {
+        ui_core::PointerButton::Middle
+    } else {
+        ui_core::PointerButton::Primary
+    }
 }
 
 /// Carry the dragged element's own pixels under the pointer for the whole gesture.
@@ -413,6 +532,13 @@ fn payload_formats(data: &DragData) -> Vec<(u32, Vec<u8>)> {
             }
         }
     }
+    // The source's own preference travels with the payload: OLE itself only knows the set
+    // it permits, and the target would otherwise read "no modifier" as copy.
+    if !formats.is_empty()
+        && let Some(format) = clipboard::preferred_effect_format()
+    {
+        formats.push((format, ole_effect(data.preferred).0.to_le_bytes().to_vec()));
+    }
     formats
 }
 
@@ -457,7 +583,38 @@ fn read_payload(data: &IDataObject) -> Option<DragData> {
             items.push(DragItem { mime, data: bytes });
         }
     }
-    (!items.is_empty()).then(|| DragData::new(items))
+    if items.is_empty() {
+        return None;
+    }
+    let mut payload = DragData::new(items);
+    if let Some(effect) = stated_effect(data) {
+        payload.preferred = effect;
+        payload.effects = payload.effects.union(DropEffects::from_effect(effect));
+    }
+    Some(payload)
+}
+
+/// The effect the source states for the payload, when it names one.
+///
+/// The same `Preferred DropEffect` block a clipboard carries: Explorer writes it for a cut
+/// paste, and this app writes it so a drag coming home keeps its meaning.
+fn stated_effect(data: &IDataObject) -> Option<DropEffect> {
+    let format = clipboard::preferred_effect_format()?;
+    // SAFETY: the interface belongs to the source and outlives the call.
+    if unsafe { data.QueryGetData(&etc(format)) }.is_err() {
+        return None;
+    }
+    let mut medium = (unsafe { data.GetData(&etc(format)) }).ok()?;
+    let bits = medium_bytes(&medium);
+    // SAFETY: `medium` came from `GetData` and has not been released.
+    unsafe { ReleaseStgMedium(&mut medium) };
+    let bits = u32::from_le_bytes(bits?.get(..4)?.try_into().ok()?);
+    Some(
+        drop_effects(DROPEFFECT(bits))
+            .iter()
+            .next()
+            .unwrap_or(DropEffect::Copy),
+    )
 }
 
 /// A `FORMATETC` for one format, globally backed and content-addressed.
@@ -591,22 +748,38 @@ impl IDropTarget_Impl for DropTarget_Impl {
     fn DragEnter(
         &self,
         pdataobj: Ref<IDataObject>,
-        _keys: MODIFIERKEYS_FLAGS,
+        keys: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> Result<()> {
         let data = pdataobj.ok()?;
         let types = offered_types(data);
+        // SAFETY: OLE passes a readable in-out parameter, which is the documented contract.
+        let offered = unsafe { pdweffect.as_ref() }.copied().unwrap_or(DROPEFFECT_NONE);
+        let effects = match drop_effects(offered) {
+            effects if effects.is_empty() => DropEffects::COPY,
+            effects => effects,
+        };
+        self.queue.keys_with(keys, true);
         if let Some(pos) = self.queue.client(pt) {
             self.queue.push(Event::Dnd(DndEvent::Entered {
                 pos,
                 types: types.clone(),
+                effects,
             }));
         }
         // OLE asks for an answer before this loop has built a frame; copying is the
         // permissive answer, and the next `DragOver` carries the engine's own choice.
         if self.queue.effect.get() == 0 && !types.is_empty() {
-            self.queue.effect.set(DROPEFFECT_COPY.0);
+            let answer = if effects.contains(DropEffect::Copy) {
+                DROPEFFECT_COPY
+            } else {
+                effects
+                    .iter()
+                    .next()
+                    .map_or(DROPEFFECT_NONE, ole_effect)
+            };
+            self.queue.effect.set(answer.0);
         }
         write_effect(pdweffect, self.queue.effect.get());
         let at = POINT { x: pt.x, y: pt.y };
@@ -616,10 +789,11 @@ impl IDropTarget_Impl for DropTarget_Impl {
 
     fn DragOver(
         &self,
-        _keys: MODIFIERKEYS_FLAGS,
+        keys: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> Result<()> {
+        self.queue.keys(keys);
         if let Some(pos) = self.queue.client(pt) {
             self.queue.push(Event::Dnd(DndEvent::Over { pos }));
         }
@@ -639,18 +813,32 @@ impl IDropTarget_Impl for DropTarget_Impl {
     fn Drop(
         &self,
         pdataobj: Ref<IDataObject>,
-        _keys: MODIFIERKEYS_FLAGS,
+        keys: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> Result<()> {
         let data = pdataobj.ok()?;
+        self.queue.keys(keys);
         let effect = self.queue.effect.get();
         if effect != 0
             && let Some(payload) = read_payload(data)
             && let Some(pos) = self.queue.client(pt)
         {
-            self.queue
-                .push(Event::Dnd(DndEvent::Dropped { pos, data: payload }));
+            // An optimized move is the target's to perform. Clearing the source's path
+            // list tells it so; without this signal the source still owns the originals
+            // and removes them after `DoDragDrop` returns, deleting what was just moved.
+            if effect == DROPEFFECT_MOVE.0 {
+                let format = etc(clipboard::hdrop_format());
+                // SAFETY: a null medium is the documented "data taken" signal, and the
+                // format outlives the call.
+                let _ = unsafe { data.SetData(&format, std::ptr::null(), false) };
+            }
+            self.queue.push(Event::Dnd(DndEvent::Dropped {
+                pos,
+                data: payload,
+                button: self.queue.button.get(),
+                performer: Performer::Target,
+            }));
         }
         write_effect(pdweffect, effect);
         let at = POINT { x: pt.x, y: pt.y };
@@ -676,6 +864,8 @@ fn write_effect(target: *mut DROPEFFECT, bits: u32) {
 #[implement(IDataObject)]
 struct DataObject {
     formats: RefCell<Vec<(u32, Vec<u8>)>>,
+    /// Set when a target moves the originals itself and says so by clearing the data.
+    moved: Rc<Cell<bool>>,
 }
 
 impl DataObject {
@@ -761,8 +951,11 @@ impl IDataObject_Impl for DataObject_Impl {
         let format = unsafe { pformatetc.as_ref() }
             .ok_or_else(|| Error::from_hresult(E_FAIL))?
             .cfFormat as u32;
+        // A null medium is the documented "the data is gone" signal: an optimized move
+        // performed by the target, so the source must not delete the originals again.
         if pmedium.is_null() {
-            return Err(Error::from_hresult(E_FAIL));
+            self.moved.set(true);
+            return Ok(());
         }
         // A medium offered with release is this call's to free, so it is taken by value;
         // without it, only the bytes are read and the caller keeps ownership.

@@ -68,5 +68,12 @@ pub fn menu_style(pack: &Style, blur: f32) -> ui_widgets::MenuStyle {
         max_width: MAX_WIDTH,
         shadow: s.container.elevation * 2.0,
         frost,
+        // MD3's menu has no quick-action strip; the cell follows the label-small ramp and
+        // the menu item's own spacing so a menu that uses one still reads as this menu.
+        compact_height: 56.0,
+        compact_icon_size: 20.0,
+        compact_label_size: crate::typescale::LABEL_SMALL.size,
+        compact_pad_x: s.menu_item.top_space,
+        compact_gap: 2.0,
     }
 }

@@ -18,3 +18,8 @@ ui-platform-wayland = { path = "../ui-platform-wayland", features = ["gpu"] }
 
 [target.'cfg(windows)'.dependencies]
 ui-platform-win32 = { path = "../ui-platform-win32" }
+
+[features]
+# The desktop's file-type icons, read from its icon theme. Off unless the app has a picker:
+# the reader brings an SVG renderer, and an app that draws no file icons needs none of it.
+file-icons = ["ui-platform-wayland/file-icons"]

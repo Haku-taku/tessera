@@ -2360,6 +2360,15 @@ impl<M: TextMeasure> BuiltinLayout<M> {
     ) {
         use crate::geom::Point;
         use crate::layout::{Anchor, OverlayAlign, PlatformPanel, Presentation, Side};
+        // A panel gets a surface of its own only where the window has one. The request is
+        // read against that capability once, here, so the fallback is not a second placement:
+        // a panel with no surface is measured, placed, clipped and hit as its parent's own.
+        let presentation = match overlay.presentation {
+            Presentation::Platform | Presentation::Window if !tree.panel_surfaces() => {
+                Presentation::Parent
+            }
+            presentation => presentation,
+        };
         // An anchor may hang off any branch of the tree, and offsets are only folded into
         // the paint offset after this pass. So both sides are spoken in the surface's own
         // space here: the anchor's rect is lifted by the offsets it will carry, and the
@@ -2383,9 +2392,11 @@ impl<M: TextMeasure> BuiltinLayout<M> {
         let anchor = anchor.unwrap_or(Rect::from_origin_size(viewport.origin, Size::ZERO));
         // A platform panel is measured as content: the surface it will live in belongs to
         // the platform, and a menu must be allowed to grow past a window smaller than it.
-        let room = match overlay.presentation {
+        let room = match presentation {
             Presentation::Parent => viewport.size,
-            Presentation::Platform => Size::new(f32::INFINITY, f32::INFINITY),
+            Presentation::Platform | Presentation::Window => {
+                Size::new(f32::INFINITY, f32::INFINITY)
+            }
         };
         let (res, c) = self.measure_node(
             tree,
@@ -2447,9 +2458,24 @@ impl<M: TextMeasure> BuiltinLayout<M> {
             Rect::from_origin_size(Point::new(x, y), size)
         };
         let mut rect = at(overlay.side);
-        // A platform panel is placed against the platform's output, not this viewport: a
-        // menu near the edge of a small window must be allowed past it.
-        if overlay.presentation == Presentation::Parent {
+        // A platform panel is placed against the output, not this viewport: a menu near the
+        // edge of a small window must be allowed past it. And it is placed here for good:
+        // the surface stands where this rect says, or the input its grab delivers outside
+        // the panel would be mapped into places the tree does not name.
+        if presentation != Presentation::Parent
+            && let Some(bounds) = tree.output_bounds()
+        {
+            rect = crate::layout::place_anchored(
+                anchor,
+                size,
+                overlay.side,
+                overlay.align,
+                overlay.offset,
+                crate::layout::Fit::FLIP_AND_SLIDE,
+                bounds,
+            );
+        }
+        if presentation == Presentation::Parent {
             if overlay.flip && !fits(rect) {
                 let opposite = match overlay.side {
                     Side::Below => Side::Above,
@@ -2480,7 +2506,11 @@ impl<M: TextMeasure> BuiltinLayout<M> {
             Rect::from_origin_size(Point::new(rect.origin.x - own.x, rect.origin.y - own.y), size),
             stats,
         );
-        if overlay.presentation == Presentation::Platform {
+        if presentation != Presentation::Parent {
+            let title = tree
+                .get(nid)
+                .and_then(|n| n.data.params())
+                .and_then(|p| p.window_title.clone());
             tree.record_platform_panel(PlatformPanel {
                 node: nid,
                 anchor,
@@ -2488,6 +2518,8 @@ impl<M: TextMeasure> BuiltinLayout<M> {
                 side: overlay.side,
                 align: overlay.align,
                 offset: overlay.offset,
+                window: presentation == Presentation::Window,
+                title,
             });
         }
     }

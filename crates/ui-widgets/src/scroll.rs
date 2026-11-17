@@ -317,8 +317,8 @@ impl Scroll {
             size: SizeClass {
                 width: AxisSize::fill(0.0, 0.0),
                 height: AxisSize::fill(0.0, 0.0),
-                grow_x: Grow::No,
-                grow_y: Grow::No,
+                grow_x: Grow::Yes,
+                grow_y: Grow::Yes,
             },
             kind: NodeKind::Column,
             axis: [true, true],
@@ -326,6 +326,25 @@ impl Scroll {
             scrollbar: ScrollbarConf::default(),
             background: None,
             snap: [0.0, 0.0],
+        }
+    }
+
+    /// A vertical scroller that takes the height the parent gives it rather than hugging its
+    /// content: the viewport, its clip and its bar reach the panel's edge even over a short
+    /// list, so a row dragged past the last one is not cut at the content's own bottom.
+    pub fn fill(id: Id) -> Self {
+        Self {
+            axis: [false, true],
+            ..Self::both(id)
+        }
+    }
+
+    /// A fixed-size viewport scrolling both axes: content wider or taller than the box is
+    /// reached by scrolling, not by shrinking the box.
+    pub fn fixed_both(id: Id, width: f32, height: f32) -> Self {
+        Self {
+            axis: [true, true],
+            ..Self::fixed(id, width, height)
         }
     }
 

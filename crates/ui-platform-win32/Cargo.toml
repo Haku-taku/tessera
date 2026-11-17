@@ -51,6 +51,7 @@ windows = { version = "0.62", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Variant",
+    "Win32_System_WindowsProgramming",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
@@ -59,6 +60,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_Pointer",
     "Win32_UI_Shell",
+    # `COMDLG_FILTERSPEC` and `IFileDialog::SetFileTypes` live in the shell's Common module.
+    "Win32_UI_Shell_Common",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_TextServices",
     "Win32_UI_WindowsAndMessaging",

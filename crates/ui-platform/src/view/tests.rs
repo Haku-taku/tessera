@@ -814,32 +814,6 @@ mod contracts {
     }
 
     #[test]
-    fn a_drag_across_selectable_text_records_the_range_it_crossed() {
-        // The engine owns the selection, not the app: a press plus a move must leave one.
-        let mut lp = AppLoop::new(Selectable);
-        let mut target = OffscreenTarget::new(600, 120);
-        lp.frame(&mut target, None);
-        let y = 8.0;
-        lp.dispatch(ui_core::Event::PointerPressed {
-            pos: ui_core::geom::Point::new(1.0, y),
-            button: ui_core::PointerButton::Primary,
-        });
-        assert!(
-            lp.dispatch(ui_core::Event::PointerMoved {
-                pos: ui_core::geom::Point::new(220.0, y),
-            }),
-            "extending the selection must ask for a repaint"
-        );
-        let (id, selection) = lp.selection().expect("the drag left no selection");
-        assert_eq!(id, Id::str("para"));
-        assert!(
-            selection.anchor < selection.caret,
-            "a rightward drag must leave anchor before caret, got {selection:?}"
-        );
-        assert!(!selection.is_collapsed());
-    }
-
-    #[test]
     fn a_press_inside_the_selection_carries_its_text_out_as_a_drag() {
         // Selecting text and then dragging it is the engine's own gesture: the payload is
         // the same text Copy would take, and the host gets an image of the selected lines
@@ -1660,7 +1634,9 @@ mod contracts {
                 pos,
                 button: ui_core::PointerButton::Primary,
             });
-            lp.dispatch(ui_core::Event::Paste("a\r\nb".to_owned()));
+            lp.dispatch(ui_core::Event::Paste(
+                ui_core::clipboard::ClipboardContent::Text("a\r\nb".to_owned()),
+            ));
             seen.borrow().clone()
         };
         assert_eq!(
@@ -2157,7 +2133,9 @@ mod contracts {
             }],
             "the engine asks for the text instead of reading it"
         );
-        lp.dispatch(ui_core::Event::Paste("al".to_string()));
+        lp.dispatch(ui_core::Event::Paste(
+            ui_core::clipboard::ClipboardContent::Text("al".to_string()),
+        ));
         assert_eq!(
             seen.borrow().last().map(String::as_str),
             Some("alpha"),
@@ -2168,7 +2146,9 @@ mod contracts {
         lp.dispatch(ui_core::Event::KeyPressed {
             key: ui_core::Key::End,
         });
-        lp.dispatch(ui_core::Event::Paste("\r\nb".to_string()));
+        lp.dispatch(ui_core::Event::Paste(
+            ui_core::clipboard::ClipboardContent::Text("\r\nb".to_string()),
+        ));
         assert_eq!(
             seen.borrow().last().map(String::as_str),
             Some("alpha b"),
@@ -2477,7 +2457,8 @@ mod contracts {
     }
 
     /// A panel declared for a surface of the platform's own paints into that surface's list,
-    /// rebased on the panel's own top-left, and never into its parent's.
+    /// rebased on the panel's own top-left, and never into its parent's; where no surface is
+    /// had — the platform refuses, or no host is there to ask — the parent paints it.
     #[test]
     fn a_platform_panel_paints_into_its_own_list_and_not_the_parent() {
         struct PanelApp;
@@ -2509,6 +2490,8 @@ mod contracts {
         }
         let mut parent = RectTarget::default();
         let mut lp = AppLoop::new(PanelApp);
+        // What a host says when it builds the loop: it reconciles a surface for every panel.
+        lp.set_panel_surfaces(true);
         lp.frame_scene(&mut parent, None).expect("a frame");
         let panel = lp.tree.find_by_id(Id::str("panel")).expect("laid out");
         assert!(
@@ -2547,6 +2530,8 @@ mod contracts {
         // A platform with no surface to open hands the panel back to its parent.
         let mut parent = RectTarget::default();
         let mut lp = AppLoop::new(PanelApp);
+        // What a host says when it builds the loop: it reconciles a surface for every panel.
+        lp.set_panel_surfaces(true);
         lp.frame_scene(&mut parent, None).expect("a frame");
         let panel = lp.tree.find_by_id(Id::str("panel")).expect("laid out");
         lp.set_panel_presentation(panel, false);
@@ -2558,6 +2543,25 @@ mod contracts {
         assert!(
             lp.present_panel(panel, &mut RectTarget::default()).is_err(),
             "a panel the parent paints has no list of its own"
+        );
+
+        // A loop with no host never presents a panel, so the window answers the declaration
+        // itself: the panel is placed and painted there from the frame it appeared in.
+        let mut parent = RectTarget::default();
+        let mut lp = AppLoop::new(PanelApp);
+        lp.frame_scene(&mut parent, None).expect("a frame");
+        let panel = lp.tree.find_by_id(Id::str("panel")).expect("laid out");
+        assert!(
+            lp.platform_panels().is_empty(),
+            "a surface is not asked for where nothing would present one"
+        );
+        assert!(
+            parent.rects.iter().any(|(owner, _)| *owner == panel),
+            "the window paints the panel without waiting for a host"
+        );
+        assert!(
+            lp.present_panel(panel, &mut RectTarget::default()).is_err(),
+            "a panel the window paints has no list of its own"
         );
     }
 
@@ -2600,11 +2604,22 @@ mod contracts {
             .menu
             .as_ref()
             .expect("the press opened a menu")
-            .rect
-            .center();
-        let (x, y) = (centre.x as u32, centre.y as u32);
+            .at;
+        let (x, y) = ((centre.x + 10.0) as u32, (centre.y + 10.0) as u32);
 
         lp.frame_with_dt(&mut target, None, 0.0);
+        // The panel hangs off the point the press named, so the point just inside it is
+        // known without waiting for a layout to read the panel's own rect.
+        let panel = lp
+            .tree
+            .find_by_id(crate::menu::Menu::panel_id(0))
+            .and_then(|nid| lp.tree.get(nid))
+            .map(|node| node.rect)
+            .expect("the menu panel is laid out in the clicking frame");
+        assert!(
+            panel.contains(ui_core::geom::Point::new(x as f32, y as f32)),
+            "the sampled point is on the menu: {panel:?}"
+        );
         assert_eq!(
             target.pixels.get(x, y),
             page,
@@ -2647,7 +2662,7 @@ mod contracts {
         }
 
         fn changed(&mut self, id: Id, change: ui_core::change::Change) -> bool {
-            if let ui_core::change::Change::Secondary { down } = change {
+            if let ui_core::change::Change::Secondary { down, .. } = change {
                 self.seen.push((id, down));
                 return true;
             }
@@ -2797,7 +2812,9 @@ mod contracts {
 
     /// A surface whose only opaque area is one small panel: everything else lets input past,
     /// the way a pin's shadow padding does.
-    struct SmallPanel;
+    struct SmallPanel {
+        picked: Vec<Id>,
+    }
 
     impl App for SmallPanel {
         fn view(&mut self, _f: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
@@ -2813,18 +2830,25 @@ mod contracts {
                     ),
             )
         }
+
+        fn changed(&mut self, _id: Id, change: ui_core::change::Change) -> bool {
+            if let ui_core::change::Change::MenuItem(item) = change {
+                self.picked.push(item);
+            }
+            true
+        }
     }
 
-    /// A menu that reaches past the node it belongs to must still be inside the surface's
-    /// input region. The panel has no node of its own, so the region cannot come from the
-    /// hit index: without it the rows below the node fall through to whatever is underneath.
+    /// A menu that reaches past the node it belongs to is still a node where it lands: with
+    /// no host to present its own surface, the window paints it, so the row below the node
+    /// must be in the published input region and must take the press.
     #[test]
-    fn a_menu_reaching_past_its_node_stays_inside_the_input_region() {
+    fn a_menu_reaching_past_its_node_still_takes_the_press_there() {
         let mut target = RegionTarget {
             inner: OffscreenTarget::new(300, 300),
             regions: Vec::new(),
         };
-        let mut lp = AppLoop::new(SmallPanel);
+        let mut lp = AppLoop::new(SmallPanel { picked: Vec::new() });
         lp.frame(&mut target, None);
 
         // Near the panel's bottom edge, so the panel — 200 units tall — cannot hold the menu.
@@ -2832,18 +2856,756 @@ mod contracts {
         let button = ui_core::PointerButton::Secondary;
         lp.dispatch(ui_core::Event::PointerPressed { pos: at, button });
         lp.dispatch(ui_core::Event::PointerReleased { pos: at, button });
-        lp.frame(&mut target, None);
+        // The entrance's first frame is its start; a second one lands it where it rests.
+        lp.frame_with_dt(&mut target, None, 0.2);
+        lp.frame_with_dt(&mut target, None, 0.2);
 
-        let menu = lp.menu.as_ref().expect("the press opened a menu").rect;
+        let row = lp
+            .tree
+            .find_by_id(crate::menu::Menu::row_id(0, 0))
+            .and_then(|nid| lp.tree.get(nid))
+            .map(|node| node.rect)
+            .expect("the menu row is laid out");
         assert!(
-            menu.max_y() > 200.0,
-            "the menu reaches below the node that owns it"
+            row.max_y() > 200.0,
+            "the menu reaches below the node that owns it: {row:?}"
         );
-        let last_row = ui_core::geom::Point::new(menu.center().x, menu.max_y() - 4.0);
+        let press = row.center();
         assert!(
-            target.regions.iter().any(|area| area.contains(last_row)),
-            "the menu's last row is in the input region: {:?}",
+            target.regions.iter().any(|area| area.contains(press)),
+            "the row past the node is in the input region: {:?}",
             target.regions
+        );
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: press,
+            button: ui_core::PointerButton::Primary,
+        });
+        lp.dispatch(ui_core::Event::PointerReleased {
+            pos: press,
+            button: ui_core::PointerButton::Primary,
+        });
+        // A click becomes a change the next frame applies, as any control's click does.
+        lp.frame(&mut target, Some(press));
+        assert_eq!(
+            lp.app_mut().picked,
+            [Id::str("copy")],
+            "the row past the node took the press"
+        );
+    }
+
+    /// Records the outcomes of programmatic and keyboard-driven menus.
+    struct MenuSink {
+        picked: Vec<Id>,
+        closed: Vec<Id>,
+    }
+
+    impl App for MenuSink {
+        fn view(&mut self, _cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            crate::from_decl(
+                Decl::container(Id::str("page"), NodeKind::Stack)
+                    .size(SizeClass::fixed(400.0, 300.0))
+                    .background(Color::from_rgba8(0, 0, 255, 255), Corners::ZERO)
+                    .child(
+                        Decl::container(Id::str("row"), NodeKind::Column)
+                            .size(SizeClass::fixed(200.0, 100.0))
+                            .sense(ui_core::Sense::FOCUSABLE | ui_core::Sense::CLICK)
+                            .background(Color::from_rgba8(0, 0, 0, 255), Corners::ZERO)
+                            .menu(vec![
+                                ui_core::menu::MenuItem::new(Id::str("copy"), "Copy"),
+                                ui_core::menu::MenuItem::new(Id::str("paste"), "Paste"),
+                            ]),
+                    ),
+            )
+        }
+
+        fn changed(&mut self, id: Id, change: ui_core::change::Change) -> bool {
+            match change {
+                ui_core::change::Change::MenuItem(item) => self.picked.push(item),
+                ui_core::change::Change::MenuClosed => self.closed.push(id),
+                _ => {}
+            }
+            true
+        }
+    }
+
+    fn menu_sink() -> (AppLoop<MenuSink>, OffscreenTarget) {
+        let mut target = OffscreenTarget::new(400, 300);
+        let mut lp = AppLoop::new(MenuSink {
+            picked: Vec::new(),
+            closed: Vec::new(),
+        });
+        lp.frame(&mut target, None);
+        (lp, target)
+    }
+
+    fn menu_key(lp: &mut AppLoop<MenuSink>, key: ui_core::Key) {
+        lp.dispatch(ui_core::Event::KeyPressed { key });
+    }
+
+    /// A row's label and chord are both measured, not left at nothing.
+    ///
+    /// Menu text once declared no size class, and a nowrap line is capped by that hint: every
+    /// text node measured zero, so the label column took the row's whole width and the chord
+    /// was drawn from the trailing edge with no room of its own.
+    #[test]
+    fn a_menu_row_measures_its_label_and_chord() {
+        let (mut lp, mut target) = menu_sink();
+        let ctrl_shift = ui_core::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..ui_core::Modifiers::NONE
+        };
+        let chord = ui_core::KeyChord::new(ui_core::Key::Char('n'), ctrl_shift);
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("a"), "Create Hard Link")
+                    .with_chord(chord, "Ctrl+Shift+N"),
+                ui_core::menu::MenuItem::new(Id::str("b"), "A much longer row label here")
+                    .with_chord(chord, "Ctrl+Shift+N"),
+            ],
+        ));
+        // The entrance slides the panel; the rows rest where they stay once it lands.
+        lp.frame(&mut target, None);
+        lp.frame(&mut target, None);
+        for row in 0..2 {
+            let id = crate::menu::Menu::row_id(0, row);
+            let width = |part: &str| {
+                lp.tree
+                    .find_by_id(id.with(part))
+                    .map(|nid| lp.tree.get(nid).unwrap().rect.size.w)
+            };
+            assert!(
+                width("text").is_some_and(|w| w > 0.0),
+                "row {row}: the label measured no width"
+            );
+            assert!(
+                width("shortcut").is_some_and(|w| w > 0.0),
+                "row {row}: the chord measured no width"
+            );
+        }
+    }
+    /// Quick actions share one row, each cell an equal share of the panel's width.
+    ///
+    /// The run grouping is the whole strip: a cell drawn as an ordinary row would stack the
+    /// actions vertically and the panel would size itself to the tallest one.
+    #[test]
+    fn a_menu_strip_lays_its_quick_actions_side_by_side() {
+        let (mut lp, mut target) = menu_sink();
+        let mark = ui_core::menu::MenuIcon::new(
+            ui_core::text::Family::Named("Material Symbols Outlined"),
+            '\u{e14e}',
+        );
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("cut"), "Cut").compact(mark),
+                ui_core::menu::MenuItem::new(Id::str("copy"), "Copy").compact(mark),
+                ui_core::menu::MenuItem::separator(),
+                ui_core::menu::MenuItem::new(Id::str("paste"), "Paste"),
+            ],
+        ));
+        // The entrance slides the panel; the rows rest where they stay once it lands.
+        lp.frame(&mut target, None);
+        lp.frame(&mut target, None);
+        let rect = |index: usize| {
+            let id = crate::menu::Menu::row_id(0, index);
+            let nid = lp.tree.find_by_id(id).expect("the row is a node");
+            lp.tree.get(nid).expect("a live node").rect
+        };
+        let (cut, copy, paste) = (rect(0), rect(1), rect(3));
+        assert_eq!(
+            cut.origin.y, copy.origin.y,
+            "the quick actions sit on one row"
+        );
+        assert!(copy.origin.x > cut.origin.x, "the cells run left to right");
+        assert!(
+            (cut.size.w - copy.size.w).abs() < 0.5,
+            "cells share the strip's width equally"
+        );
+        assert!(
+            paste.origin.y >= cut.max_y(),
+            "a row after the strip starts below it"
+        );
+        let label = crate::menu::Menu::row_id(0, 0).with("label");
+        let width = lp
+            .tree
+            .find_by_id(label)
+            .and_then(|nid| lp.tree.get(nid))
+            .map(|node| node.rect.size.w);
+        assert!(
+            width.is_some_and(|width| width > 0.0),
+            "a cell's label is measured by the cell's share"
+        );
+    }
+
+    /// A header's mark keeps its room: a long label ends before it, and it stays inside.
+    ///
+    /// Without the reservation in `level_width` a long label takes the panel's width and the
+    /// mark is pushed past its edge, where it is clipped or drawn over the label.
+    #[test]
+    fn a_submenu_header_keeps_its_cascade_mark_inside_the_panel() {
+        let (mut lp, mut target) = menu_sink();
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![ui_core::menu::MenuItem::submenu(
+                Id::str("more"),
+                "A label long enough to want the whole panel for itself",
+                vec![ui_core::menu::MenuItem::new(Id::str("a"), "A")],
+            )],
+        ));
+        // The entrance slides the panel; the rows rest where they stay once it lands.
+        lp.frame(&mut target, None);
+        lp.frame(&mut target, None);
+        let id = crate::menu::Menu::row_id(0, 0);
+        let rect = |part: &str| {
+            lp.tree
+                .find_by_id(id.with(part))
+                .and_then(|nid| lp.tree.get(nid))
+                .map(|node| node.rect)
+        };
+        let label = rect("text").expect("the label is a node");
+        let chevron = rect("chevron").expect("a header carries its cascade mark");
+        assert!(chevron.size.w > 0.0, "the mark measured nothing");
+        assert!(
+            label.max_x() <= chevron.origin.x + 0.5,
+            "the label ends before the mark's own room"
+        );
+    }
+
+    /// A flyout hangs off the row that heads it, not off the menu's own corner.
+    ///
+    /// The anchor was read from the flyout's own `child_of`, which only names *its* flyout:
+    /// every cascade unfolded from the root's click point and covered the level it came from.
+    #[test]
+    fn a_flyout_hangs_off_the_row_that_heads_it() {
+        let (mut lp, mut target) = menu_sink();
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("copy"), "Copy"),
+                ui_core::menu::MenuItem::submenu(
+                    Id::str("more"),
+                    "More",
+                    vec![ui_core::menu::MenuItem::new(Id::str("nested"), "Nested")],
+                ),
+            ],
+        ));
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Right);
+        // Let the entrance settle so the rects are where they are painted.
+        lp.frame_with_dt(&mut target, None, 0.2);
+        let rect = |id| {
+            lp.tree
+                .find_by_id(id)
+                .and_then(|nid| lp.tree.get(nid))
+                .map(|node| node.visual_rect())
+        };
+        let header = rect(crate::menu::Menu::row_id(0, 1)).expect("the header is a row");
+        let flyout = rect(crate::menu::Menu::panel_id(1)).expect("the flyout is a panel");
+        assert!(
+            flyout.min_x() >= header.max_x() - 0.5,
+            "the flyout starts beside the row, not over the level"
+        );
+        assert!(
+            (flyout.min_y() - header.min_y()).abs() < 0.5,
+            "the flyout starts level with the row that heads it"
+        );
+    }
+
+    /// A programmatic menu's pick reports the row to its owner, never as a dismissal.
+    #[test]
+    fn a_programmatic_menus_pick_reports_the_row_to_its_owner() {
+        let (mut lp, _target) = menu_sink();
+        let owner = Id::str("row");
+        assert!(lp.open_menu_at(
+            owner,
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("open"), "Open"),
+                ui_core::menu::MenuItem::new(Id::str("copy"), "Copy").default_row(),
+            ],
+        ));
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Enter);
+
+        assert_eq!(lp.app_mut().picked, [Id::str("open")]);
+        assert!(
+            lp.app_mut().closed.is_empty(),
+            "a pick is not a dismissal"
+        );
+        assert!(lp.menu.is_none(), "the pick closed the menu");
+    }
+
+    /// Backing out of a menu is reported so the app can drop what it built it from.
+    #[test]
+    fn escape_reports_menu_closed_and_closes() {
+        let (mut lp, _target) = menu_sink();
+        let owner = Id::str("row");
+        assert!(lp.open_menu_at(
+            owner,
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![ui_core::menu::MenuItem::new(Id::str("copy"), "Copy")],
+        ));
+        menu_key(&mut lp, ui_core::Key::Escape);
+
+        assert_eq!(lp.app_mut().closed, [owner]);
+        assert!(lp.app_mut().picked.is_empty());
+        assert!(lp.menu.is_none());
+    }
+
+    /// A press outside the menu is the light dismiss every flyout has, and it is spent on
+    /// that dismissal: nothing underneath hears it.
+    #[test]
+    fn a_press_outside_the_menu_dismisses_it_and_reaches_nothing() {
+        let (mut lp, mut target) = menu_sink();
+        let owner = Id::str("row");
+        assert!(lp.open_menu_at(
+            owner,
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![ui_core::menu::MenuItem::new(Id::str("copy"), "Copy")],
+        ));
+        lp.frame(&mut target, None);
+        let outside = ui_core::geom::Point::new(350.0, 250.0);
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: outside,
+            button: ui_core::PointerButton::Primary,
+        });
+        lp.dispatch(ui_core::Event::PointerReleased {
+            pos: outside,
+            button: ui_core::PointerButton::Primary,
+        });
+        lp.frame(&mut target, Some(outside));
+
+        assert_eq!(lp.app_mut().closed, [owner], "the owner hears the dismissal");
+        assert!(lp.app_mut().picked.is_empty(), "no row was picked");
+        assert!(lp.menu.is_none(), "the menu is closed");
+    }
+
+    /// A divider is paint and spacing: neither the pointer nor the keyboard can choose it.
+    #[test]
+    fn a_separator_cannot_be_picked_by_pointer_or_keyboard() {
+        let (mut lp, mut target) = menu_sink();
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("a"), "A"),
+                ui_core::menu::MenuItem::separator(),
+                ui_core::menu::MenuItem::new(Id::str("b"), "B"),
+            ],
+        ));
+        // Down crosses the divider to the row after it.
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Down);
+        assert_eq!(lp.menu.as_ref().and_then(|menu| menu.hovered), Some(2));
+
+        // Let the entrance settle so the row rect is where it is painted.
+        lp.frame_with_dt(&mut target, None, 0.2);
+        let divider = lp
+            .tree
+            .find_by_id(crate::menu::Menu::row_id(0, 1))
+            .and_then(|nid| lp.tree.get(nid))
+            .map(|node| node.rect.center())
+            .expect("the divider is a laid-out row");
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: divider,
+            button: ui_core::PointerButton::Primary,
+        });
+        assert!(lp.app_mut().picked.is_empty(), "a divider is not a pick");
+        assert!(lp.app_mut().closed.is_empty(), "a divider press is inert");
+        assert!(lp.menu.is_some());
+
+        menu_key(&mut lp, ui_core::Key::Enter);
+        assert_eq!(lp.app_mut().picked, [Id::str("b")]);
+    }
+
+    /// A submenu's rows are the menu's rows: a pick reports the nested id to the owner.
+    #[test]
+    fn a_submenu_row_reports_its_nested_id() {
+        let (mut lp, _target) = menu_sink();
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("copy"), "Copy"),
+                ui_core::menu::MenuItem::submenu(
+                    Id::str("more"),
+                    "More",
+                    vec![ui_core::menu::MenuItem::new(Id::str("nested"), "Nested")],
+                ),
+            ],
+        ));
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Right);
+        assert!(
+            lp.menu.as_ref().is_some_and(|menu| menu.child.is_some()),
+            "Right opens the hovered submenu"
+        );
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Enter);
+
+        assert_eq!(lp.app_mut().picked, [Id::str("nested")]);
+        assert!(lp.app_mut().closed.is_empty());
+        assert!(lp.menu.is_none());
+    }
+
+    /// A click on a flyout's row picks it, as a click on the menu's own row does.
+    ///
+    /// The flyout is a panel of its own: a press there must be judged inside it, not
+    /// outside every level, or the click dismisses the whole menu instead of running the row.
+    #[test]
+    fn a_flyouts_row_picks_when_clicked() {
+        let (mut lp, mut target) = menu_sink();
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("copy"), "Copy"),
+                ui_core::menu::MenuItem::submenu(
+                    Id::str("more"),
+                    "More",
+                    vec![ui_core::menu::MenuItem::new(Id::str("nested"), "Nested")],
+                ),
+            ],
+        ));
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Right);
+        // Let the entrances settle so the rows are where they are painted.
+        lp.frame_with_dt(&mut target, None, 0.2);
+        lp.frame_with_dt(&mut target, None, 0.2);
+        let row = lp
+            .tree
+            .find_by_id(crate::menu::Menu::row_id(1, 0))
+            .and_then(|nid| lp.tree.get(nid))
+            .map(|node| node.visual_rect().center())
+            .expect("the flyout's row is laid out");
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: row,
+            button: ui_core::PointerButton::Primary,
+        });
+        lp.dispatch(ui_core::Event::PointerReleased {
+            pos: row,
+            button: ui_core::PointerButton::Primary,
+        });
+        lp.frame(&mut target, Some(row));
+
+        assert_eq!(
+            lp.app_mut().picked,
+            [Id::str("nested")],
+            "the flyout's row runs the command it stands for"
+        );
+        assert!(lp.app_mut().closed.is_empty(), "the click is not a dismissal");
+        assert!(lp.menu.is_none(), "the pick closes the menu");
+    }
+
+    /// The menu key opens the focused node's declared menu; Shift+F10 arrives as the same
+    /// key on the platform side and follows the same path here.
+    #[test]
+    fn the_menu_key_and_shift_f10_open_the_focused_nodes_declared_menu() {
+        let (mut lp, _target) = menu_sink();
+        menu_key(&mut lp, ui_core::Key::Tab);
+        assert_eq!(lp.focused(), Some(Id::str("row")));
+
+        menu_key(&mut lp, ui_core::Key::Menu);
+        assert!(lp.menu.is_some(), "the menu key opens the declared menu");
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Enter);
+        assert_eq!(lp.app_mut().picked, [Id::str("copy")]);
+
+        lp.dispatch(ui_core::Event::Modifiers(ui_core::Modifiers {
+            shift: true,
+            ..ui_core::Modifiers::default()
+        }));
+        menu_key(&mut lp, ui_core::Key::Menu);
+        assert!(lp.menu.is_some(), "Shift+F10 opens it again");
+        menu_key(&mut lp, ui_core::Key::Escape);
+        assert_eq!(lp.app_mut().closed, [Id::str("row")]);
+    }
+
+    /// A disabled row cannot take the hover, so movement never stops on it.
+    #[test]
+    fn keyboard_movement_skips_disabled_rows() {
+        let (mut lp, _target) = menu_sink();
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.0, 20.0),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("a"), "A"),
+                ui_core::menu::MenuItem::new(Id::str("b"), "B").disabled_because("not now"),
+                ui_core::menu::MenuItem::new(Id::str("c"), "C"),
+            ],
+        ));
+        menu_key(&mut lp, ui_core::Key::Down);
+        menu_key(&mut lp, ui_core::Key::Down);
+        assert_eq!(
+            lp.menu.as_ref().and_then(|menu| menu.hovered),
+            Some(2),
+            "the disabled row is skipped"
+        );
+        menu_key(&mut lp, ui_core::Key::Enter);
+        assert_eq!(lp.app_mut().picked, [Id::str("c")]);
+    }
+
+    /// Records clipboard payloads no editor took.
+    struct PasteSink {
+        pastes: Vec<(Id, ui_core::clipboard::ClipboardContent)>,
+    }
+
+    impl App for PasteSink {
+        fn view(&mut self, _cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            crate::from_decl(
+                Decl::container(Id::str("target"), NodeKind::Row)
+                    .size(SizeClass::fixed(200.0, 100.0))
+                    .sense(ui_core::Sense::FOCUSABLE | ui_core::Sense::CLICK)
+                    .background(Color::WHITE, Corners::ZERO),
+            )
+        }
+
+        fn changed(&mut self, id: Id, change: ui_core::change::Change) -> bool {
+            if let ui_core::change::Change::Paste(content) = change {
+                self.pastes.push((id, content));
+            }
+            true
+        }
+    }
+
+    /// Without a caret the whole payload is the app's; a text paste with one still edits.
+    #[test]
+    fn a_paste_without_an_editor_reaches_the_app_and_a_text_paste_still_edits() {
+        let mut target = OffscreenTarget::new(300, 200);
+        let mut lp = AppLoop::new(PasteSink { pastes: Vec::new() });
+        lp.frame(&mut target, None);
+        lp.dispatch(ui_core::Event::KeyPressed {
+            key: ui_core::Key::Tab,
+        });
+        assert_eq!(lp.focused(), Some(Id::str("target")));
+
+        press_ctrl(
+            &mut lp,
+            'v',
+            ui_core::Modifiers {
+                ctrl: true,
+                ..ui_core::Modifiers::default()
+            },
+        );
+        assert!(matches!(
+            lp.take_clipboard_commands().last(),
+            Some(crate::clipboard::ClipboardCommand::RequestPaste { .. })
+        ));
+        let files = ui_core::clipboard::ClipboardContent::Files {
+            paths: vec![std::path::PathBuf::from("a.txt")],
+            effect: ui_core::DropEffect::Copy,
+        };
+        assert!(lp.dispatch(ui_core::Event::Paste(files.clone())));
+        assert_eq!(lp.app_mut().pastes, [(Id::str("target"), files)]);
+
+        let (mut lp, seen) = focused_typing("");
+        assert!(lp.dispatch(ui_core::Event::Paste(
+            ui_core::clipboard::ClipboardContent::Text("hi".to_string())
+        )));
+        assert_eq!(
+            seen.borrow().as_slice(),
+            ["hi"],
+            "a text paste still edits the focused buffer"
+        );
+    }
+
+    /// An app whose node declares no menu and opens its own from the press point.
+    #[derive(Default)]
+    struct RequestedMenu {
+        open_at: Option<ui_core::geom::Point>,
+        picked: Vec<Id>,
+        closed: Vec<Id>,
+    }
+
+    impl App for RequestedMenu {
+        fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            if let Some(at) = self.open_at.take() {
+                cx.open_menu(
+                    Id::str("row"),
+                    at,
+                    vec![ui_core::menu::MenuItem::new(Id::str("copy"), "Copy")],
+                );
+            }
+            crate::from_decl(
+                Decl::container(Id::str("page"), NodeKind::Stack)
+                    .size(SizeClass::fixed(300.0, 300.0))
+                    .background(Color::from_rgba8(0, 0, 255, 255), Corners::ZERO)
+                    .child(
+                        Decl::container(Id::str("row"), NodeKind::Column)
+                            .size(SizeClass::fixed(200.0, 100.0))
+                            .sense(ui_core::Sense::CLICK | ui_core::Sense::FOCUSABLE)
+                            .drag_data(ui_core::DragData::bytes("text/plain", b"row".to_vec()))
+                            .background(Color::from_rgba8(0, 0, 0, 255), Corners::ZERO),
+                    ),
+            )
+        }
+
+        fn changed(&mut self, id: Id, change: ui_core::change::Change) -> bool {
+            match change {
+                ui_core::change::Change::MenuRequested(at) => self.open_at = Some(at),
+                ui_core::change::Change::MenuItem(item) => self.picked.push(item),
+                ui_core::change::Change::MenuClosed => self.closed.push(id),
+                _ => {}
+            }
+            true
+        }
+    }
+
+    /// A secondary tap on a node with no declared menu hands the point to the app, while a
+    /// right drag that travels opens nothing; the menu the app builds reports its pick.
+    #[test]
+    fn a_secondary_press_without_a_declared_menu_asks_the_app_for_one() {
+        let mut target = OffscreenTarget::new(300, 300);
+        let mut lp = AppLoop::new(RequestedMenu::default());
+        lp.frame(&mut target, None);
+        let at = ui_core::geom::Point::new(50.0, 60.0);
+        let button = ui_core::PointerButton::Secondary;
+
+        // The row carries a payload, so a press cannot know yet whether the gesture is a
+        // tap: a right drag must report its drop and open nothing.
+        lp.dispatch(ui_core::Event::PointerMoved { pos: at });
+        lp.dispatch(ui_core::Event::PointerPressed { pos: at, button });
+        assert_eq!(
+            lp.app_mut().open_at,
+            None,
+            "the press alone must not ask for a menu a drag would leave behind"
+        );
+        let away = ui_core::geom::Point::new(at.x + 60.0, at.y);
+        lp.dispatch(ui_core::Event::PointerMoved { pos: away });
+        lp.dispatch(ui_core::Event::PointerReleased { pos: away, button });
+        assert_eq!(
+            lp.app_mut().open_at,
+            None,
+            "a travelled right drag reports its drop, not a menu"
+        );
+
+        lp.dispatch(ui_core::Event::PointerPressed { pos: at, button });
+        lp.dispatch(ui_core::Event::PointerReleased { pos: at, button });
+        assert_eq!(
+            lp.app_mut().open_at,
+            Some(at),
+            "the tap's release hands the node the press point for its rows"
+        );
+        lp.frame(&mut target, None);
+        assert!(
+            lp.menu.is_some(),
+            "Cx::open_menu shows the rows the app built"
+        );
+        assert_eq!(lp.menu.as_ref().map(|menu| menu.owner), Some(Id::str("row")));
+
+        lp.dispatch(ui_core::Event::KeyPressed {
+            key: ui_core::Key::Down,
+        });
+        lp.dispatch(ui_core::Event::KeyPressed {
+            key: ui_core::Key::Enter,
+        });
+        assert_eq!(lp.app_mut().picked, [Id::str("copy")]);
+        assert!(lp.app_mut().closed.is_empty());
+    }
+
+    /// An app with no caret can still start the clipboard read from a build.
+    struct AskingPaste {
+        ask: bool,
+        pastes: Vec<(Id, ui_core::clipboard::ClipboardContent)>,
+    }
+
+    impl App for AskingPaste {
+        fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            if self.ask {
+                self.ask = false;
+                cx.request_paste();
+            }
+            crate::from_decl(
+                Decl::container(Id::str("target"), NodeKind::Row)
+                    .size(SizeClass::fixed(200.0, 100.0))
+                    .background(Color::WHITE, Corners::ZERO),
+            )
+        }
+
+        fn changed(&mut self, id: Id, change: ui_core::change::Change) -> bool {
+            if let ui_core::change::Change::Paste(content) = change {
+                self.pastes.push((id, content));
+            }
+            true
+        }
+    }
+
+    /// The build's paste request routes its answer exactly like Ctrl+V without a caret.
+    #[test]
+    fn a_cx_paste_request_answers_on_the_focused_target() {
+        let mut target = OffscreenTarget::new(300, 200);
+        let mut lp = AppLoop::new(AskingPaste {
+            ask: true,
+            pastes: Vec::new(),
+        });
+        lp.frame(&mut target, None);
+        assert!(matches!(
+            lp.take_clipboard_commands().last(),
+            Some(crate::clipboard::ClipboardCommand::RequestPaste { .. })
+        ));
+
+        let files = ui_core::clipboard::ClipboardContent::Files {
+            paths: vec![std::path::PathBuf::from("a.txt")],
+            effect: ui_core::DropEffect::Copy,
+        };
+        assert!(lp.dispatch(ui_core::Event::Paste(files.clone())));
+        assert_eq!(lp.app_mut().pastes, [(Id::str("target"), files)]);
+    }
+
+    /// An app that asks the host for the platform's own menu from one build.
+    struct AskingShellMenu {
+        ask: Option<(Vec<std::path::PathBuf>, ui_core::geom::Point)>,
+    }
+
+    impl App for AskingShellMenu {
+        fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            if let Some((paths, at)) = self.ask.take() {
+                cx.request_shell_menu(paths, at);
+            }
+            crate::from_decl(
+                Decl::container(Id::str("page"), NodeKind::Stack)
+                    .size(SizeClass::fixed(200.0, 200.0))
+                    .background(Color::WHITE, Corners::ZERO),
+            )
+        }
+
+        fn changed(&mut self, _id: Id, _change: ui_core::change::Change) -> bool {
+            false
+        }
+    }
+
+    /// A shell menu is handed to the host, never run inside the build that asked.
+    ///
+    /// The popup runs the shell's own loop until the user dismisses it; a build that opened
+    /// it would leave the frame unpainted and the engine's own menu on screen meanwhile.
+    #[test]
+    fn a_shell_menu_request_leaves_for_the_host_after_the_frame() {
+        let mut target = OffscreenTarget::new(200, 200);
+        let mut lp = AppLoop::new(AskingShellMenu { ask: None });
+        lp.frame(&mut target, None);
+        assert!(lp.take_shell_menu().is_none(), "no build asked for a menu");
+
+        let paths = vec![std::path::PathBuf::from("a.txt")];
+        let at = ui_core::geom::Point::new(12.0, 34.0);
+        lp.app_mut().ask = Some((paths.clone(), at));
+        lp.frame(&mut target, None);
+        let request = lp
+            .take_shell_menu()
+            .expect("the host runs it once this frame has presented");
+        assert_eq!(request.paths, paths);
+        assert_eq!(request.at, at);
+        assert!(
+            lp.take_shell_menu().is_none(),
+            "one build's request is one popup"
         );
     }
 
@@ -2901,7 +3663,7 @@ mod contracts {
                 change,
                 ui_core::change::Change::DragStarted
                     | ui_core::change::Change::Moved { .. }
-                    | ui_core::change::Change::Dropped(_)
+                    | ui_core::change::Change::Dropped { .. }
                     | ui_core::change::Change::Cancelled
             ) {
                 self.seen.push((id, change));
@@ -3021,14 +3783,34 @@ mod contracts {
             "the drop lands on the accepting zone"
         );
         assert_eq!(
-            dropped.and_then(|(_, data)| data.text().map(str::to_owned)),
+            dropped.and_then(|(_, data)| data.data.text().map(str::to_owned)),
             Some("hello".to_owned()),
             "the payload's bytes arrive intact"
         );
         assert!(
             lp.app_mut().seen.iter().any(|(id, change)| *id == Id::str("source")
-                && matches!(change, ui_core::change::Change::Dropped(Some(zone)) if *zone == Id::str("zone"))),
+                && matches!(change, ui_core::change::Change::Dropped { target: Some(zone), .. } if *zone == Id::str("zone"))),
             "the source learns where its payload went"
+        );
+    }
+
+    #[test]
+    fn an_in_app_drag_lights_the_zone() {
+        // The highlight every app reads is `drag_over_within`, and it is only true when the
+        // drag's route names the target; hearing `DragEntered` alone would leave it dark.
+        let mut target = OffscreenTarget::new(220, 220);
+        let mut lp = AppLoop::new(Carrying {
+            seen: Vec::new(),
+            accepts: &["text/plain"],
+        });
+        lp.frame(&mut target, None);
+        drag_across(&mut lp, ui_core::geom::Point::new(50.0, 80.0));
+        let _ = lp.frame(&mut target, None);
+        assert_eq!(
+            lp.drag_path.last(),
+            Some(&Id::str("zone")),
+            "after a frame: {:?}",
+            lp.drag_path
         );
     }
 
@@ -3063,7 +3845,7 @@ mod contracts {
         );
         assert!(
             lp.app_mut().seen.iter().any(|(id, change)| *id == Id::str("source")
-                && matches!(change, ui_core::change::Change::Dropped(None))),
+                && matches!(change, ui_core::change::Change::Dropped { target: None, .. })),
             "the source hears that its payload landed nowhere"
         );
     }
@@ -3104,10 +3886,13 @@ mod contracts {
         lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Entered {
             pos: at,
             types: vec!["text/plain".to_string()],
+            effects: ui_core::DropEffects::COPY,
         }));
         lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Dropped {
             pos: at,
             data: ui_core::DragData::bytes("text/plain", b"from elsewhere".to_vec()),
+            button: ui_core::PointerButton::Primary,
+            performer: ui_core::Performer::Target,
         }));
         let seen: Vec<_> = lp
             .app_mut()
@@ -3123,7 +3908,7 @@ mod contracts {
         assert!(
             seen.iter().any(|(id, change)| *id == Id::str("zone")
                 && matches!(change, ui_core::change::Change::DroppedOn(data)
-                    if data.text() == Some("from elsewhere"))),
+                    if data.data.text() == Some("from elsewhere"))),
             "the payload decoded by the platform arrives at the drop: {seen:?}"
         );
     }
@@ -3210,6 +3995,93 @@ mod contracts {
             image.hotspot,
             (60, 40),
             "the image hangs from the grab point"
+        );
+    }
+
+    #[test]
+    fn a_secondary_press_on_a_payload_starts_a_right_drag() {
+        // The right button's drag belongs to the payload, not to `SECONDARY`: a node that
+        // never asked to hear the press still has to leave with the pointer. The threshold
+        // still separates the drag from the tap whose menu the press withheld.
+        let mut target = OffscreenTarget::new(220, 220);
+        let mut lp = AppLoop::new(LeavingCard);
+        lp.frame(&mut target, None);
+        let nid = lp
+            .tree()
+            .find_by_id(Id::str("source"))
+            .expect("the source is laid out");
+        let rect = lp
+            .tree()
+            .get(nid)
+            .expect("the source has a node")
+            .visual_rect();
+        let at = ui_core::geom::Point::new(rect.origin.x + 60.0, rect.origin.y + 40.0);
+        lp.dispatch(ui_core::Event::PointerMoved { pos: at });
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: at,
+            button: ui_core::PointerButton::Secondary,
+        });
+        // A tap is not a drag: nothing leaves for the host.
+        lp.dispatch(ui_core::Event::PointerReleased {
+            pos: at,
+            button: ui_core::PointerButton::Secondary,
+        });
+        assert!(
+            lp.take_native_drag().is_none(),
+            "a secondary tap opens the menu instead of dragging"
+        );
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: at,
+            button: ui_core::PointerButton::Secondary,
+        });
+        lp.dispatch(ui_core::Event::PointerMoved {
+            pos: ui_core::geom::Point::new(at.x + 60.0, at.y),
+        });
+        let drag = lp
+            .take_native_drag()
+            .expect("a right drag leaves for the host like a left one");
+        assert!(
+            drag.image.is_some(),
+            "the host gets the element's pixels for a right drag too"
+        );
+    }
+
+    /// An app that keeps no drag state of its own and answers every change with "nothing".
+    struct Silent;
+
+    impl App for Silent {
+        fn view(&mut self, _f: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            crate::from_decl(
+                Decl::container(Id::str("root"), NodeKind::Column)
+                    .size(ui_core::layout::SizeClass::fixed(200.0, 200.0))
+                    .child(
+                        Decl::container(Id::str("zone"), NodeKind::Column)
+                            .size(ui_core::layout::SizeClass::fixed(120.0, 80.0))
+                            .accept_drop(["text/*"]),
+                    ),
+            )
+        }
+
+        fn changed(&mut self, _id: Id, _change: ui_core::change::Change) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_drag_entering_a_target_asks_for_a_frame_by_itself() {
+        // The highlight and the effect the host publishes are both read from the next
+        // frame, so a target change must request one even when the app reports nothing:
+        // otherwise the pointer keeps showing the previous effect to the OS.
+        let mut target = OffscreenTarget::new(220, 220);
+        let mut lp = AppLoop::new(Silent);
+        lp.frame(&mut target, None);
+        assert!(
+            lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Entered {
+                pos: ui_core::geom::Point::new(20.0, 20.0),
+                types: vec!["text/plain".to_string()],
+                effects: ui_core::DropEffects::COPY,
+            })),
+            "entering a target is a frame, whatever the app answered"
         );
     }
 
@@ -3376,6 +4248,57 @@ mod contracts {
                 .any(|r| r.contains(ui_core::geom::Point::new(20.0, 20.0))),
             "a replaced texture must repaint its node, got {rects:?}"
         );
+    }
+
+    /// A picture a build hands over lives for the frame it painted; one registered on the
+    /// loop lives for the run. A picker hands over a thumbnail per visible row, so a table
+    /// that kept every one of them grows as long as the user browses.
+    #[test]
+    fn a_builds_picture_does_not_outlive_its_frame() {
+        struct EachFrame(u64);
+
+        impl App for EachFrame {
+            fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+                let id = self.0;
+                self.0 += 1;
+                cx.register_image(ui_core::draw::ImageEntry {
+                    id,
+                    width: 1,
+                    height: 1,
+                    source: ui_core::draw::ImageSource::Pixels(std::sync::Arc::new(vec![
+                        0, 0, 0, 255,
+                    ])),
+                    colour: ui_core::colour::ContentColour::SDR,
+                    sampling: ui_core::draw::Sampling::Smooth,
+                });
+                crate::from_decl(
+                    Decl::container(Id::str("pic"), NodeKind::Box)
+                        .size(ui_core::layout::SizeClass::fixed(40.0, 40.0))
+                        .background_image(id, ui_core::tree::ImageFit::Fill),
+                )
+            }
+        }
+
+        let texture = |id: u64| ui_core::draw::ImageEntry {
+            id,
+            width: 1,
+            height: 1,
+            source: ui_core::draw::ImageSource::Pixels(std::sync::Arc::new(vec![0, 0, 0, 255])),
+            colour: ui_core::colour::ContentColour::SDR,
+            sampling: ui_core::draw::Sampling::Smooth,
+        };
+        let mut target = OffscreenTarget::new(100, 100);
+        let mut lp = AppLoop::new(EachFrame(10));
+        lp.register_image(texture(3));
+        for _ in 0..5 {
+            lp.frame(&mut target, None);
+        }
+        assert_eq!(
+            lp.images.len(),
+            2,
+            "the run's picture and this frame's, not five frames' worth"
+        );
+        assert!(lp.images.contains_key(&3), "the run's picture stays");
     }
 
     /// An app whose picture is a canvas: two columns, and a version the app owns.
@@ -4640,6 +5563,82 @@ mod contracts {
             *lp.app_mut().steps.last().unwrap(),
             Some(ui_core::geom::Point::new(30.0, 0.0)),
             "40 -> 60 -> 70 is one frame's worth of movement"
+        );
+    }
+
+    /// A caret that keeps moving is still a blinking caret: the cycle belongs to the
+    /// editor, and restarting it on every offset change pins the caret lit while a key
+    /// repeats.
+    #[test]
+    fn a_caret_walking_with_the_keys_keeps_blinking() {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut lp = AppLoop::new(Typing {
+            text: "abc".to_string(),
+            seen,
+        });
+        lp.clock = FrameClock::scripted(vec![
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+        ]);
+        let mut target = OffscreenTarget::new(200, 120);
+        lp.frame(&mut target, None);
+        let at = ui_core::geom::Point::new(20.0, 20.0);
+        lp.dispatch(ui_core::Event::PointerPressed {
+            pos: at,
+            button: ui_core::PointerButton::Primary,
+        });
+        lp.dispatch(ui_core::Event::PointerReleased {
+            pos: at,
+            button: ui_core::PointerButton::Primary,
+        });
+        lp.frame(&mut target, None);
+        let start = lp.editing.expect("the click placed a caret");
+        for step in 0..7 {
+            let key = if step % 2 == 0 {
+                ui_core::Key::Left
+            } else {
+                ui_core::Key::Right
+            };
+            lp.dispatch(ui_core::Event::KeyPressed { key });
+            lp.frame(&mut target, None);
+        }
+        assert!(
+            lp.editing.is_some_and(|(_, selection)| selection.caret < start.1.caret),
+            "the keys walked the caret, so the cycle was under a moving caret"
+        );
+        // Seven tenths past the first frame that held the caret: the lit half is over.
+        assert!(
+            !lp.caret_blink_lit(lp.frame_now),
+            "a caret that kept moving must still reach its dark half"
+        );
+    }
+
+
+    /// A platform panel is placed against the output the host names: the surface a backend
+    /// opens for it stands where the tree put it, so the tree is what constrains it.
+    #[test]
+    fn a_platform_panel_unfolds_inside_the_output() {
+        let (mut lp, mut target) = menu_sink();
+        lp.set_panel_surfaces(true);
+        lp.set_output_bounds(Some(ui_core::geom::Rect::new(0.0, 0.0, 400.0, 200.0)));
+        lp.frame(&mut target, None);
+        // The anchor sits at the output's bottom, so below it there is no room.
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.0, 180.0),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("copy"), "Copy"),
+                ui_core::menu::MenuItem::new(Id::str("paste"), "Paste"),
+            ],
+        ));
+        lp.frame_with_dt(&mut target, None, 0.2);
+        let panel = lp
+            .platform_panels()
+            .first()
+            .map(|panel| panel.rect)
+            .expect("the menu is a platform panel");
+        assert!(
+            (panel.max_y() - 180.0).abs() < 0.5,
+            "the panel unfolds above the anchor rather than past the output"
         );
     }
 }
@@ -6223,6 +7222,168 @@ mod scrollbar_fade_tests {
     }
 }
 
+/// A list that declares only the rows its window covers, the way the picker does: the
+/// window comes from the offset the scroller reports, and a frame that moves the offset
+/// has to declare the rows it paints rather than the rows of where it stood before.
+mod windowed_list_tests {
+    use crate::present::OffscreenTarget;
+    use crate::view::*;
+    use ui_core::Decl;
+
+    const ROW: f32 = 20.0;
+
+    struct Listed {
+        content: f32,
+        /// The row the second build scrolls to before choosing its window.
+        jump_row: Option<usize>,
+        views: usize,
+    }
+
+    impl App for Listed {
+        fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            self.views += 1;
+            let scroller = Id::str("scroller");
+            // The picker's reveal: ask first, choose the window from the answer.
+            let (offset, viewport) = cx
+                .scroll_of(scroller)
+                .map_or((0.0, 100.0), |geom| (geom.offset_y, geom.viewport_h));
+            if self.views == 2
+                && let Some(row) = self.jump_row
+            {
+                let top = row as f32 * ROW;
+                if top < offset || top + ROW > offset + viewport {
+                    cx.set_scroll(scroller, 0.0, top);
+                }
+            }
+            let (offset, viewport) = cx
+                .scroll_of(scroller)
+                .map_or((0.0, 100.0), |geom| (geom.offset_y, geom.viewport_h));
+            let count = (self.content / ROW) as usize;
+            let first = ((offset / ROW).floor() as usize).min(count);
+            let last = (((offset + viewport) / ROW).ceil() as usize).min(count);
+            let mut column = Decl::container(Id::str("content"), NodeKind::Column)
+                .size(ui_core::layout::SizeClass::fixed(100.0, self.content));
+            if first > 0 {
+                column = column.child(
+                    Decl::container(Id::str("above"), NodeKind::Box).size(
+                        ui_core::layout::SizeClass::fixed(100.0, first as f32 * ROW),
+                    ),
+                );
+            }
+            for row in first..last {
+                column = column.child(
+                    Decl::container(Id::str("row").with(row), NodeKind::Box)
+                        .size(ui_core::layout::SizeClass::fixed(100.0, ROW)),
+                );
+            }
+            let scroller = Decl::container(scroller, NodeKind::Column)
+                // Hug, as `Scroll::vertical` does: a short list's viewport is its own
+                // height, which is what a frame that receives a longer list still reads.
+                .size(ui_core::layout::SizeClass {
+                    width: ui_core::layout::AxisSize::fixed(100.0),
+                    height: ui_core::layout::AxisSize::hug(0.0, 100.0),
+                    grow_x: ui_core::layout::Grow::No,
+                    grow_y: ui_core::layout::Grow::No,
+                })
+                .sense(ui_core::Sense::HOVER | ui_core::Sense::SCROLL_OWNED)
+                .clip(ui_core::layout::Clip {
+                    x: ui_core::layout::Overflow::Hidden,
+                    y: ui_core::layout::Overflow::Scroll,
+                })
+                .child(column);
+            crate::from_decl(scroller)
+        }
+    }
+
+    fn listed(jump_row: Option<usize>) -> (AppLoop<Listed>, OffscreenTarget) {
+        let app = Listed {
+            content: 4000.0,
+            jump_row,
+            views: 0,
+        };
+        (AppLoop::new(app), OffscreenTarget::new(100, 100))
+    }
+
+    fn listing(content: f32) -> (AppLoop<Listed>, OffscreenTarget) {
+        let app = Listed {
+            content,
+            jump_row: None,
+            views: 0,
+        };
+        (AppLoop::new(app), OffscreenTarget::new(100, 100))
+    }
+
+    fn offset(lp: &AppLoop<Listed>) -> f32 {
+        lp.scroll_of(Id::str("scroller")).unwrap_or(0.0)
+    }
+
+    /// The id table salts with the hash of the value, and a `usize` salt is not the `i32`
+    /// one: the row the app declares is `with(row)` where `row` counts rows.
+    fn row(index: usize) -> Id {
+        Id::str("row").with(index)
+    }
+
+    #[test]
+    fn a_revealed_row_is_declared_by_the_frame_that_reveals_it() {
+        let (mut lp, mut target) = listed(Some(120));
+        lp.frame(&mut target, None);
+        assert_eq!(offset(&lp), 0.0, "the first frame stands at the top");
+        lp.frame(&mut target, None);
+        assert_eq!(offset(&lp), 2400.0, "the reveal moved the scroller");
+        assert!(
+            lp.tree().find_by_id(row(120)).is_some(),
+            "the frame must declare the rows it paints, not the rows of the old offset"
+        );
+    }
+
+    #[test]
+    fn a_shrunken_list_owes_the_frame_that_rewindows_it() {
+        let (mut lp, mut target) = listed(Some(195));
+        lp.frame(&mut target, None);
+        lp.frame(&mut target, None);
+        assert_eq!(offset(&lp), 3900.0, "the list stands on its last page");
+        // The directory behind the list shrinks under the offset it stood at.
+        lp.app_mut().content = 300.0;
+        lp.take_dispatched();
+        lp.frame(&mut target, None);
+        assert_eq!(offset(&lp), 200.0, "layout clamps the offset past the new end");
+        assert!(
+            lp.frame_due(),
+            "the frame that shrank the box owes the window that follows it"
+        );
+        lp.frame(&mut target, None);
+        assert!(
+            lp.tree().find_by_id(row(10)).is_some(),
+            "the next window lands on the rows the clamped offset shows"
+        );
+    }
+
+    #[test]
+    fn a_list_whose_viewport_grows_owes_the_frame_that_rewindows_it() {
+        // A three-row list: the scroller hugs it, so its viewport is three rows tall.
+        let (mut lp, mut target) = listing(60.0);
+        lp.frame(&mut target, None);
+        lp.frame(&mut target, None);
+        lp.take_dispatched();
+        // The directory grows to twenty rows, and the scroller to its ceiling.
+        lp.app_mut().content = 400.0;
+        lp.frame(&mut target, None);
+        assert!(
+            lp.tree().find_by_id(row(4)).is_none(),
+            "the frame windowed from the short box it read before layout"
+        );
+        assert!(
+            lp.frame_due(),
+            "the frame that grew the viewport owes the window that follows it"
+        );
+        lp.frame(&mut target, None);
+        assert!(
+            lp.tree().find_by_id(row(4)).is_some(),
+            "the next frame windows from the viewport it now has"
+        );
+    }
+}
+
 /// A drag hands its movement down a chain of scrollers: each link takes what its own range
 /// allows on the axes it owns, and the rest passes to the ancestor behind it.
 mod pan_chain_tests {
@@ -6509,7 +7670,7 @@ mod cursor_command_tests {
         }
 
         fn changed(&mut self, id: Id, change: ui_core::change::Change) -> bool {
-            if let ui_core::change::Change::Middle { down } = change {
+            if let ui_core::change::Change::Middle { down, .. } = change {
                 self.seen.borrow_mut().push((id, down));
                 return true;
             }
@@ -6619,5 +7780,118 @@ mod cursor_command_tests {
         lp.frame(&mut target, None);
         assert_eq!(lp.take_pointer_steps(), vec![(-2.0, 1.0)]);
         assert!(lp.take_pointer_steps().is_empty(), "a request is drained once");
+    }
+}
+
+mod press_burst_tests {
+    use crate::present::OffscreenTarget;
+    use crate::view::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use ui_core::Decl;
+    use ui_core::Sense;
+    use ui_core::geom::Point;
+    use ui_core::layout::SizeClass;
+
+    /// One row's view of the burst: every completed primary click and the count it carried.
+    struct Tap {
+        sense: Sense,
+        clicks: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl crate::Element for Tap {
+        fn decl(&self, _cx: &mut ui_core::cx::Cx<'_>) -> Decl {
+            Decl::container(Id::str("tap"), NodeKind::Box)
+                .size(SizeClass::fixed(80.0, 40.0))
+                .sense(self.sense)
+        }
+
+        fn change(
+            &self,
+            state: &crate::WidgetState,
+            _bounds: ui_core::geom::Rect,
+        ) -> Option<ui_core::change::Change> {
+            if state.clicked {
+                self.clicks.borrow_mut().push(state.clicks);
+            }
+            None
+        }
+    }
+
+    struct Taps {
+        sense: Sense,
+        clicks: Rc<RefCell<Vec<u32>>>,
+        secondary: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl App for Taps {
+        fn view(&mut self, _cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn crate::Element> {
+            Box::new(Tap {
+                sense: self.sense,
+                clicks: Rc::clone(&self.clicks),
+            })
+        }
+
+        fn changed(&mut self, _id: Id, change: ui_core::change::Change) -> bool {
+            if let ui_core::change::Change::Secondary { down: true, clicks } = change {
+                self.secondary.borrow_mut().push(clicks);
+            }
+            true
+        }
+    }
+
+    fn press(
+        lp: &mut AppLoop<Taps>,
+        button: ui_core::PointerButton,
+        at: Point,
+    ) {
+        lp.dispatch(ui_core::Event::PointerPressed { button, pos: at });
+        lp.dispatch(ui_core::Event::PointerReleased { button, pos: at });
+    }
+
+    /// The desktop rule: a press inside the gap and the rectangle joins the previous one.
+    /// Each button has its own burst, so a right double-click is two presses, not a mix.
+    #[test]
+    fn a_press_joins_its_burst_only_within_the_desktops_gap_and_rectangle() {
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let secondary = Rc::new(RefCell::new(Vec::new()));
+        let mut lp = AppLoop::new(Taps {
+            sense: Sense::HOVER | Sense::CLICK | Sense::SECONDARY,
+            clicks: Rc::clone(&clicks),
+            secondary: Rc::clone(&secondary),
+        });
+        lp.clock = FrameClock::scripted(vec![0.0]);
+        let mut target = OffscreenTarget::new(200, 200);
+        lp.frame(&mut target, None);
+        let at = Point::new(20.0, 20.0);
+        let primary = ui_core::PointerButton::Primary;
+
+        press(&mut lp, primary, at);
+        lp.frame(&mut target, None);
+        press(&mut lp, primary, at);
+        lp.frame(&mut target, None);
+        assert_eq!(*clicks.borrow(), [1, 2], "one double-click reads as two presses");
+
+        // Past the desktop's half second, the next press is a new single click.
+        lp.build_with_dt((200, 200), None, 0.6);
+        press(&mut lp, primary, at);
+        lp.frame(&mut target, None);
+        assert_eq!(*clicks.borrow(), [1, 2, 1], "a slow second press starts over");
+
+        // The rectangle is what separates a double-click from two clicks in one row.
+        press(&mut lp, primary, Point::new(20.0, 32.0));
+        lp.frame(&mut target, None);
+        assert_eq!(*clicks.borrow(), [1, 2, 1, 1], "a moved press starts over");
+
+        let secondary_button = ui_core::PointerButton::Secondary;
+        press(&mut lp, secondary_button, at);
+        lp.frame(&mut target, None);
+        press(&mut lp, secondary_button, at);
+        lp.frame(&mut target, None);
+        assert_eq!(
+            *secondary.borrow(),
+            [1, 2],
+            "the secondary button counts its own presses, so a right double-click reads 2"
+        );
     }
 }

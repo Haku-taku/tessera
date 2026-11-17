@@ -122,6 +122,10 @@ pub struct MenuFlyoutParams<'a> {
     /// The narrow padding is the reference's pen/mouse/keyboard variant; touch keeps the
     /// default. `None` means "not told", which takes the default.
     pub narrow: Option<bool>,
+    /// Where the panel is painted: inside the parent surface, or on a platform popup of its
+    /// own. A platform panel escapes the parent's clip, so a menu opened near the window's
+    /// edge keeps its whole height.
+    pub presentation: Presentation,
 }
 
 impl<'a> MenuFlyoutParams<'a> {
@@ -133,6 +137,7 @@ impl<'a> MenuFlyoutParams<'a> {
             items,
             open: true,
             narrow: None,
+            presentation: Presentation::Parent,
         }
     }
 
@@ -148,6 +153,11 @@ impl<'a> MenuFlyoutParams<'a> {
 
     pub fn narrow(mut self, narrow: bool) -> Self {
         self.narrow = Some(narrow);
+        self
+    }
+
+    pub fn presentation(mut self, presentation: Presentation) -> Self {
+        self.presentation = presentation;
         self
     }
 }
@@ -218,6 +228,8 @@ pub struct FluentMenuFlyout {
     fired: Option<Id>,
     /// This frame's entrance, and whether the panel is still on stage while closing.
     motion: PopupMotion,
+    /// The surface the panel is painted on, as the caller asked for it.
+    presentation: Presentation,
 }
 
 impl FluentMenuFlyout {
@@ -229,6 +241,7 @@ impl FluentMenuFlyout {
             items,
             open,
             narrow,
+            presentation,
         } = params;
         let m = pack
             .controls
@@ -307,11 +320,13 @@ impl FluentMenuFlyout {
                 tint: recipe.tint,
                 luminosity: recipe.luminosity,
                 noise: recipe.noise,
+                fallback: recipe.fallback,
             },
             blur_sigma: recipe.blur_sigma,
             focus,
             fired,
             motion,
+            presentation,
         }
     }
 
@@ -453,7 +468,7 @@ impl Widget for FluentMenuFlyout {
             match_anchor_width: false,
             match_anchor_height: false,
             min_width: 0.0,
-            presentation: Presentation::Parent,
+            presentation: self.presentation,
         };
         let corners = Corners::all(PRESENTER_RADIUS);
         let mut panel = Decl::container(panel_id, NodeKind::Column)

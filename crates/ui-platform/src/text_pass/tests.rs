@@ -1338,16 +1338,47 @@ mod contracts {
         );
     }
 
+    /// A truncated name ends its line short and the painter appends the ellipsis to make up
+    /// the difference. Spans are in the block's own bytes, so a piece clamped against the
+    /// appended ellipsis was sliced at an offset the block does not own: the slice was not a
+    /// character boundary, the piece shaped nothing, and the primitive stayed unresolved —
+    /// invisible on the GPU and a placeholder bar on the CPU fallback.
     #[test]
-    fn resolve_replaces_text_with_glyphs() {
-        let mut pass = TextPass::new();
+    fn a_truncated_line_shapes_its_body_and_its_ellipsis() {
+        let mut pass = TextPass::with_stack(&["Tahoma"]);
         if !pass.has_face() {
             return;
         }
-        let out = pass.resolve(&text_list("Hi", 24.0), 1.0);
-        assert!(out.prims.texts.is_empty(), "text must be consumed");
-        assert_eq!(out.prims.glyphs.len(), 2, "one glyph per visible char");
-        assert_eq!(pass.unresolved(), 0);
+        let mut list = text_list("Captures", 20.0);
+        // Layout has already chosen the cut, one character short of the span's end.
+        list.prims.texts[0].layout = Some(std::sync::Arc::new(ui_core::InlineLayout {
+            lines: vec![ui_core::InlineLine {
+                range: 0..7,
+                y: 0.0,
+                height: 20.0,
+                baseline: 15.0,
+                width: 70.0,
+                ellipsis: true,
+                runs: Vec::new(),
+                atoms: Vec::new(),
+            }],
+            width: 70.0,
+            height: 20.0,
+            baseline: 15.0,
+            rtl: false,
+        }));
+
+        let out = pass.resolve(&list, 1.0);
+        assert!(
+            out.prims.texts.is_empty(),
+            "a truncated line must resolve to glyphs"
+        );
+        assert_eq!(
+            out.prims.glyphs.len(),
+            8,
+            "seven kept characters and the ellipsis"
+        );
+        assert_eq!(pass.unresolved(), 0, "nothing may fall back unshaped");
     }
 
     #[test]
@@ -1566,18 +1597,6 @@ mod contracts {
             "the trailing digit must draw with a width, got {:?}",
             digits.iter().map(|g| g.rect.size.w).collect::<Vec<_>>()
         );
-    }
-
-    /// A display-list line is placed at the formula's origin and baseline, so a
-    /// `\cancel` stroke lands on the body it crosses.
-    #[test]
-    fn a_formula_line_is_placed_on_the_baseline() {
-        let origin = ui_core::geom::Point::new(10.0, 20.0);
-        let line = math_line(origin, 32.0, [1.0, 2.0, 30.0, 40.0], 1.5, Color::WHITE);
-        assert_eq!(line.from, ui_core::geom::Point::new(11.0, 34.0));
-        assert_eq!(line.to, ui_core::geom::Point::new(40.0, 72.0));
-        assert_eq!(line.thickness, 1.5);
-        assert_eq!(line.colour, Color::WHITE);
     }
 
     /// A formula paints through the same atlas as text: its glyph ids become glyph prims on

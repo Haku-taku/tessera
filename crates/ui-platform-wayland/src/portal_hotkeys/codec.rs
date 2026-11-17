@@ -35,6 +35,7 @@ fn named_keysym(key: Key) -> Option<&'static str> {
         Key::Up => "Up",
         Key::Down => "Down",
         Key::Print => "Print",
+        Key::Menu => "Menu",
         Key::Function(_) | Key::Char(_) => return None,
     })
 }
@@ -177,6 +178,7 @@ fn keysym_to_key(name: &str) -> Option<Key> {
         "Right" => return Some(Key::Right),
         "Up" => return Some(Key::Up),
         "Down" => return Some(Key::Down),
+        "Menu" => return Some(Key::Menu),
         _ => {}
     }
     // A single lowercase letter or digit is its own character; otherwise punctuation.

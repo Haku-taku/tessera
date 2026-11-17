@@ -88,4 +88,25 @@ mod tests {
         assert!(p.ink("ButtonBackground").is_some());
         assert_eq!(p.ink("colorNeutralBackground1"), None);
     }
+
+    /// WinUI's raised surface is a card tint — white at five percent — that the system
+    /// composites over the page. A menu or a dialog that covers rows has to come out opaque,
+    /// or the rows show through it and its text cannot be read.
+    #[test]
+    fn a_surface_that_hides_content_is_opaque_whatever_the_pack_paints() {
+        use ui_core::geom::Color;
+        use ui_design::CommonColor;
+        let p = pack_of(ui_design::Appearance::Dark);
+        let fallback = Color::WHITE;
+        let raised = p.colour_or(CommonColor::SurfaceRaised, fallback);
+        assert!(raised.a < 1.0, "the WinUI card fill is a tint: {raised:?}");
+        let covering = p.opaque_or(CommonColor::SurfaceRaised, fallback);
+        assert_eq!(covering.a, 1.0, "a covering surface cannot be translucent");
+        let page = p.colour_or(CommonColor::Surface, fallback);
+        assert_eq!(
+            covering,
+            raised.over(page),
+            "the tint is composited over the page, as the system does"
+        );
+    }
 }

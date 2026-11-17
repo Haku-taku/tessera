@@ -393,6 +393,7 @@ impl FluentNavigationView {
                 tint: recipe.tint,
                 luminosity: recipe.luminosity,
                 noise: recipe.noise,
+                fallback: recipe.fallback,
             },
             blur_sigma: recipe.blur_sigma,
             // No `NavigationViewPaneBorderBrush` in the corpus; the content grid's own stroke

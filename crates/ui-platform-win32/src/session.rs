@@ -9,9 +9,12 @@ use ui_core::Damage;
 use ui_core::NodeId;
 use ui_core::draw::DrawList;
 use ui_core::geom::Point;
+use ui_platform::chooser::{
+    ChooserAnswer, ChooserCapabilities, ChooserError, ChooserId, ChooserRequest,
+};
 use ui_platform::clipboard::{ClipboardCommand, ClipboardCopy};
 use ui_platform::driver::{Driver, FrameHost as _, Turn};
-use ui_platform::host::{Engine, SurfaceHandle, SurfaceStep};
+use ui_platform::host::{Engine, PresentationOptions, SurfaceHandle, SurfaceStep};
 use ui_platform::present::{CanvasFrame, PresentStats, SceneTarget};
 use ui_platform::session::{HostSession, SessionOptions, Tick};
 use ui_platform::text_pass::TextPass;
@@ -34,9 +37,6 @@ pub struct Presenter {
     win: Win32Window,
     /// The surface's frame event, shared with the window and the host's wait set.
     pace: Arc<FramePace>,
-    /// The atlas versions the render thread has been sent, so a frame carries only what
-    /// changed and a rebuilt device is given everything again.
-    atlases: Atlases,
     /// Scripted pointer for the next frame; see [`set_pointer`](Self::set_pointer).
     pointer: Option<Point>,
     /// The app asked for this surface to close.
@@ -50,6 +50,15 @@ pub struct Presenter {
     /// Every surface's frame event, which the host's one sleep waits on. A panel opened
     /// later adds its own, or its next frame would wait for an event nothing is waiting for.
     paces: Rc<RefCell<Vec<Weak<FramePace>>>>,
+    /// The window a shell context menu belongs to, shared with the backend when there is one.
+    menu_owner: crate::context_menu::MenuOwner,
+    /// Answers the native dialogs produced, drained by the host on its next turn.
+    chooser_answers: Vec<(ChooserId, ChooserAnswer)>,
+    /// A platform menu a build asked for, held until the next turn.
+    ///
+    /// The host reconciles the engine's panels after a step, and the menu the user picked
+    /// from must leave the screen before the platform's popup takes the input.
+    pending_shell_menu: Option<ui_core::cx::ShellMenuRequest>,
 }
 
 /// An app and the one surface it drives, for code that runs a single window itself.
@@ -58,67 +67,61 @@ pub struct Session<A: App> {
     presenter: Presenter,
 }
 
-/// The two atlas pages' versions, as last handed to the render thread.
-///
-/// The text starts at the presenter's own `u64::MAX`: a fresh renderer holds no glyphs, so
-/// it is owed the first frame's page whatever version that frame reports.
-struct Atlases {
-    text: u64,
-    color: u64,
-}
-
-impl Atlases {
-    /// Nothing sent yet: a render thread that just opened a chain.
-    fn fresh() -> Self {
-        Self {
-            text: u64::MAX,
-            color: 0,
-        }
-    }
-
-    /// Nothing holds these bytes any more, so the next frame carries both pages.
-    fn forget(&mut self) {
-        self.text = u64::MAX;
-        self.color = u64::MAX;
-    }
-}
-
 impl Presenter {
     /// Open the window and start the render thread.
     pub fn open(
         opts: SessionOptions,
         paces: Rc<RefCell<Vec<Weak<FramePace>>>>,
+        menu_owner: crate::context_menu::MenuOwner,
     ) -> Result<Self, String> {
         if opts.cpu_presenter {
             return Err(String::from(
                 "the Win32 backend presents through D3D11 only; it has no CPU presenter",
             ));
         }
-        let mut win = Win32Window::new(opts.surface.clone())
+        log::debug!("ui-platform-win32: creating the window for a surface");
+        let win = Win32Window::new(opts.surface.clone())
             .map_err(|error| format!("cannot open a Win32 window: {error}"))?;
+        log::debug!("ui-platform-win32: the window is up; asking for a chain");
+        Self::with_window(win, opts.surface, opts.uncapped, paces, menu_owner)
+    }
+
+    /// Wrap an already created window in a presenter and start its render thread.
+    fn with_window(
+        mut win: Win32Window,
+        spec: SurfaceSpec,
+        uncapped: bool,
+        paces: Rc<RefCell<Vec<Weak<FramePace>>>>,
+        menu_owner: crate::context_menu::MenuOwner,
+    ) -> Result<Self, String> {
         let pace = Arc::new(FramePace::new());
         let render = RenderThread::open(
             win.visual_hwnd(),
             win.client_size(),
             win.alpha(),
-            opts.uncapped,
+            uncapped,
             win.refresh_hz(),
             Arc::clone(&pace),
         )
         .map_err(|error| format!("the D3D11 renderer could not start: {error}"))?;
         win.set_frame_pace(Arc::clone(&pace));
+        // Only a window that will exist hands menus its handle; a failed renderer above
+        // leaves the previous owner in the slot.
+        crate::context_menu::set_owner(&menu_owner, win.hwnd());
         Ok(Self {
             render,
-            driver: Driver::new().uncapped(opts.uncapped),
+            driver: Driver::new().uncapped(uncapped),
             win,
             pace,
-            atlases: Atlases::fresh(),
             pointer: None,
             closed: false,
             supersample: 1,
-            spec: opts.surface,
-            uncapped: opts.uncapped,
+            spec,
+            uncapped,
             paces,
+            menu_owner,
+            chooser_answers: Vec::new(),
+            pending_shell_menu: None,
         })
     }
 
@@ -334,15 +337,8 @@ impl Presenter {
         if width == 0 || height == 0 || !self.win.can_draw() {
             return false;
         }
-        let drew = present_once(
-            lp,
-            &mut self.win,
-            &self.render,
-            &self.pace,
-            &mut self.atlases,
-            pointer,
-        )
-        .is_ok();
+        lp.set_output_bounds(self.win.work_area());
+        let drew = present_once(lp, &mut self.win, &self.render, &self.pace, pointer).is_ok();
         self.closed |= lp.take_close();
         for (dx, dy) in lp.take_pointer_steps() {
             self.win.nudge_pointer(dx, dy);
@@ -365,7 +361,11 @@ impl Presenter {
         }
     }
 
-    fn draw<A: App>(&mut self, lp: &mut AppLoop<A>, pointer: Option<Point>) -> Result<Tick, String> {
+    fn draw<A: App>(
+        &mut self,
+        lp: &mut AppLoop<A>,
+        pointer: Option<Point>,
+    ) -> Result<Tick, String> {
         let tick = self.draw_frame(lp, pointer)?;
         // The render thread presents asynchronously: a refused frame is reported here, one
         // turn late, rather than closing the window from a driver error nobody can see.
@@ -380,14 +380,48 @@ impl Presenter {
         lp: &mut AppLoop<A>,
         pointer: Option<Point>,
     ) -> Result<Tick, String> {
+        // The tree constrains platform panels against the monitor, and the surfaces this
+        // window owns stand where the tree placed them; a moved window changes the bound.
+        lp.set_output_bounds(self.win.work_area());
+        // A menu the previous build asked for runs before this turn's frame: the host has
+        // reconciled the panels since then, so the engine's own menu is already gone.
+        if let Some(menu) = self.pending_shell_menu.take() {
+            self.run_shell_menu(lp, menu);
+        }
         let tick = self.present_frame(lp, pointer)?;
         // A drag that asked to leave the app becomes OLE's; one that highlighted a drop
         // publishes the effect the pointer should show from now on.
         if let Some(drag) = lp.take_native_drag() {
             self.run_native_drag(lp, drag);
         }
+        // The platform's popup owns the user's input until it closes, so it runs on the turn
+        // after the build that asked: by then the host has reconciled the engine's panels,
+        // and the menu the user picked from is off screen under the popup.
+        if let Some(menu) = lp.take_shell_menu() {
+            self.pending_shell_menu = Some(menu);
+            lp.request_frame();
+        }
         self.win.set_drop_effect(lp.drop_effect());
         Ok(tick)
+    }
+
+    /// Run the platform menu a build asked for, at the start of a turn.
+    ///
+    /// The popup's loop is the shell's own and does not return until the user dismisses it;
+    /// a build that opened it would stay unpainted and the host would never reconcile. This
+    /// window holds the frame it has for the whole popup, and the rest of the process keeps
+    /// drawing from the loop's timer.
+    fn run_shell_menu<A: App>(&mut self, lp: &mut AppLoop<A>, menu: ui_core::cx::ShellMenuRequest) {
+        use ui_platform::shell_menu::ShellMenuHost as _;
+        let host = crate::context_menu::Win32ShellMenu::for_window(self.win.hwnd());
+        let mut pump = || {};
+        let timer = crate::modal::arm(self.win.hwnd(), &mut pump);
+        let shown = host.show_native(&menu.paths, (menu.at.x, menu.at.y));
+        crate::modal::disarm(self.win.hwnd(), timer);
+        if shown {
+            // A shell verb may have changed the folder; the next build reads it.
+            lp.request_frame();
+        }
     }
 
     /// Build, layout, paint and hand one frame to the render thread; no drag starts here.
@@ -408,18 +442,11 @@ impl Presenter {
             self.render
                 .rebuild(String::from("the display changed"), self.win.refresh_hz());
         }
-        if self.render.take_atlas_request() {
-            self.atlases.forget();
-        }
         let framed = {
             let Presenter {
-                win,
-                render,
-                pace,
-                atlases,
-                ..
+                win, render, pace, ..
             } = self;
-            present_once(lp, win, render, pace, atlases, pointer)?
+            present_once(lp, win, render, pace, pointer)?
         };
         // A close the build asked for takes effect in this turn, not the next one.
         self.closed |= lp.take_close();
@@ -458,13 +485,30 @@ impl Presenter {
             win,
             render,
             pace,
-            atlases,
             closed,
             ..
         } = self;
         let mut pump = || {
+            // The wheel still has to reach the scroller under the pointer: OLE's loop
+            // dispatches it to this window, but no turn drains the queue while it runs.
+            let mut wheeled = false;
+            for event in win.take_wheel_events() {
+                lp.dispatch(event);
+                wheeled = true;
+            }
+            if wheeled {
+                lp.request_frame();
+            }
             // Nothing to say and nothing moving: the surface already shows the truth.
-            if queue.is_empty() && !lp.is_animating() {
+            if queue.is_empty() && !lp.is_animating() && !wheeled {
+                return;
+            }
+            // A frame still in flight means the gate is shut, and the hand-over would block
+            // until the render thread takes it. This pump runs inside `DoDragDrop`, so a
+            // block here stops the gesture itself — the pointer stops moving the drag. The
+            // queue waits for the next tick: a phase consumed now would be drawn by no
+            // frame, and OLE reports a still pointer only once.
+            if !win.can_draw() {
                 return;
             }
             // The drag the app is carrying may itself be over one of its targets.
@@ -475,16 +519,10 @@ impl Presenter {
             if size.0 == 0 || size.1 == 0 {
                 return;
             }
-            // A frame still in flight means the gate is shut, and the hand-over would block
-            // until the render thread takes it. This pump runs inside `DoDragDrop`, so a
-            // block here stops the gesture itself — the pointer stops moving the drag.
-            if !win.can_draw() {
-                return;
-            }
             let pointer = win.pointer();
             // A failed frame during a drag is not worth ending the surface for: the next
             // turn reports it the ordinary way.
-            let _ = present_once(lp, win, render, pace, atlases, pointer);
+            let _ = present_once(lp, win, render, pace, pointer);
             *closed |= lp.take_close();
             for (dx, dy) in lp.take_pointer_steps() {
                 win.nudge_pointer(dx, dy);
@@ -496,7 +534,7 @@ impl Presenter {
         if !crate::dnd::begin(hwnd, drag, &queue, Some(&mut pump)) {
             // The host refused, so the gesture ends without a drop.
             lp.dispatch(ui_core::Event::Dnd(ui_core::DndEvent::Finished {
-                dropped: false,
+                outcome: None,
             }));
             lp.request_frame();
         }
@@ -509,7 +547,11 @@ impl<A: App> Session<A> {
         Ok(Self {
             lp,
             // A single surface drives itself: nothing else would step a panel it opened.
-            presenter: Presenter::open(opts, Rc::new(RefCell::new(Vec::new())))?,
+            presenter: Presenter::open(
+                opts,
+                Rc::new(RefCell::new(Vec::new())),
+                crate::context_menu::empty_owner(),
+            )?,
         })
     }
 
@@ -612,6 +654,8 @@ impl<A: App> Session<A> {
 
 impl Drop for Presenter {
     fn drop(&mut self) {
+        // A menu must not keep a handle to a window that is about to go.
+        crate::context_menu::clear_owner(&self.menu_owner, self.win.hwnd());
         // The chain belongs to the render thread and the window to this type: the thread
         // must let go of the chain before the window it presents through is destroyed.
         self.finish();
@@ -622,6 +666,10 @@ impl SurfaceHandle for Presenter {
     fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
         let tick = self.step_with(engine)?;
         Ok(SurfaceStep { drew: tick.drew })
+    }
+
+    fn pointer(&self) -> Option<Point> {
+        self.win.pointer()
     }
 
     fn moving(&self) -> bool {
@@ -677,6 +725,69 @@ impl SurfaceHandle for Presenter {
         )?;
         Ok(Box::new(presenter))
     }
+
+    /// A panel presented as a window: a decorated, non-modal child of this surface.
+    ///
+    /// The panel still belongs to this surface's tree, so the window is a view of that
+    /// subtree rather than an app of its own.
+    fn open_panel_window(
+        &mut self,
+        node: NodeId,
+        spec: PopupSpec,
+        title: &str,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        let root = Point::new(0.0, 0.0);
+        let presenter = open_panel_window(
+            &self.win,
+            &self.spec,
+            root,
+            node,
+            spec,
+            title,
+            self.uncapped,
+            &self.paces,
+        )?;
+        Ok(Box::new(presenter))
+    }
+
+    /// A dialog belonging to this surface: an owned window, modal over it when asked.
+    fn open_dialog(
+        &mut self,
+        spec: SurfaceSpec,
+        options: PresentationOptions,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        let win = Win32Window::new_dialog(&self.win, spec.clone())
+            .map_err(|error| format!("cannot open a Win32 dialog: {error}"))?;
+        let presenter = Presenter::with_window(
+            win,
+            spec,
+            options.uncapped,
+            Rc::clone(&self.paces),
+            Arc::clone(&self.menu_owner),
+        )?;
+        // The host's wait must end when the dialog's render thread finishes a frame.
+        self.paces
+            .borrow_mut()
+            .push(Arc::downgrade(&presenter.frame_pace()));
+        Ok(Box::new(presenter))
+    }
+
+    fn chooser_capabilities(&self) -> Option<ChooserCapabilities> {
+        Some(crate::chooser::capabilities())
+    }
+
+    /// The dialog runs its own message loop until the user answers; the host has already
+    /// held the parent's input, so blocking this turn is the intended shape.
+    fn choose(&mut self, id: ChooserId, request: ChooserRequest) -> Result<(), ChooserError> {
+        let answer = crate::chooser::choose(self.win.hwnd(), &request);
+        self.chooser_answers
+            .push((id, ChooserAnswer::native(answer)));
+        Ok(())
+    }
+
+    fn chooser_events(&mut self) -> Vec<(ChooserId, ChooserAnswer)> {
+        std::mem::take(&mut self.chooser_answers)
+    }
 }
 
 /// A panel's own window: the engine paints it, this presenter shows it and routes its input.
@@ -687,7 +798,6 @@ struct PopupPresenter {
     render: RenderThread,
     win: Win32Window,
     pace: Arc<FramePace>,
-    atlases: Atlases,
     /// What the popup was opened as, so a panel inside it is named the same way.
     spec: SurfaceSpec,
     node: NodeId,
@@ -703,6 +813,9 @@ struct PopupPresenter {
     presented: Option<u64>,
     /// The panel went away or the shell took it back; the host dismisses it.
     closed: bool,
+    /// Whether this surface is a window rather than a popup: a window keeps its own place
+    /// and only takes the size a changed panel asks for.
+    window: bool,
 }
 
 /// The surface spec a panel's window is opened with.
@@ -752,7 +865,6 @@ fn open_panel(
         render,
         win,
         pace,
-        atlases: Atlases::fresh(),
         spec: surface,
         node,
         uncapped,
@@ -761,6 +873,56 @@ fn open_panel(
         origin: parent_origin + spec.rect.origin,
         presented: None,
         closed: false,
+        window: false,
+    })
+}
+
+/// Open a non-modal window owned by `parent` that shows the panel `node`.
+///
+/// The platform decides where a modeless child stands, so the panel's rect supplies the
+/// client size and its own place is not imposed on the window.
+fn open_panel_window(
+    parent: &Win32Window,
+    parent_spec: &SurfaceSpec,
+    parent_origin: Point,
+    node: NodeId,
+    spec: PopupSpec,
+    title: &str,
+    uncapped: bool,
+    paces: &Rc<RefCell<Vec<Weak<FramePace>>>>,
+) -> Result<PopupPresenter, String> {
+    let size = (
+        spec.rect.size.w.round().max(1.0) as u32,
+        spec.rect.size.h.round().max(1.0) as u32,
+    );
+    let surface = SurfaceSpec::dialog(parent_spec.app_id.clone(), title, size).with_modal(false);
+    let mut win = Win32Window::new_panel_dialog(parent, surface.clone())
+        .map_err(|error| format!("cannot open the panel's window: {error}"))?;
+    let pace = Arc::new(FramePace::new());
+    let render = RenderThread::open(
+        win.visual_hwnd(),
+        win.client_size(),
+        win.alpha(),
+        uncapped,
+        win.refresh_hz(),
+        Arc::clone(&pace),
+    )
+    .map_err(|error| format!("the panel's renderer could not start: {error}"))?;
+    win.set_frame_pace(Arc::clone(&pace));
+    paces.borrow_mut().push(Arc::downgrade(&pace));
+    Ok(PopupPresenter {
+        render,
+        win,
+        pace,
+        spec: surface,
+        node,
+        uncapped,
+        paces: Rc::clone(paces),
+        parent_origin,
+        origin: parent_origin + spec.rect.origin,
+        presented: None,
+        closed: false,
+        window: true,
     })
 }
 
@@ -769,9 +931,18 @@ fn shift(event: ui_core::Event, by: Point) -> ui_core::Event {
     use ui_core::Event;
     match event {
         Event::PointerMoved { pos } => Event::PointerMoved { pos: pos + by },
-        Event::PointerPressed { pos, button } => Event::PointerPressed { pos: pos + by, button },
-        Event::PointerReleased { pos, button } => Event::PointerReleased { pos: pos + by, button },
-        Event::Scroll { pos, delta } => Event::Scroll { pos: pos + by, delta },
+        Event::PointerPressed { pos, button } => Event::PointerPressed {
+            pos: pos + by,
+            button,
+        },
+        Event::PointerReleased { pos, button } => Event::PointerReleased {
+            pos: pos + by,
+            button,
+        },
+        Event::Scroll { pos, delta } => Event::Scroll {
+            pos: pos + by,
+            delta,
+        },
         other => other,
     }
 }
@@ -785,18 +956,13 @@ impl PopupPresenter {
         let scale = self.win.scale();
         let node = self.node;
         let PopupPresenter {
-            win,
-            render,
-            pace,
-            atlases,
-            ..
+            win, render, pace, ..
         } = self;
         let mut target = Target {
             win,
             sink: Sink {
                 render,
                 pace,
-                atlases,
                 size,
                 scale,
             },
@@ -810,13 +976,13 @@ impl PopupPresenter {
 }
 
 impl SurfaceHandle for PopupPresenter {
-    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+    fn intake(&mut self, engine: &mut Engine) -> Result<(), String> {
         // The queue is the thread's, so a pump here takes whatever arrived for this window
         // as well as for the root's; each window keeps only what its own procedure stored.
         self.win.pump();
         if self.win.should_close() {
             self.closed = true;
-            return Ok(SurfaceStep::default());
+            return Ok(());
         }
         // A frame the render thread refused is reported here, one turn late, rather than
         // leaving the panel showing its last one forever.
@@ -832,16 +998,27 @@ impl SurfaceHandle for PopupPresenter {
         if let Some(at) = self.win.pointer() {
             self.win.set_cursor(engine.cursor_shape_at(at + origin));
         }
+        Ok(())
+    }
+
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        self.intake(engine)?;
+        if self.closed {
+            return Ok(SurfaceStep::default());
+        }
         let frame = engine.frame_number();
         // Nothing new since the last show, nothing painted for it, or no frame window yet.
-        if self.presented == Some(frame)
-            || !self.win.can_draw()
-            || !engine.panel_painted(self.node)
+        if self.presented == Some(frame) || !self.win.can_draw() || !engine.panel_painted(self.node)
         {
             return Ok(SurfaceStep::default());
         }
         self.present(engine, frame)?;
         Ok(SurfaceStep { drew: true })
+    }
+
+    fn pointer(&self) -> Option<Point> {
+        // The panel's own pointer is window-local: the tree places the panel at `origin`.
+        self.win.pointer().map(|local| local + self.origin)
     }
 
     fn next_deadline(&self, _engine: &Engine) -> Option<std::time::Instant> {
@@ -877,7 +1054,24 @@ impl SurfaceHandle for PopupPresenter {
     }
 
     fn reconfigure(&mut self, spec: PopupSpec) -> Result<(), String> {
-        self.win.move_popup(spec).map_err(|error| error.to_string())?;
+        if self.window {
+            // Where a modeless child stands is the platform's; its size is the content's.
+            let size = (
+                spec.rect.size.w.round().max(1.0) as u32,
+                spec.rect.size.h.round().max(1.0) as u32,
+            );
+            self.win
+                .set_client_size(size)
+                .map_err(|error| error.to_string())?;
+            self.spec.role = SurfaceRole::Dialog {
+                size,
+                modal: false,
+            };
+            return Ok(());
+        }
+        self.win
+            .move_popup(spec)
+            .map_err(|error| error.to_string())?;
         self.origin = self.parent_origin + spec.rect.origin;
         Ok(())
     }
@@ -892,7 +1086,6 @@ fn present_once<A: App>(
     win: &mut Win32Window,
     render: &RenderThread,
     pace: &Arc<FramePace>,
-    atlases: &mut Atlases,
     pointer: Option<Point>,
 ) -> Result<SceneFrameOutcome, String> {
     let size = win.client_size();
@@ -902,7 +1095,6 @@ fn present_once<A: App>(
         sink: Sink {
             render,
             pace,
-            atlases,
             size,
             scale,
         },
@@ -966,6 +1158,12 @@ impl<A: App> HostSession<A> for Session<A> {
 
     fn request_close(&mut self) {
         self.presenter.window_mut().request_close();
+    }
+
+    fn shell_menu(&self) -> Option<Arc<dyn ui_platform::shell_menu::ShellMenuHost>> {
+        Some(Arc::new(crate::context_menu::Win32ShellMenu::for_window(
+            self.window().hwnd(),
+        )))
     }
 
     fn write_clipboard(&mut self, content: ui_core::clipboard::ClipboardContent) -> bool {
@@ -1045,18 +1243,17 @@ struct Target<'a> {
     sink: Sink<'a>,
 }
 
-/// What the render thread is handed: the packet's source and the version bookkeeping.
+/// What the render thread is handed: the packet's source and the size it draws at.
 struct Sink<'a> {
     render: &'a RenderThread,
     pace: &'a Arc<FramePace>,
-    atlases: &'a mut Atlases,
     size: (u32, u32),
     scale: f32,
 }
 
 impl Sink<'_> {
     fn packet(
-        &mut self,
+        &self,
         scene: &DrawList,
         text: &TextPass,
         damage: &Damage,
@@ -1071,8 +1268,15 @@ impl Sink<'_> {
             size: self.size,
             scale: self.scale,
         };
-        if text.version() != self.atlases.text {
-            self.atlases.text = text.version();
+        // What the renderer holds decides what a frame carries. A frame is only a proposal:
+        // one the render thread never drew acknowledges nothing, so its page stays owed and
+        // the next frame carries it. A page the renderer lacks is a glyph with no ink but
+        // its advance.
+        let (text_page, color_page) = self
+            .render
+            .held_atlases()
+            .owes(text.version(), text.color_version());
+        if text_page {
             let (width, height) = text.dimensions();
             packet.atlas = Some(AtlasUpdate {
                 version: text.version(),
@@ -1082,17 +1286,14 @@ impl Sink<'_> {
             });
         }
         // The colour page is tracked separately: a new text glyph must not re-upload it.
-        if text.color_version() != self.atlases.color {
-            self.atlases.color = text.color_version();
-            if !text.color_atlas().is_empty() {
-                let (width, height) = text.color_dimensions();
-                packet.color_atlas = Some(AtlasUpdate {
-                    version: text.color_version(),
-                    width,
-                    height,
-                    data: text.color_atlas().to_vec(),
-                });
-            }
+        if color_page {
+            let (width, height) = text.color_dimensions();
+            packet.color_atlas = Some(AtlasUpdate {
+                version: text.color_version(),
+                width,
+                height,
+                data: text.color_atlas().to_vec(),
+            });
         }
         packet
     }

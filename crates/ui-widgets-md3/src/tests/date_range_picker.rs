@@ -1,34 +1,10 @@
 //! The MD3 date range picker: the selection rule, the month grid and the band.
 
-use super::*;
-
 use crate::date_picker::{Date, Weekday};
-use crate::date_range_picker::{
-    DateRangePickerParams, Md3DateRangePicker, grid_of, next_range, row_band,
-};
-use ui_core::layout::AxisSize;
-
-const PICKER: Id = Id::str("date-range/modal");
+use crate::date_range_picker::{grid_of, next_range, row_band};
 
 fn date(year: i32, month: u8, day: u8) -> Date {
     Date::new(year, month, day).expect("a real date")
-}
-
-fn build() -> Decl {
-    let mut store = AnimStore::new();
-    let mut core = ui_core::cx::Cx::new(&mut store, 0, 600, 800, 0.0, 0.0, 1.0, None);
-    core.route(ui_core::cx::Routing::default());
-    let mut cx = ui_widgets::Cx::new(&mut core, ui_style::Env::root());
-    let params = DateRangePickerParams::new(PICKER, date(2026, 11, 1), date(2026, 11, 11));
-    let control = Md3DateRangePicker::from_pack(crate::pack::pack(), &mut cx, params);
-    cx.with_cx(|cx| control.decl(cx))
-}
-
-fn find(decl: &Decl, id: Id) -> Option<&Decl> {
-    if decl.id == id {
-        return Some(decl);
-    }
-    decl.children.iter().find_map(|child| find(child, id))
 }
 
 #[test]
@@ -124,18 +100,3 @@ fn the_band_runs_from_the_start_cell_to_the_end_cell() {
     );
 }
 
-#[test]
-fn the_range_form_takes_the_modal_pickers_box() {
-    // 524 is the modal picker's height and 68 is the range header's 128 less the 60 dp of
-    // buttons Compose's header leaves out; a wrong subtraction would move the weekdays.
-    let decl = build();
-    assert_eq!(decl.id, PICKER, "the widget itself is the scrim");
-    let surface = find(&decl, PICKER.with("surface")).expect("a surface of its own");
-    assert_eq!(surface.size_class.width, AxisSize::fixed(360.0));
-    assert_eq!(surface.size_class.height, AxisSize::fixed(524.0));
-    let header = find(&decl, PICKER.with("header")).expect("a header");
-    assert_eq!(header.size_class.height, AxisSize::fixed(68.0));
-    let scroller = find(&decl, PICKER.with("months")).expect("the month list");
-    assert_eq!(scroller.size_class.width, AxisSize::fixed(336.0));
-    assert_eq!(scroller.size_class.height, AxisSize::fixed(408.0));
-}

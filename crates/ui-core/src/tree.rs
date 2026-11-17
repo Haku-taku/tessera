@@ -380,6 +380,9 @@ pub struct ContainerParams {
     pub modal: Option<ModalTarget>,
     /// Whether this container can be the target of a `Proximate` modal.
     pub modal_host: bool,
+    /// The title a window surface carries when this node is presented as one. The app's
+    /// text, because a window title is localized like any other label.
+    pub window_title: Option<String>,
     /// The node's own curve when the frame does not paint one: a text button is a pill for
     /// its ripple and for its clip, yet has no container at rest.
     ///
@@ -495,6 +498,7 @@ impl Default for ContainerParams {
             corners: None,
             modal: None,
             modal_host: false,
+            window_title: None,
             text_input: None,
             text_input_multiline: false,
             text_input_enter_newline: false,
@@ -1189,6 +1193,14 @@ impl Decl {
         self
     }
 
+    /// The title this node's window carries when it is presented as one.
+    pub fn window_title(mut self, title: impl Into<String>) -> Self {
+        if let Some(p) = self.data.params_mut() {
+            p.window_title = Some(title.into());
+        }
+        self
+    }
+
     /// Bind a chord on this node; the engine reports `Change::Shortcut` when it fires.
     pub fn shortcut(
         mut self,
@@ -1583,6 +1595,10 @@ pub struct Tree {
     held: Vec<NodeId>,
     /// Panels the last layout pass measured for a surface of the platform's own.
     platform_panels: Vec<crate::layout::PlatformPanel>,
+    /// Whether the window this tree is laid out for has a surface to show a panel in.
+    panel_surfaces: bool,
+    /// The output a platform panel must fit, in this tree's own coordinates.
+    output_bounds: Option<crate::geom::Rect>,
 }
 
 impl Tree {
@@ -1612,6 +1628,38 @@ impl Tree {
     /// Panels the last layout pass laid out for the platform to present.
     pub fn platform_panels(&self) -> &[crate::layout::PlatformPanel] {
         &self.platform_panels
+    }
+
+    /// Whether the window has a surface a panel of its own may be shown in.
+    ///
+    /// False until a host says otherwise, so a loop with no host paints its panels in the
+    /// window: the declaration is a request, and a request nobody can answer must not leave
+    /// the panel unpainted.
+    pub(crate) fn panel_surfaces(&self) -> bool {
+        self.panel_surfaces
+    }
+
+    /// Say whether the window this tree is laid out for presents panels.
+    pub fn set_panel_surfaces(&mut self, presents: bool) {
+        self.panel_surfaces = presents;
+    }
+
+    /// The output a platform panel must stay inside, in this tree's coordinates.
+    ///
+    /// A surface presents a panel where the tree placed it, so the tree is the one that
+    /// constrains the panel: a surface moved after layout would map the input its grab
+    /// routes back into the tree to the wrong places.
+    pub fn output_bounds(&self) -> Option<crate::geom::Rect> {
+        self.output_bounds
+    }
+
+    /// Name the output the platform panels are placed against; `None` leaves them at their
+    /// preferred spot. A change is a layout change, so the next pass re-places them.
+    pub fn set_output_bounds(&mut self, bounds: Option<crate::geom::Rect>) {
+        if self.output_bounds != bounds {
+            self.output_bounds = bounds;
+            self.layout_dirty = true;
+        }
     }
 
     /// The layout pass is about to record this frame's platform panels.

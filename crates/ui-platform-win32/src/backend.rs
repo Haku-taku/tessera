@@ -9,14 +9,22 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use ui_platform::clipboard::ClipboardCopy;
-use ui_platform::host::{Backend, PresentationOptions, SurfaceHandle};
+use ui_platform::file_icons::FileIconProvider;
+use ui_platform::file_operation::FileOperator;
+use ui_platform::host::{Backend, PointerTiming, PresentationOptions, SurfaceHandle};
 use ui_platform::hotkeys::GlobalHotkeys;
 use ui_platform::ipc::Channel;
 use ui_platform::jobs::Waker;
+use ui_platform::listing::DirectoryLister;
 use ui_platform::output::OutputInfo;
+use ui_platform::places::{Device, Place};
+use ui_platform::search::DirectorySearcher;
 use ui_platform::session::SessionOptions;
+use ui_platform::thumbnails::Thumbnailer;
 use ui_platform::transfer::SelectionReader;
 use ui_platform::tray::{Icon, TrayEvent, TrayHandle, TrayId};
+use ui_platform::volumes::VolumeMounter;
+use ui_platform::watch::DirectoryWatcher;
 use ui_platform::window::SurfaceSpec;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -51,6 +59,8 @@ pub struct Win32Backend {
     /// a retired surface takes its entry with it; the wait prunes what is left. Shared with
     /// the presenters, because a panel opened later has a frame event of its own.
     paces: Rc<RefCell<Vec<Weak<FramePace>>>>,
+    /// The window a shell context menu belongs to: the one opened last, dialogs included.
+    menu_owner: crate::context_menu::MenuOwner,
 }
 
 /// The loop's wake channel from the other side: an event any worker can set.
@@ -87,6 +97,7 @@ impl Win32Backend {
             tray_events: Rc::new(RefCell::new(Vec::new())),
             reader: ClipboardReader::default(),
             paces: Rc::new(RefCell::new(Vec::new())),
+            menu_owner: crate::context_menu::empty_owner(),
         }
     }
 }
@@ -110,6 +121,7 @@ impl Backend for Win32Backend {
                 cpu_presenter: false,
             },
             Rc::clone(&self.paces),
+            Arc::clone(&self.menu_owner),
         )?;
         // The host's one sleep must end when this surface's render thread finishes a frame;
         // the presenter keeps the pace alive, so the entry needs no removal on retirement.
@@ -117,6 +129,10 @@ impl Backend for Win32Backend {
             .borrow_mut()
             .push(Arc::downgrade(&presenter.frame_pace()));
         Ok(Box::new(presenter))
+    }
+
+    fn pointer_timing(&self) -> PointerTiming {
+        crate::input::pointer_timing()
     }
 
     fn set_clipboard_copy(&mut self, copy: ClipboardCopy) -> bool {
@@ -178,6 +194,55 @@ impl Backend for Win32Backend {
         std::mem::take(&mut *self.tray_events.borrow_mut())
     }
 
+    /// The shell's image factory, which runs on the service's worker: a handler it loads is
+    /// an in-process extension and needs the apartment the worker opens for it.
+    fn thumbnails(&mut self) -> Option<Box<dyn Thumbnailer>> {
+        Some(Box::new(crate::shell::ShellThumbnailer))
+    }
+
+    /// The system image list, asked by extension: a type icon never reads the file.
+    fn file_icons(&mut self) -> Option<Box<dyn FileIconProvider>> {
+        Some(Box::new(crate::shell::ShellFileIcons))
+    }
+
+    /// The filesystem is the process's own, and Windows adds an attribute to the dotfile
+    /// rule; the portable reader is given that rule.
+    fn file_listing(&mut self) -> Option<Box<dyn DirectoryLister>> {
+        Some(Box::new(crate::shell::lister()))
+    }
+
+    fn file_operator(&mut self) -> Option<Box<dyn FileOperator>> {
+        Some(Box::new(crate::file_operation::WindowsOperator))
+    }
+
+    /// The classic shell menu the desktop builds from `IContextMenu`.
+    fn shell_menu(&mut self) -> Option<Arc<dyn ui_platform::shell_menu::ShellMenuHost>> {
+        Some(Arc::new(crate::context_menu::Win32ShellMenu::following(
+            Arc::clone(&self.menu_owner),
+        )))
+    }
+
+    /// The same walk with the same hidden rule, one directory at a time.
+    fn file_search(&mut self) -> Option<Box<dyn DirectorySearcher>> {
+        Some(Box::new(crate::shell::searcher()))
+    }
+
+    fn file_watch(&mut self) -> Option<Box<dyn DirectoryWatcher>> {
+        Some(Box::new(crate::watch::Win32Watcher))
+    }
+
+    fn volume_mounter(&mut self) -> Option<Box<dyn VolumeMounter>> {
+        Some(Box::new(crate::volumes::Win32Volumes))
+    }
+
+    fn places(&mut self) -> Vec<Place> {
+        crate::shell::places()
+    }
+
+    fn devices(&mut self) -> Vec<Device> {
+        crate::shell::devices()
+    }
+
     fn wait(&mut self, timeout: Option<Duration>) -> Result<(), String> {
         // The queue's own messages, the worker's wake event and every surface's frame
         // event end the sleep. A frame event is what makes a surface drawable again:
@@ -199,7 +264,12 @@ impl Backend for Win32Backend {
         // SAFETY: every handle is live for the duration of the wait: the wake event is
         // owned here, and a pace's event belongs to its session, which the host keeps alive.
         let _ = unsafe {
-            MsgWaitForMultipleObjectsEx(Some(handles.as_slice()), millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+            MsgWaitForMultipleObjectsEx(
+                Some(handles.as_slice()),
+                millis,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            )
         };
         // The wait consumed the auto-reset object it returned on; any other surface whose
         // render thread finished at the same moment is drained here. A timeout opens
@@ -331,4 +401,3 @@ fn display_mode(info: &MONITORINFOEXW) -> (u32, bool) {
     let rotated = matches!(orientation, DMDO_90 | DMDO_180 | DMDO_270);
     (refresh, rotated)
 }
-

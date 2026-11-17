@@ -1,0 +1,25 @@
+[package]
+name = "ui-picker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/picker.rs"
+
+[dependencies]
+ui-core = { path = "../ui-core" }
+ui-design = { path = "../ui-design" }
+ui-i18n = { path = "../ui-i18n" }
+ui-platform = { path = "../ui-platform" }
+ui-style = { path = "../ui-style" }
+ui-widgets = { path = "../ui-widgets" }
+
+[dev-dependencies]
+# The demo opens a real window; which backend that is depends on the target, and the choice
+# lives in `ui-host`. The file-type icons are the picker's whole point, so the feature is on.
+log = "0.4"
+ui-host = { path = "../ui-host", features = ["file-icons"] }
+ui-widgets-fluent = { path = "../ui-widgets-fluent" }
+ui-widgets-glass = { path = "../ui-widgets-glass" }
+ui-widgets-md3 = { path = "../ui-widgets-md3" }

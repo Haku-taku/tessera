@@ -11,6 +11,9 @@ pub struct WidgetState {
     /// A press and its release landed on this node with the pointer staying within
     /// `DRAG_THRESHOLD`; anything further is a drag, not a click.
     pub clicked: bool,
+    /// How many presses of one button the click on this node was part of: 1 is a single
+    /// click, 2 a double. Zero when this frame's click did not reach the node.
+    pub clicks: u32,
     /// A drag ended on this node within the last frame.
     pub dropped: bool,
     /// The node this drag was released onto, when that node accepts drops.
@@ -60,6 +63,7 @@ impl WidgetState {
             hovered: core.hovered_within(id) || core.hovered() == Some(id),
             pressed: core.pressed_within(id) || core.pressed() == Some(id),
             clicked: core.clicked_within(id),
+            clicks: core.clicks_within(id),
             dropped: core.dropped_within(id),
             drop_target: core.drop_target(),
             drag_over: core.drag_over_within(id),

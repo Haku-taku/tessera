@@ -36,15 +36,16 @@ pub enum Change {
     /// the press, `false` on the release, wherever the pointer is by then.
     ///
     /// No point travels with it: a control that needs one reads the pointer, which the
-    /// press already moved.
-    Secondary { down: bool },
+    /// press already moved. `clicks` is the burst length the press belonged to, so a
+    /// right-button double-click reads as 2 instead of two unrelated presses.
+    Secondary { down: bool, clicks: u32 },
 
     /// The middle button on a node that declared [`crate::Sense::MIDDLE`]: `true` on the
     /// press, `false` on the release, wherever the pointer is by then.
     ///
     /// Same contract as [`Secondary`](Self::Secondary): the press already moved the
     /// pointer, so a control that needs a point reads it rather than receiving one.
-    Middle { down: bool },
+    Middle { down: bool, clicks: u32 },
 
     /// A drag gesture began on the control, with no value yet.
     ///
@@ -59,9 +60,14 @@ pub enum Change {
     /// A drag ended on `target`, the node under the pointer that accepts drops.
     ///
     /// Reported to the node the drag started on, never to the target: the target hears
-    /// [`DroppedOn`](Self::DroppedOn) with the payload. `None` means the drag ended over
-    /// nothing that takes it, or over another application.
-    Dropped(Option<Id>),
+    /// [`DroppedOn`](Self::DroppedOn) with the payload. `target` is `None` when the drag
+    /// ended over nothing that takes it, or over another application; `outcome` then still
+    /// says how the other application took it, which a source that must finish a Wayland
+    /// move needs. Both are `None` for a gesture released over nothing at all.
+    Dropped {
+        target: Option<Id>,
+        outcome: Option<crate::dnd::DropOutcome>,
+    },
 
     /// A drag is over this node and it accepts what the drag offers.
     ///
@@ -79,8 +85,9 @@ pub enum Change {
     /// A drag was released on this node and it takes what the drag carries.
     ///
     /// The payload is the drag's own bytes, decoded by the platform for a drag from another
-    /// application and handed straight over for one inside this app.
-    DroppedOn(crate::dnd::DragData),
+    /// application and handed straight over for one inside this app. The report also says
+    /// where and how the release landed, so a right drag can ask instead of acting.
+    DroppedOn(crate::dnd::DropReport),
 
     /// The interaction that would have reported a change was abandoned.
     Cancelled,
@@ -98,6 +105,26 @@ pub enum Change {
 
     /// A row of this node's context menu was chosen, named by the row's stable id.
     MenuItem(Id),
+
+    /// The menu this node opened closed without a pick.
+    ///
+    /// A pick reports only [`MenuItem`](Self::MenuItem). An app that opened a menu from
+    /// state it built for the occasion needs this to drop that state when the user backs
+    /// out with Escape or a press elsewhere.
+    MenuClosed,
+
+    /// A secondary press landed on this node, which declared no menu of its own.
+    ///
+    /// The point is where the press landed, so the app can open its own rows there with
+    /// [`crate::cx::Cx::open_menu`]. The node is the natural owner of that menu and hears
+    /// the pick and the dismissal.
+    MenuRequested(crate::geom::Point),
+
+    /// Clipboard content was pasted and no text editor consumed it.
+    ///
+    /// The payload is handed over whole, so an app without a caret can take a file list
+    /// (or any other MIME type) the same way a drag target takes one.
+    Paste(crate::clipboard::ClipboardContent),
 
     /// A control asked the keyboard focus to move to `target`.
     ///

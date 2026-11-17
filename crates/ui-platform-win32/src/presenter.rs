@@ -10,7 +10,7 @@ use ui_gpu_d3d11::D3d11Device;
 use ui_gpu_scene::{AtlasUpload, CanvasUpload, Device, GpuRenderer, RenderTarget, TargetId};
 use ui_platform::present::{CanvasFrame, PresentStats, SceneTarget};
 use ui_platform::text_pass::TextPass;
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
@@ -30,6 +30,7 @@ use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow}
 use windows::core::Interface as _;
 
 use crate::outputs::HdrOutput;
+use crate::render::HeldAtlases;
 use crate::window::Win32Window;
 use crate::WindowError;
 
@@ -69,10 +70,22 @@ pub struct Win32Presenter {
     capture: bool,
     /// The last captured frame, top-down RGBA8.
     captured: Option<Vec<u8>>,
-    atlas_version: u64,
-    color_atlas_version: u64,
+    /// The version of each atlas page this renderer holds; `None` until one lands.
+    atlas_version: Option<u64>,
+    color_atlas_version: Option<u64>,
     /// Frames presented since the loop last read the count.
     presented: u32,
+}
+
+impl Drop for Win32Presenter {
+    fn drop(&mut self) {
+        // DXGI hands this handle to whoever asks; the chain keeps the object it waits on, so
+        // an unclosed handle is a surface's worth of leak with nothing else holding it.
+        if let Some(handle) = self.latency.take() {
+            // SAFETY: the handle is this presenter's own, and nothing waits on it any more.
+            let _ = unsafe { CloseHandle(handle) };
+        }
+    }
 }
 
 impl Win32Presenter {
@@ -145,8 +158,8 @@ impl Win32Presenter {
             size,
             capture: false,
             captured: None,
-            atlas_version: u64::MAX,
-            color_atlas_version: 0,
+            atlas_version: None,
+            color_atlas_version: None,
             presented: 0,
         };
         this.allocate_targets()?;
@@ -278,8 +291,7 @@ impl Win32Presenter {
 
     /// Upload the glyph atlases if the text pass changed them.
     fn sync_atlas(&mut self, pass: &TextPass) -> Result<(), WindowError> {
-        if pass.version() != self.atlas_version {
-            self.atlas_version = pass.version();
+        if Some(pass.version()) != self.atlas_version {
             let (width, height) = pass.dimensions();
             self.renderer
                 .set_atlas(
@@ -291,10 +303,11 @@ impl Win32Presenter {
                     },
                 )
                 .map_err(|error| WindowError::Gpu(format!("atlas upload: {error}")))?;
+            // Only an upload that landed is a page this renderer holds.
+            self.atlas_version = Some(pass.version());
         }
         // The colour page is tracked separately: a new text glyph must not re-upload it.
-        if pass.color_version() != self.color_atlas_version {
-            self.color_atlas_version = pass.color_version();
+        if Some(pass.color_version()) != self.color_atlas_version {
             if !pass.color_atlas().is_empty() {
                 let (width, height) = pass.color_dimensions();
                 self.renderer
@@ -310,6 +323,7 @@ impl Win32Presenter {
                         WindowError::Gpu(format!("colour atlas upload: {error}"))
                     })?;
             }
+            self.color_atlas_version = Some(pass.color_version());
         }
         Ok(())
     }
@@ -348,8 +362,8 @@ pub(crate) struct AtlasUpdate {
 impl Win32Presenter {
     /// Render and present a frame whose atlases are already on the loop's side.
     ///
-    /// `atlas` and `color_atlas` are present only when the loop found newer data than the
-    /// renderer holds; a rebuilt device asks for both again through the session.
+    /// `atlas` and `color_atlas` are present only when the loop found the renderer holds
+    /// another version; a rebuilt device holds none, so it is owed both again.
     pub(crate) fn present_uploads(
         &mut self,
         scene: &DrawList,
@@ -360,7 +374,6 @@ impl Win32Presenter {
         interval: u32,
     ) -> Result<PresentStats, String> {
         if let Some(atlas) = atlas {
-            self.atlas_version = atlas.version;
             self.renderer
                 .set_atlas(
                     &mut self.device,
@@ -371,19 +384,25 @@ impl Win32Presenter {
                     },
                 )
                 .map_err(|error| format!("atlas upload: {error}"))?;
+            // Only an upload that landed is a page this renderer holds.
+            self.atlas_version = Some(atlas.version);
         }
         if let Some(atlas) = color_atlas {
-            self.color_atlas_version = atlas.version;
-            self.renderer
-                .set_color_atlas(
-                    &mut self.device,
-                    AtlasUpload {
-                        width: atlas.width,
-                        height: atlas.height,
-                        data: atlas.data,
-                    },
-                )
-                .map_err(|error| format!("colour atlas upload: {error}"))?;
+            // An empty page is nothing to upload: the update acknowledges a version, so the
+            // loop stops offering it every frame.
+            if !atlas.data.is_empty() {
+                self.renderer
+                    .set_color_atlas(
+                        &mut self.device,
+                        AtlasUpload {
+                            width: atlas.width,
+                            height: atlas.height,
+                            data: atlas.data,
+                        },
+                    )
+                    .map_err(|error| format!("colour atlas upload: {error}"))?;
+            }
+            self.color_atlas_version = Some(atlas.version);
         }
         let uploads: Vec<CanvasUpload<'_>> = canvases
             .iter()
@@ -433,6 +452,14 @@ impl Win32Presenter {
             draw_calls: stats.draw_calls,
             band: stats.band,
         })
+    }
+
+    /// The pages this renderer holds, for the loop to compare the text pass against.
+    pub(crate) fn held_atlases(&self) -> HeldAtlases {
+        HeldAtlases {
+            text: self.atlas_version,
+            color: self.color_atlas_version,
+        }
     }
 }
 

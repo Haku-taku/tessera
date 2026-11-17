@@ -95,6 +95,40 @@ pub struct InputEdit {
     pub detached: bool,
 }
 
+/// A menu an app asked the engine to show for `owner`, drained after the view returns.
+///
+/// The engine owns the placement and the report; the app owns the rows and the state they
+/// were built from, which is why a dismissal comes back as `Change::MenuClosed`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuRequest {
+    pub owner: Id,
+    pub at: crate::geom::Point,
+    pub items: Vec<crate::menu::MenuItem>,
+}
+
+/// New rows for a menu that is already open, e.g. after an asynchronous read answered.
+///
+/// The engine keeps the level in place — its position, hover and entrance — and only swaps
+/// the rows, so rows that arrive late join the menu the user is looking at.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuUpdate {
+    pub owner: Id,
+    pub items: Vec<crate::menu::MenuItem>,
+}
+
+/// A request to show the platform's own menu for a file selection, drained after the view.
+///
+/// The platform's popup runs a message loop of its own that does not return until the user
+/// dismisses it, so it must not run inside a build: the frame would stay unpainted and the
+/// engine's own menus and panels would outlive the selection that asked for it. The host
+/// runs the request after the frame presents, from its own turn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShellMenuRequest {
+    pub paths: Vec<std::path::PathBuf>,
+    /// The point in the surface whose menu asked for it, in that surface's own units.
+    pub at: Point,
+}
+
 /// Engine facts for one build, plus the only writable door it offers.
 /// Everything the engine routes this frame, as named fields: positional arguments this
 /// numerous invite silent swaps, and every new fact would break every call site.
@@ -104,6 +138,8 @@ pub struct Routing {
     pub pressed: Option<Id>,
     /// The clicked node and its ancestors, root first; empty when nothing was clicked.
     pub clicked_path: Vec<Id>,
+    /// How many presses the click was part of: one for a single click, two for a double.
+    pub clicks: u32,
     /// The keyboard-activated node and its ancestors, root first; empty when nothing fired.
     pub activated_path: Vec<Id>,
     /// The node a drag was released on, and its ancestors, root first.
@@ -168,6 +204,8 @@ pub struct Cx<'a> {
     modifiers: crate::event::Modifiers,
     /// The clicked node's ancestor chain, root first; empty when nothing was clicked.
     clicked_path: Vec<Id>,
+    /// The burst length of this frame's click: one for a single, two for a double.
+    clicks: u32,
     /// The keyboard-activated node's ancestor chain, root first.
     activated_path: Vec<Id>,
     /// The drag-release chain, root first.
@@ -182,6 +220,13 @@ pub struct Cx<'a> {
     drag_types: Option<Rc<Vec<String>>>,
     /// Every node folded as inert this frame; normally empty.
     disabled: Vec<Id>,
+    /// Inertness declared by the containers a build is currently inside.
+    ///
+    /// The committed `disabled` set describes last frame's tree, so a control that a build
+    /// just re-enabled would still read itself as inert. A container folds its own
+    /// declaration into this scope while building its children, which lets a control's
+    /// look follow this frame's tree without waiting for the commit.
+    inherited_disabled: bool,
     hovered: Option<Id>,
     pressed: Option<Id>,
     focused: Option<Id>,
@@ -207,6 +252,14 @@ pub struct Cx<'a> {
     edit_req: Rc<RefCell<Vec<InputEdit>>>,
     /// Focus the build asked for, applied once the declaration names the node.
     focus_req: Rc<RefCell<Vec<Id>>>,
+    /// Menus the build asked the engine to show, applied after this declaration is laid out.
+    menu_req: Rc<RefCell<Vec<MenuRequest>>>,
+    /// Rows that answered late for the open menu, swapped in without reopening it.
+    menu_update_req: Rc<RefCell<Option<MenuUpdate>>>,
+    /// The platform's own menu for a file selection, which only the host can run.
+    shell_menu_req: Rc<RefCell<Option<ShellMenuRequest>>>,
+    /// Whether the build asked the clipboard for a paste; the answer arrives as an event.
+    paste_req: Rc<Cell<bool>>,
     /// Payloads the build asked to put on the clipboard; the engine hands them to the
     /// platform.
     copy_req: Rc<RefCell<Vec<crate::clipboard::ClipboardContent>>>,
@@ -282,6 +335,7 @@ impl<'a> Cx<'a> {
             hovered: None,
             pressed: None,
             clicked_path: Vec::new(),
+            clicks: 0,
             activated_path: Vec::new(),
             dropped_path: Vec::new(),
             drop_target: None,
@@ -304,6 +358,10 @@ impl<'a> Cx<'a> {
             bring_req: Rc::new(RefCell::new(Vec::new())),
             edit_req: Rc::new(RefCell::new(Vec::new())),
             focus_req: Rc::new(RefCell::new(Vec::new())),
+            menu_req: Rc::new(RefCell::new(Vec::new())),
+            menu_update_req: Rc::new(RefCell::new(None)),
+            shell_menu_req: Rc::new(RefCell::new(None)),
+            paste_req: Rc::new(Cell::new(false)),
             copy_req: Rc::new(RefCell::new(Vec::new())),
             close_req: Rc::new(Cell::new(false)),
             nudge_req: Rc::new(RefCell::new(Vec::new())),
@@ -317,6 +375,7 @@ impl<'a> Cx<'a> {
             press_origin: None,
             local: None,
             disabled: Vec::new(),
+            inherited_disabled: false,
             anim,
             rec: Rc::new(RefCell::new(Recorder::default())),
             cache: None,
@@ -640,6 +699,9 @@ impl<'a> Cx<'a> {
             Dep::HoveredWithin(id, v) => self.hovered_path.contains(id) == *v,
             Dep::PressedWithin(id, v) => self.pressed_path.contains(id) == *v,
             Dep::ClickedWithin(id, v) => self.clicked_path.contains(id) == *v,
+            Dep::ClicksWithin(id, v) => {
+                self.clicked_path.contains(id) && self.clicks == *v
+            }
             Dep::ActivatedWithin(id, v) => self.activated_path.contains(id) == *v,
             Dep::DroppedWithin(id, v) => self.dropped_path.contains(id) == *v,
             Dep::DragOverWithin(id, v) => self.drag_path.contains(id) == *v,
@@ -677,6 +739,7 @@ impl<'a> Cx<'a> {
         self.hovered = r.hovered;
         self.pressed = r.pressed;
         self.clicked_path = r.clicked_path;
+        self.clicks = r.clicks;
         self.activated_path = r.activated_path;
         self.dropped_path = r.dropped_path;
         self.drop_target = r.drop_target;
@@ -792,11 +855,55 @@ impl<'a> Cx<'a> {
         v
     }
 
+    /// How many presses of one button the click on this node was part of.
+    ///
+    /// One is a single click, two a double, and a third press in the same burst reads three.
+    /// Zero when the frame's click did not reach this node.
+    pub fn clicks_within(&self, id: Id) -> u32 {
+        let v = if self.clicked_path.contains(&id) {
+            self.clicks
+        } else {
+            0
+        };
+        self.record(Dep::ClicksWithin(id, v));
+        v
+    }
+
     /// Whether this node is inert; a disabled ancestor makes every descendant inert.
+    ///
+    /// The answer describes the committed tree, so it lags the declaration a build is
+    /// producing. For a look that must follow this frame's declaration, see
+    /// [`Cx::inherited_disabled`] and record the final flag with [`Cx::note_disabled`].
     pub fn is_disabled(&self, id: Id) -> bool {
         let v = self.disabled.contains(&id);
         self.record(Dep::Disabled(id, v));
         v
+    }
+
+    /// Record the inertness a build folded for `id`, for the declaration cache.
+    ///
+    /// A builder knows its own declaration before the tree is committed; recording that
+    /// value instead of last frame's keeps a cached subtree from outliving the flag it was
+    /// built with.
+    pub fn note_disabled(&self, id: Id, disabled: bool) {
+        self.record(Dep::Disabled(id, disabled));
+    }
+
+    /// Whether the containers this build is inside declared themselves inert.
+    pub fn inherited_disabled(&self) -> bool {
+        self.inherited_disabled
+    }
+
+    /// Build `f` with `disabled` folded into the inertness its children inherit.
+    ///
+    /// A container calls this around its children so a look resolved during the build sees
+    /// the ancestor's declaration now, rather than the inertness the last commit recorded.
+    pub fn with_disabled_scope<R>(&mut self, disabled: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = self.inherited_disabled;
+        self.inherited_disabled = outer || disabled;
+        let value = f(self);
+        self.inherited_disabled = outer;
+        value
     }
 
     /// The pointer in the pressed node's own space.
@@ -902,8 +1009,26 @@ impl<'a> Cx<'a> {
 
     /// The scroll geometry of the `SCROLL_OWNED` container `id`, both axes. `None` when
     /// `id` is not such a container this frame.
+    ///
+    /// The offset is the one this frame will paint at: an offset the build already asked
+    /// for with [`set_scroll`](Self::set_scroll) is folded in, so a list that computes
+    /// which rows to declare after asking the scroller to move declares the rows the
+    /// frame actually shows. Reading last frame's offset there would leave the list
+    /// windowed where it used to stand until an unrelated frame arrived to rebuild it.
     pub fn scroll_of(&self, id: Id) -> Option<ScrollGeom> {
-        let got = self.scrolls.iter().find(|g| g.id == id).copied();
+        let mut got = self.scrolls.iter().find(|g| g.id == id).copied();
+        if let Some(geom) = got.as_mut() {
+            // Only a jump: an animated scroll still paints this frame where it started.
+            for request in self
+                .scroll_req
+                .borrow()
+                .iter()
+                .filter(|request| request.id == id && !request.animate)
+            {
+                geom.offset_x = request.x;
+                geom.offset_y = request.y;
+            }
+        }
         self.record(Dep::Scroll {
             id,
             extent_w: got.map(|g| g.extent_w).unwrap_or(0.0),
@@ -919,6 +1044,10 @@ impl<'a> Cx<'a> {
 
     /// Ask an engine-owned scroller to hold this offset. The engine merges the request
     /// after the view returns; a wheel it handled itself still wins over a stale request.
+    ///
+    /// The rest of this build reads the requested offset from
+    /// [`scroll_of`](Self::scroll_of), so anything the app windows from the scroller after
+    /// this call lines up with where the frame paints.
     pub fn set_scroll(&self, id: Id, x: f32, y: f32) {
         self.scroll_req.borrow_mut().push(ScrollRequest {
             id,
@@ -1033,6 +1162,64 @@ impl<'a> Cx<'a> {
         std::mem::take(&mut self.focus_req.borrow_mut())
     }
 
+    /// Ask the engine to show `items` at `at` on `owner`'s behalf.
+    ///
+    /// The request is drained after this build, once the declaration is laid out; a pick
+    /// then arrives as `Change::MenuItem` on `owner`. A later request in the same build
+    /// replaces an earlier one, so a frame shows at most one menu.
+    pub fn open_menu(&self, owner: Id, at: crate::geom::Point, items: Vec<crate::menu::MenuItem>) {
+        self.menu_req.borrow_mut().push(MenuRequest {
+            owner,
+            at,
+            items,
+        });
+    }
+
+    /// Take the menus the build asked for; the engine calls this once the view returns.
+    pub fn take_menu_requests(&self) -> Vec<MenuRequest> {
+        std::mem::take(&mut self.menu_req.borrow_mut())
+    }
+
+    /// Replace the open menu's rows when it still belongs to `owner`.
+    ///
+    /// The request is drained with `take_menu_requests`, so a build can open a menu and
+    /// then correct it; a menu the owner no longer holds is left alone.
+    pub fn update_menu(&self, owner: Id, items: Vec<crate::menu::MenuItem>) {
+        *self.menu_update_req.borrow_mut() = Some(MenuUpdate { owner, items });
+    }
+
+    /// Take the row replacement the build asked for; the engine calls this after the view.
+    pub fn take_menu_update(&self) -> Option<MenuUpdate> {
+        self.menu_update_req.borrow_mut().take()
+    }
+
+    /// Ask the host to show the platform's own menu for `paths` at `at`.
+    ///
+    /// The request is drained after the view and run by the host once the frame has
+    /// presented; a later request in the same build replaces an earlier one, because the
+    /// platform's popup owns the user's next click.
+    pub fn request_shell_menu(&self, paths: Vec<std::path::PathBuf>, at: Point) {
+        *self.shell_menu_req.borrow_mut() = Some(ShellMenuRequest { paths, at });
+    }
+
+    /// Take the platform menu the build asked for; the engine calls this after the view.
+    pub fn take_shell_menu_request(&self) -> Option<ShellMenuRequest> {
+        self.shell_menu_req.borrow_mut().take()
+    }
+
+    /// Ask for the clipboard's content, for an app whose target has no caret.
+    ///
+    /// The answer arrives as `Event::Paste`; the engine routes it to the focused node, or
+    /// the root when nothing is focused, as `Change::Paste` when no editor takes it.
+    pub fn request_paste(&self) {
+        self.paste_req.set(true);
+    }
+
+    /// Take whether the build asked for a paste; the engine calls this once the view returns.
+    pub fn take_paste_request(&self) -> bool {
+        self.paste_req.replace(false)
+    }
+
     /// Put `text` on the clipboard, as a copy button in a control does.
     ///
     /// A request, not a write: the platform owns the clipboard, and the engine drains this
@@ -1056,6 +1243,19 @@ impl<'a> Cx<'a> {
             });
     }
 
+    /// Put a path list on the clipboard, copied or cut.
+    ///
+    /// The backend writes the platform's own file-list form (`CF_HDROP` on Windows,
+    /// `text/uri-list` on Wayland) and the cut marker, when it has one.
+    pub fn copy_files(&self, paths: &[std::path::PathBuf], effect: crate::dnd::DropEffect) {
+        self.copy_req
+            .borrow_mut()
+            .push(crate::clipboard::ClipboardContent::Files {
+                paths: paths.to_vec(),
+                effect,
+            });
+    }
+
     /// Take the copies the build asked for; the engine calls this once the view returns.
     pub fn take_copies(&self) -> Vec<crate::clipboard::ClipboardContent> {
         std::mem::take(&mut self.copy_req.borrow_mut())
@@ -1064,7 +1264,9 @@ impl<'a> Cx<'a> {
     /// Hand the engine a picture this build produced, under its stable texture id.
     ///
     /// A request, not a registration: the engine owns the texture table and drains this
-    /// after the view returns, so the frame that produced the pixels paints them.
+    /// after the view returns, so the frame that produced the pixels paints them. The picture
+    /// is dropped once that frame is painted; one that must outlive it is registered on the
+    /// loop instead.
     pub fn register_image(&self, entry: crate::draw::ImageEntry) {
         self.image_req.borrow_mut().push(entry);
     }
@@ -1226,6 +1428,7 @@ impl<'a> Cx<'a> {
             hovered: self.hovered,
             pressed: self.pressed,
             clicked_path: self.clicked_path.clone(),
+            clicks: self.clicks,
             activated_path: self.activated_path.clone(),
             dropped_path: self.dropped_path.clone(),
             drop_target: self.drop_target,
@@ -1248,6 +1451,10 @@ impl<'a> Cx<'a> {
             bring_req: Rc::clone(&self.bring_req),
             edit_req: Rc::clone(&self.edit_req),
             focus_req: Rc::clone(&self.focus_req),
+            menu_req: Rc::clone(&self.menu_req),
+            menu_update_req: Rc::clone(&self.menu_update_req),
+            shell_menu_req: Rc::clone(&self.shell_menu_req),
+            paste_req: Rc::clone(&self.paste_req),
             copy_req: Rc::clone(&self.copy_req),
             close_req: Rc::clone(&self.close_req),
             nudge_req: Rc::clone(&self.nudge_req),
@@ -1256,6 +1463,7 @@ impl<'a> Cx<'a> {
             hovered_path: self.hovered_path.clone(),
             pressed_path: self.pressed_path.clone(),
             disabled: self.disabled.clone(),
+            inherited_disabled: self.inherited_disabled,
             drag_owner: self.drag_owner,
             drag_started: self.drag_started,
             drag_step: self.drag_step,

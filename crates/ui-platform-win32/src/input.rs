@@ -5,8 +5,8 @@
 
 use ui_core::{Key, Modifiers};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, MAPVK_VK_TO_CHAR, MapVirtualKeyW, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
-    VK_END, VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT,
+    GetKeyState, MAPVK_VK_TO_CHAR, MapVirtualKeyW, VK_APPS, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
+    VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT,
     VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_TAB, VK_UP,
 };
 
@@ -57,8 +57,12 @@ pub(crate) fn named(vk: u16) -> Option<Key> {
     Some(key)
 }
 
+/// Whether this press is the context-menu key: VK_APPS, or Shift+F10 for keyboards without it.
+pub(crate) fn menu(vk: u16, shift: bool) -> bool {
+    vk == VK_APPS.0 || (vk == VK_F10.0 && shift)
+}
+
 /// The character a command chord names: Ctrl+A arrives as `Char('a')`, never as text.
-///
 /// `MapVirtualKeyW` reports the character on the key's unshifted face, which is what a
 /// chord is stored as.
 pub(crate) fn command_char(vk: u16) -> Option<char> {
@@ -68,4 +72,20 @@ pub(crate) fn command_char(vk: u16) -> Option<char> {
         return None;
     }
     char::from_u32(value & 0xFFFF).map(|character| character.to_ascii_lowercase())
+}
+
+/// The desktop's multi-click rule, as the control panel states it.
+pub(crate) fn pointer_timing() -> ui_platform::host::PointerTiming {
+    use std::time::Duration;
+    use windows::Win32::UI::HiDpi::GetDpiForSystem;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXDOUBLECLK};
+    // The rectangle is a physical metric, while the engine's pointer positions are logical
+    // points: the system DPI is what turns one into the other.
+    let dpi = unsafe { GetDpiForSystem() }.max(96) as f32;
+    let slop = unsafe { GetSystemMetrics(SM_CXDOUBLECLK) }.max(1) as f32 * 96.0 / dpi;
+    ui_platform::host::PointerTiming {
+        multi_click: Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() })),
+        multi_click_slop: slop,
+    }
 }

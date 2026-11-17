@@ -16,6 +16,7 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::client::wp_linux_drm_syncobj_m
 use wayland_protocols::wp::pointer_warp::v1::client::wp_pointer_warp_v1::WpPointerWarpV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
+use wayland_protocols::xdg::dialog::v1::client::xdg_wm_dialog_v1::XdgWmDialogV1;
 use wayland_protocols::xdg::shell::client::xdg_wm_base;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1;
 
@@ -29,6 +30,8 @@ pub struct Capabilities {
     pub wm_base: Option<xdg_wm_base::XdgWmBase>,
     /// Optional: overlay surfaces placed by the compositor (wlroots protocol).
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    /// Optional: the window manager half; a dialog without it is a transient child only.
+    pub dialog: Option<XdgWmDialogV1>,
     pub seat: Option<wl_seat::WlSeat>,
     /// Optional: seat clipboard and drag-and-drop; absent means neither exists.
     pub data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
@@ -85,6 +88,8 @@ pub(crate) fn bind(
 
     // Optional: the window degrades instead of failing.
     let wm_base: Option<xdg_wm_base::XdgWmBase> = globals.bind(qh, 1..=3, ()).ok();
+    // Optional: without it a dialog is still transient, but its modality is only the host's.
+    let dialog: Option<XdgWmDialogV1> = globals.bind(qh, 1..=1, ()).ok();
     let layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1> =
         globals.bind(qh, 1..=4, ()).ok();
     let seat: Option<wl_seat::WlSeat> = globals.bind(qh, 1..=9, ()).ok();
@@ -108,6 +113,7 @@ pub(crate) fn bind(
         compositor,
         shm,
         wm_base,
+        dialog,
         layer_shell,
         seat,
         data_device_manager,

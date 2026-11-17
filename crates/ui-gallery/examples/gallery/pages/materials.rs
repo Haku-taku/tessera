@@ -196,6 +196,8 @@ impl MaterialState {
                         Param::Luminosity.real(self.get(k, Param::Luminosity)),
                     ),
                     noise: Param::Noise.real(self.get(k, Param::Noise)),
+                    // The demo never becomes a panel, so it has no stand-in to name.
+                    fallback: Color::TRANSPARENT,
                 }),
                 sigma,
                 Color::TRANSPARENT,

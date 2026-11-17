@@ -16,6 +16,12 @@ use ui_platform::host::{
 };
 use ui_platform::hotkeys::{GlobalHotkeyError, GlobalHotkeys};
 use ui_platform::ipc::{Channel, Reply};
+use ui_platform::thumbnails::{
+    ThumbnailPicture, ThumbnailRequest, ThumbnailState, Thumbnailer, Thumbnails,
+};
+use ui_platform::{
+    FileIcon, FileIconProvider, FileIconRequest, FileIconState, FileIcons, FileKind,
+};
 use ui_platform::window::SurfaceSpec;
 use ui_platform::{App, Element};
 
@@ -134,6 +140,10 @@ struct FakeBackend {
     /// Stop the loop once this many waits have happened; the fake never blocks.
     stop_after: usize,
     hotkeys: Option<ScriptedHotkeys>,
+    /// The platform's thumbnail source, when the test gives it one.
+    thumbnailer: Option<Box<dyn Thumbnailer>>,
+    /// The platform's file-icon source, when the test gives it one.
+    file_icon_provider: Option<Box<dyn FileIconProvider>>,
 }
 
 impl Backend for FakeBackend {
@@ -178,6 +188,14 @@ impl Backend for FakeBackend {
 
     fn listen(&mut self, _name: &str) -> Result<Box<dyn Channel>, String> {
         Ok(Box::new(Once { sent: false }))
+    }
+
+    fn thumbnails(&mut self) -> Option<Box<dyn Thumbnailer>> {
+        self.thumbnailer.take()
+    }
+
+    fn file_icons(&mut self) -> Option<Box<dyn FileIconProvider>> {
+        self.file_icon_provider.take()
     }
 
     fn hotkeys(&mut self) -> Option<&mut (dyn GlobalHotkeys + 'static)> {
@@ -237,6 +255,53 @@ fn host(surfaces: Vec<Scripted>, stop_after: usize) -> (Host, Rc<RefCell<Log>>) 
     host_with_hotkeys(surfaces, stop_after, None)
 }
 
+/// A host whose platform reports a thumbnail source.
+fn host_with_thumbnailer(
+    surfaces: Vec<Scripted>,
+    thumbnailer: Box<dyn Thumbnailer>,
+) -> (Host, Rc<RefCell<Log>>) {
+    let log = Rc::new(RefCell::new(Log::default()));
+    let backend = fake_backend(
+        surfaces,
+        Rc::clone(&log),
+        usize::MAX,
+        None,
+        Some(thumbnailer),
+    );
+    (Host::new(Box::new(backend)), log)
+}
+
+/// A host whose platform reports an icon source.
+fn host_with_icons(
+    surfaces: Vec<Scripted>,
+    provider: Box<dyn FileIconProvider>,
+) -> (Host, Rc<RefCell<Log>>) {
+    let log = Rc::new(RefCell::new(Log::default()));
+    let mut backend = fake_backend(surfaces, Rc::clone(&log), usize::MAX, None, None);
+    backend.file_icon_provider = Some(provider);
+    (Host::new(Box::new(backend)), log)
+}
+
+fn fake_backend(
+    surfaces: Vec<Scripted>,
+    log: Rc<RefCell<Log>>,
+    stop_after: usize,
+    hotkeys: Option<ScriptedHotkeys>,
+    thumbnailer: Option<Box<dyn Thumbnailer>>,
+) -> FakeBackend {
+    FakeBackend {
+        prepared: surfaces
+            .into_iter()
+            .map(|surface| Box::new(surface) as Box<dyn SurfaceHandle>)
+            .collect(),
+        log,
+        stop_after,
+        hotkeys,
+        thumbnailer,
+        file_icon_provider: None,
+    }
+}
+
 /// `pressed: None` is a platform without hotkeys at all.
 fn host_with_hotkeys(
     surfaces: Vec<Scripted>,
@@ -248,15 +313,7 @@ fn host_with_hotkeys(
         pressed: pressed.into(),
         log: Rc::clone(&log),
     });
-    let backend = FakeBackend {
-        prepared: surfaces
-            .into_iter()
-            .map(|surface| Box::new(surface) as Box<dyn SurfaceHandle>)
-            .collect(),
-        log: Rc::clone(&log),
-        stop_after,
-        hotkeys,
-    };
+    let backend = fake_backend(surfaces, Rc::clone(&log), stop_after, hotkeys, None);
     (Host::new(Box::new(backend)), log)
 }
 
@@ -453,8 +510,9 @@ fn a_texture_reaches_the_surface_that_survived_and_makes_it_build() {
     );
     assert_eq!(
         second_builds.get(),
-        4,
-        "every turn's texture and request asked the surface to build"
+        5,
+        "every turn's texture and request asked the surface to build, and the departure of the \
+         other surface asked it once more: its opener reads what the closed surface answered"
     );
 }
 
@@ -474,6 +532,7 @@ fn the_clipboard_gets_each_copy_once_in_order() {
         .map(|copy| match &copy.content {
             ClipboardContent::Text(text) => text.as_str(),
             ClipboardContent::Bytes { .. } => "<bytes>",
+            ClipboardContent::Files { .. } => "<files>",
         })
         .collect();
     assert_eq!(texts, ["a", "b"], "copies keep the order the build asked");
@@ -648,6 +707,101 @@ fn a_finished_job_asks_every_surface_for_a_frame() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while jobs.completed() == 0 {
         assert!(Instant::now() < deadline, "the job never finished");
+        std::thread::yield_now();
+    }
+
+    host.open(spec("first"), Blank, OpenOptions::default())
+        .expect("the surface");
+    host.run_until(None).expect("the surface closes");
+
+    assert_eq!(requested.get(), 1, "one completion asks for one frame");
+}
+
+/// A thumbnail that arrives between turns is not an event either: its completion asks for the
+/// frame that can show it, the same way a job's does.
+#[test]
+fn a_finished_thumbnail_asks_every_surface_for_a_frame() {
+    struct Blocking {
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Thumbnailer for Blocking {
+        fn thumbnail(&self, request: &ThumbnailRequest) -> Option<ThumbnailPicture> {
+            if let Ok(release) = self.release.lock() {
+                let _ = release.recv_timeout(Duration::from_secs(5));
+            }
+            let side = request.size;
+            Some(ThumbnailPicture {
+                width: side,
+                height: side,
+                rgba: vec![0; side as usize * side as usize * 4],
+            })
+        }
+    }
+
+    let (surface, _steps) = scripted(&[Act::Idle, Act::Idle, Act::Close]);
+    let requested = Rc::clone(&surface.requested);
+    let (release, receiver) = std::sync::mpsc::channel();
+    let provider = Box::new(Blocking {
+        release: std::sync::Mutex::new(receiver),
+    });
+    let (mut host, _log) = host_with_thumbnailer(vec![surface], provider);
+    let thumbnails: Thumbnails = host.thumbnails().expect("the fake has a thumbnail source");
+    let request = ThumbnailRequest::new("/tmp/a.png", 64);
+    assert!(matches!(thumbnails.get(&request), ThumbnailState::Loading));
+    release.send(()).expect("the provider is listening");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while thumbnails.completed() == 0 {
+        assert!(Instant::now() < deadline, "the thumbnail never finished");
+        std::thread::yield_now();
+    }
+
+    host.open(spec("first"), Blank, OpenOptions::default())
+        .expect("the surface");
+    host.run_until(None).expect("the surface closes");
+
+    assert_eq!(requested.get(), 1, "one completion asks for one frame");
+}
+
+/// An icon that arrives between turns asks for the frame that draws it, as a thumbnail does.
+#[test]
+fn a_finished_icon_asks_every_surface_for_a_frame() {
+    struct Blocking {
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FileIconProvider for Blocking {
+        fn icon(&self, request: &FileIconRequest) -> Option<FileIcon> {
+            if let Ok(release) = self.release.lock() {
+                let _ = release.recv_timeout(Duration::from_secs(5));
+            }
+            let side = request.size;
+            Some(FileIcon {
+                identity: 1,
+                base: ThumbnailPicture {
+                    width: side,
+                    height: side,
+                    rgba: vec![0; side as usize * side as usize * 4],
+                },
+                badge: None,
+            })
+        }
+    }
+
+    let (surface, _steps) = scripted(&[Act::Idle, Act::Idle, Act::Close]);
+    let requested = Rc::clone(&surface.requested);
+    let (release, receiver) = std::sync::mpsc::channel();
+    let provider = Box::new(Blocking {
+        release: std::sync::Mutex::new(receiver),
+    });
+    let (mut host, _log) = host_with_icons(vec![surface], provider);
+    let icons: FileIcons = host.file_icons().expect("the fake has an icon source");
+    let request = FileIconRequest::new("/tmp/a.txt", FileKind::Text, false, 32);
+    assert!(matches!(icons.get(&request), FileIconState::Loading));
+    release.send(()).expect("the provider is listening");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while icons.completed() == 0 {
+        assert!(Instant::now() < deadline, "the icon never finished");
         std::thread::yield_now();
     }
 
@@ -859,6 +1013,8 @@ fn run_panels_with(
         log: Rc::new(RefCell::new(Log::default())),
         stop_after: usize::MAX,
         hotkeys: None,
+        thumbnailer: None,
+        file_icon_provider: None,
     };
     let mut host = Host::new(Box::new(backend));
     host.open(
@@ -930,6 +1086,181 @@ fn a_panel_gets_a_surface_of_its_own_or_falls_back_to_its_parent() {
     );
 }
 
+/// A page with a panel on a surface of its own, recording the pointer each frame is built
+/// with, in tree coordinates.
+struct PointerPage {
+    seen: Rc<RefCell<Vec<Option<ui_core::geom::Point>>>>,
+}
+
+impl App for PointerPage {
+    fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn Element> {
+        self.seen.borrow_mut().push(cx.pointer());
+        use ui_core::layout::{Anchor, OverlayPlacement, Presentation, SizeClass};
+        ui_platform::from_decl(
+            Decl::container(Id::str("root"), NodeKind::Stack)
+                .size(SizeClass::fixed(200.0, 200.0))
+                .child(
+                    Decl::container(Id::str("anchor"), NodeKind::Box)
+                        .size(SizeClass::fixed(20.0, 20.0)),
+                )
+                .child(
+                    Decl::container(Id::str("panel"), NodeKind::Box)
+                        .size(SizeClass::fixed(100.0, 60.0))
+                        .overlay(
+                            OverlayPlacement::below(Anchor::Node(Id::str("anchor")))
+                                .presentation(Presentation::Platform),
+                        ),
+                ),
+        )
+    }
+}
+
+/// The panel's half of a crossing: it holds the pointer the window lost and hands the
+/// arrival to the tree on its own intake, before the window builds the frame.
+struct CrossingPanel {
+    pointer: Cell<Option<ui_core::geom::Point>>,
+    /// Hand the arrival to the tree once, on the first intake after the surface exists.
+    arrive: Cell<bool>,
+}
+
+struct CrossingPanelSurface {
+    node: ui_core::NodeId,
+    side: Rc<CrossingPanel>,
+}
+
+impl SurfaceHandle for CrossingPanelSurface {
+    fn intake(&mut self, engine: &mut Engine) -> Result<(), String> {
+        if self.side.arrive.take()
+            && let Some(pos) = self.side.pointer.get()
+        {
+            engine.dispatch(ui_core::Event::PointerMoved { pos });
+        }
+        Ok(())
+    }
+
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        let mut target = OwnerTarget::default();
+        engine.present_panel(self.node, &mut target)?;
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn pointer(&self) -> Option<ui_core::geom::Point> {
+        self.side.pointer.get()
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+}
+
+/// The window's half: its queue has not been read yet, so it still reports the place the
+/// pointer last stood on it, and its step dispatches the leave the compositor sends the
+/// moment the pointer enters the popup.
+struct CrossingWindow {
+    pointer: Cell<Option<ui_core::geom::Point>>,
+    /// Step on which the leave is dispatched, before that step's frame is built.
+    leave_on: usize,
+    steps: Cell<usize>,
+    panel: Rc<CrossingPanel>,
+}
+
+impl SurfaceHandle for CrossingWindow {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        let step = self.steps.get();
+        if step == self.leave_on {
+            engine.dispatch(ui_core::Event::PointerLeft);
+        }
+        let mut target = OwnerTarget::default();
+        engine.frame_scene(&mut target, None)?;
+        self.steps.set(step + 1);
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn pointer(&self) -> Option<ui_core::geom::Point> {
+        self.pointer.get()
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        // One turn past the crossing: the frame in question is already built.
+        self.steps.get() > self.leave_on
+    }
+
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+
+    fn open_popup(
+        &mut self,
+        node: ui_core::NodeId,
+        _spec: ui_platform::window::PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        Ok(Box::new(CrossingPanelSurface {
+            node,
+            side: Rc::clone(&self.panel),
+        }))
+    }
+}
+
+/// The frame built in the turn the pointer crosses from the window onto its popup sees the
+/// pointer where it arrived. The window's leave and the popup's motion arrive in the same
+/// batch on different queues, so the window both reports a stale place and erases the tree's
+/// pointer before the frame is built.
+#[test]
+fn a_pointer_crossing_between_surfaces_reaches_the_frame_it_builds() {
+    let at = ui_core::geom::Point::new(140.0, 90.0);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let panel = Rc::new(CrossingPanel {
+        pointer: Cell::new(Some(at)),
+        arrive: Cell::new(true),
+    });
+    let backend = FakeBackend {
+        prepared: VecDeque::from([Box::new(CrossingWindow {
+            // Where the pointer last stood on the window, which has not read its queue yet.
+            pointer: Cell::new(Some(ui_core::geom::Point::new(900.0, 600.0))),
+            leave_on: 1,
+            steps: Cell::new(0),
+            panel: Rc::clone(&panel),
+        }) as Box<dyn SurfaceHandle>]),
+        log: Rc::new(RefCell::new(Log::default())),
+        stop_after: usize::MAX,
+        hotkeys: None,
+        thumbnailer: None,
+        file_icon_provider: None,
+    };
+    let mut host = Host::new(Box::new(backend));
+    host.open(
+        spec("page"),
+        PointerPage {
+            seen: Rc::clone(&seen),
+        },
+        OpenOptions::default(),
+    )
+    .expect("the page opens");
+    host.run_until(None).expect("the page closes");
+    let frames = seen.borrow().clone();
+    assert!(
+        frames.len() >= 2,
+        "the crossing frame was built: {frames:?}"
+    );
+    assert_eq!(
+        frames[1],
+        Some(at),
+        "the frame built as the pointer entered the popup sees it there: {frames:?}"
+    );
+}
+
 /// A page with a panel inside a panel, both asking for a surface of their own.
 struct NestedPage;
 
@@ -974,6 +1305,8 @@ fn a_panel_inside_a_panel_is_placed_against_the_outer_surface() {
         log: Rc::new(RefCell::new(Log::default())),
         stop_after: usize::MAX,
         hotkeys: None,
+        thumbnailer: None,
+        file_icon_provider: None,
     };
     let mut host = Host::new(Box::new(backend));
     host.open(spec("page"), NestedPage, OpenOptions::default())
@@ -1009,4 +1342,364 @@ fn a_panel_inside_a_panel_is_placed_against_the_outer_surface() {
         (0.0, 0.0),
         "a nested panel's request starts at the outer surface's own origin: {request:?}"
     );
+}
+
+/// A page with a panel inside a panel, recording the pointer each frame is built with.
+struct NestedPointerPage {
+    seen: Rc<RefCell<Vec<Option<ui_core::geom::Point>>>>,
+}
+
+impl App for NestedPointerPage {
+    fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn Element> {
+        self.seen.borrow_mut().push(cx.pointer());
+        let mut nested = NestedPage;
+        App::view(&mut nested, cx)
+    }
+}
+
+/// A root whose panels each claim the pointer, as a flyout's surface does while it holds
+/// the grab; the panel inside the outer one claims a different place.
+struct ClaimingRoot {
+    budget: Cell<usize>,
+    outer: ui_core::geom::Point,
+    inner: ui_core::geom::Point,
+}
+
+impl SurfaceHandle for ClaimingRoot {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        let mut target = OwnerTarget::default();
+        engine.frame_scene(&mut target, None)?;
+        self.budget.set(self.budget.get() - 1);
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        self.budget.get() == 0
+    }
+
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+
+    fn open_popup(
+        &mut self,
+        node: ui_core::NodeId,
+        _spec: ui_platform::window::PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        Ok(Box::new(ClaimingPanel {
+            node,
+            point: self.outer,
+            child: self.inner,
+        }))
+    }
+}
+
+struct ClaimingPanel {
+    node: ui_core::NodeId,
+    point: ui_core::geom::Point,
+    /// The place the panel opened inside this one claims.
+    child: ui_core::geom::Point,
+}
+
+impl SurfaceHandle for ClaimingPanel {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        let mut target = OwnerTarget::default();
+        engine.present_panel(self.node, &mut target)?;
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+
+    fn pointer(&self) -> Option<ui_core::geom::Point> {
+        Some(self.point)
+    }
+
+    fn open_popup(
+        &mut self,
+        node: ui_core::NodeId,
+        _spec: ui_platform::window::PopupSpec,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        Ok(Box::new(ClaimingPanel {
+            node,
+            point: self.child,
+            child: self.child,
+        }))
+    }
+}
+
+/// The deepest panel that claims the pointer is the one the frame takes.
+///
+/// An open flyout holds the grab and keeps hearing the mouse while the panel it hangs off
+/// stops; asking the panels in the order they opened took the outer panel's stale sample,
+/// which froze the menu's hover and kept the flyout open. Nothing else asks two panels for
+/// one pointer at once.
+#[test]
+fn the_deeper_panel_owns_the_shared_pointer() {
+    let inner = ui_core::geom::Point::new(60.0, 40.0);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let backend = FakeBackend {
+        prepared: VecDeque::from([Box::new(ClaimingRoot {
+            budget: Cell::new(3),
+            outer: ui_core::geom::Point::new(10.0, 10.0),
+            inner,
+        }) as Box<dyn SurfaceHandle>]),
+        log: Rc::new(RefCell::new(Log::default())),
+        stop_after: usize::MAX,
+        hotkeys: None,
+        thumbnailer: None,
+        file_icon_provider: None,
+    };
+    let mut host = Host::new(Box::new(backend));
+    host.open(
+        spec("page"),
+        NestedPointerPage {
+            seen: Rc::clone(&seen),
+        },
+        OpenOptions::default(),
+    )
+    .expect("the page opens");
+    host.run_until(None).expect("the page closes");
+    let frames = seen.borrow().clone();
+    assert!(
+        frames.len() >= 2,
+        "a frame was built with both panels bound: {frames:?}"
+    );
+    assert_eq!(
+        frames.last().copied().flatten(),
+        Some(inner),
+        "the frame takes the pointer of the panel that holds the grab: {frames:?}"
+    );
+}
+
+// A dialog is a surface of its own whose input the host arbitrates; these fixtures drive
+// that rule without a compositor.
+/// An app whose whole window is one clickable node, so a press always has a target.
+struct Clickable;
+
+impl App for Clickable {
+    fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn Element> {
+        let (width, height) = (cx.width() as f32, cx.height() as f32);
+        ui_platform::from_decl(
+            Decl::container(Id::str("hit"), NodeKind::Box)
+                .size(ui_core::layout::SizeClass::fixed(width, height))
+                .sense(ui_core::Sense::CLICK),
+        )
+    }
+}
+
+/// A root that presses its own window each step and records whether the engine took it.
+struct DialogRoot {
+    pressed: Rc<RefCell<Vec<bool>>>,
+    budget: Cell<usize>,
+    /// How many steps the dialog it opens stays up; `usize::MAX` leaves it open.
+    dialog_steps: usize,
+    /// Set when the dialog's surface is dropped.
+    dropped: Rc<Cell<bool>>,
+}
+
+impl SurfaceHandle for DialogRoot {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        // Build first: a press is hit-tested against the frame layout.
+        let mut target = OwnerTarget::default();
+        engine.frame_scene(&mut target, None)?;
+        let pos = ui_core::geom::Point::new(5.0, 5.0);
+        engine.dispatch(ui_core::Event::PointerReleased {
+            pos,
+            button: ui_core::PointerButton::Primary,
+        });
+        // The release above is not news; this press is, unless a modal dialog holds it.
+        let took = engine.dispatch(ui_core::Event::PointerPressed {
+            pos,
+            button: ui_core::PointerButton::Primary,
+        });
+        self.pressed.borrow_mut().push(took);
+        self.budget.set(self.budget.get().saturating_sub(1));
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        self.budget.get() == 0
+    }
+
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+
+    fn open_dialog(
+        &mut self,
+        spec: SurfaceSpec,
+        _options: PresentationOptions,
+    ) -> Result<Box<dyn SurfaceHandle>, String> {
+        assert!(
+            matches!(spec.role, ui_platform::window::SurfaceRole::Dialog { .. }),
+            "a dialog is asked for as a dialog"
+        );
+        Ok(Box::new(DialogSurface {
+            steps: 0,
+            close_after: self.dialog_steps,
+            dropped: Rc::clone(&self.dropped),
+        }))
+    }
+}
+
+/// A dialog's own surface: it closes after a scripted number of steps.
+struct DialogSurface {
+    steps: usize,
+    close_after: usize,
+    dropped: Rc<Cell<bool>>,
+}
+
+impl Drop for DialogSurface {
+    fn drop(&mut self) {
+        self.dropped.set(true);
+    }
+}
+
+impl SurfaceHandle for DialogSurface {
+    fn step(&mut self, _engine: &mut Engine) -> Result<SurfaceStep, String> {
+        self.steps = self.steps.saturating_add(1);
+        Ok(SurfaceStep::default())
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        self.steps >= self.close_after
+    }
+
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+}
+
+/// A host over one `DialogRoot`.
+fn dialog_host(
+    budget: usize,
+    dialog_steps: usize,
+    pressed: Rc<RefCell<Vec<bool>>>,
+    dropped: Rc<Cell<bool>>,
+) -> Host {
+    let root = DialogRoot {
+        pressed,
+        budget: Cell::new(budget),
+        dialog_steps,
+        dropped,
+    };
+    let backend = FakeBackend {
+        prepared: VecDeque::from([Box::new(root) as Box<dyn SurfaceHandle>]),
+        log: Rc::new(RefCell::new(Log::default())),
+        // A bound on the wait, so a surface that should have closed ends the loop instead
+        // of spinning; the assertion after the run is what reports it.
+        stop_after: 64,
+        hotkeys: None,
+        thumbnailer: None,
+        file_icon_provider: None,
+    };
+    Host::new(Box::new(backend))
+}
+
+/// While a modal dialog is open the parent paints but takes nothing; when it closes, input
+/// comes back. This is the host's own filter, not the platform's hint.
+#[test]
+fn a_modal_dialog_blocks_its_parent_until_it_closes() {
+    let pressed = Rc::new(RefCell::new(Vec::new()));
+    let dropped = Rc::new(Cell::new(false));
+    let mut host = dialog_host(12, 3, Rc::clone(&pressed), Rc::clone(&dropped));
+    let parent = host
+        .open(spec("parent"), Clickable, OpenOptions::default())
+        .expect("the parent opens");
+    let mut turn = 0;
+    host.on_turn(move |ctx, _| {
+        turn += 1;
+        if turn == 2 {
+            ctx.open_dialog(
+                parent,
+                SurfaceSpec::dialog("dev.crabsnap.test", "dialog", (200, 120)),
+                Box::new(Blank),
+                OpenOptions::default(),
+            )
+            .expect("the dialog opens");
+        }
+    });
+    host.run_until(None).expect("the parent closes");
+
+    let pressed = pressed.borrow();
+    assert_eq!(
+        pressed.first(),
+        Some(&true),
+        "the parent took input before the dialog: {pressed:?}"
+    );
+    assert!(
+        pressed.contains(&false),
+        "a modal dialog did not hold its parent: {pressed:?}"
+    );
+    assert_eq!(
+        pressed.last(),
+        Some(&true),
+        "input did not come back after the dialog closed: {pressed:?}"
+    );
+    assert!(dropped.get(), "the dialog surface outlived its dismissal");
+}
+
+/// A dialog belongs to the surface that opened it: closing the parent closes the dialog.
+#[test]
+fn a_dialog_closes_with_the_surface_that_opened_it() {
+    let pressed = Rc::new(RefCell::new(Vec::new()));
+    let dropped = Rc::new(Cell::new(false));
+    let mut host = dialog_host(2, usize::MAX, pressed, Rc::clone(&dropped));
+    let parent = host
+        .open(spec("parent"), Clickable, OpenOptions::default())
+        .expect("the parent opens");
+    host.open_dialog(
+        parent,
+        SurfaceSpec::dialog("dev.crabsnap.test", "dialog", (200, 120)),
+        Blank,
+        OpenOptions::default(),
+    )
+    .expect("the dialog opens");
+    // A deadline rather than "until empty": if the dialog were not closed with its parent
+    // the loop would never be empty, and the assertion below is what reports it.
+    let deadline = Instant::now() + Duration::from_millis(50);
+    host.run_until(Some(deadline)).expect("the parent closes");
+    assert_eq!(host.surface_count(), 0, "the dialog outlived its parent");
+    assert!(dropped.get(), "the dialog surface was never dropped");
+}
+
+/// A presentation with no dialog windows says so, and the caller keeps its own window.
+#[test]
+fn a_presentation_without_dialog_surfaces_refuses() {
+    let (first, _steps) = scripted(&[Act::Idle]);
+    let (mut host, _log) = host(vec![first], usize::MAX);
+    let parent = host
+        .open(spec("parent"), Blank, OpenOptions::default())
+        .expect("the parent opens");
+    let error = host
+        .open_dialog(
+            parent,
+            SurfaceSpec::dialog("dev.crabsnap.test", "dialog", (100, 100)),
+            Blank,
+            OpenOptions::default(),
+        )
+        .expect_err("a scripted surface has no dialogs");
+    assert!(error.contains("no dialog surfaces"), "{error}");
 }

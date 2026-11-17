@@ -12,7 +12,7 @@
 //! `margin` and `size` into a rectangle on the output itself; `exclusive` and `keyboard` have
 //! no counterpart and are ignored, or approximated with "does not activate" window styles.
 
-use ui_core::geom::{Insets, Point, Rect, Size};
+use ui_core::geom::{Insets, Rect};
 use ui_core::layout::{OverlayAlign, Side};
 
 /// What a host asks for when it opens a surface.
@@ -64,11 +64,42 @@ impl SurfaceSpec {
         }
     }
 
+    /// A secondary window belonging to another surface: an alert, a settings panel, a picker.
+    ///
+    /// It is opened through [`SurfaceHandle::open_dialog`](crate::host::SurfaceHandle::open_dialog)
+    /// on the surface it belongs to, never as a top-level surface of its own. The platform
+    /// stacks it above that surface and keeps it there; `modal` asks the platform to hold
+    /// the parent's input until the dialog is answered.
+    pub fn dialog(app_id: impl Into<String>, title: impl Into<String>, size: (u32, u32)) -> Self {
+        Self {
+            app_id: app_id.into(),
+            name: title.into(),
+            role: SurfaceRole::Dialog { size, modal: true },
+            min_size: None,
+        }
+    }
+
+    /// Whether this dialog blocks its parent's input. Meaningful only for a dialog.
+    pub fn with_modal(mut self, modal: bool) -> Self {
+        if let SurfaceRole::Dialog { modal: current, .. } = &mut self.role {
+            *current = modal;
+        }
+        self
+    }
+
+    /// The dialog's modality, when this surface is a dialog.
+    pub fn dialog_modal(&self) -> Option<bool> {
+        match &self.role {
+            SurfaceRole::Dialog { modal, .. } => Some(*modal),
+            _ => None,
+        }
+    }
+
     /// The layer spec, when this surface is one.
     pub fn layer_spec(&self) -> Option<&LayerSpec> {
         match &self.role {
             SurfaceRole::Layer(layer) => Some(layer),
-            SurfaceRole::Window { .. } => None,
+            _ => None,
         }
     }
 }
@@ -79,6 +110,14 @@ pub enum SurfaceRole {
     /// The window manager places, decorates and stacks it; `size` is its opening size in
     /// logical pixels.
     Window { size: (u32, u32) },
+    /// A secondary window of another surface, opened through the surface it belongs to.
+    ///
+    /// The platform stacks it above that surface and closes it with it; `modal` asks for
+    /// the parent's input to be held until the dialog is answered. A platform that cannot
+    /// express the relation is what [`SurfaceHandle::open_dialog`] refuses.
+    ///
+    /// [`SurfaceHandle::open_dialog`]: crate::host::SurfaceHandle::open_dialog
+    Dialog { size: (u32, u32), modal: bool },
     /// The engine places it: no decoration, no window-manager layout.
     Layer(LayerSpec),
 }
@@ -229,7 +268,8 @@ pub struct PopupSpec {
 /// What a platform may do when a popup's preferred position does not fit.
 ///
 /// The set is `xdg_positioner`'s, so a Wayland backend forwards it instead of interpreting
-/// it; a platform without a positioner applies [`place_popup`].
+/// it. The tree has already applied [`place_popup`]'s rule against the output it was given,
+/// so a backend that replays it lands on the rect the panel was laid out at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Constraint {
     /// Mirror to the anchor's other side.
@@ -269,127 +309,35 @@ impl Default for Constraint {
 ///
 /// `bounds` is the space the popup must stay inside, in the same coordinates as
 /// [`PopupSpec::anchor`]: a backend converts its monitor's work area into the parent's client
-/// space before calling. The popup's size never changes.
+/// space before calling. The popup's size never changes. The rule itself is the layout's, so
+/// a backend that replays it lands where the tree placed the panel.
 pub fn place_popup(spec: &PopupSpec, bounds: Rect) -> Rect {
-    let size = spec.rect.size;
     let vertical = matches!(spec.side, Side::Below | Side::Above);
     let (flip_along, flip_across) = if vertical {
         (spec.constraint.flip_y, spec.constraint.flip_x)
     } else {
         (spec.constraint.flip_x, spec.constraint.flip_y)
     };
-
-    let mut side = spec.side;
-    let mut rect = preferred(spec.anchor, size, side, spec.align, spec.offset);
-
-    // Flipping along the unfolding axis changes which side of the anchor the panel is on.
-    if flip_along && !fits(rect, bounds, vertical) {
-        let flipped = opposite(side);
-        let alternative = preferred(spec.anchor, size, flipped, spec.align, spec.offset);
-        if overflow(alternative, bounds, vertical) < overflow(rect, bounds, vertical) {
-            side = flipped;
-            rect = alternative;
-        }
-    }
-    // The cross axis has no other side, only the anchor's other end.
-    if flip_across
-        && !fits(rect, bounds, !vertical)
-        && let Some(align) = flipped_align(spec.align)
-    {
-        let alternative = preferred(spec.anchor, size, side, align, spec.offset);
-        if overflow(alternative, bounds, !vertical) < overflow(rect, bounds, !vertical) {
-            rect = alternative;
-        }
-    }
-    if spec.constraint.slide_x {
-        rect.origin.x = slide(rect.origin.x, rect.size.w, bounds.min_x(), bounds.max_x());
-    }
-    if spec.constraint.slide_y {
-        rect.origin.y = slide(rect.origin.y, rect.size.h, bounds.min_y(), bounds.max_y());
-    }
-    rect
-}
-
-fn preferred(anchor: Rect, size: Size, side: Side, align: OverlayAlign, offset: f32) -> Rect {
-    let (x, y) = match side {
-        Side::Below => (
-            along(anchor.min_x(), anchor.size.w, size.w, align),
-            anchor.max_y() + offset,
-        ),
-        Side::Above => (
-            along(anchor.min_x(), anchor.size.w, size.w, align),
-            anchor.min_y() - offset - size.h,
-        ),
-        Side::Right => (
-            anchor.max_x() + offset,
-            along(anchor.min_y(), anchor.size.h, size.h, align),
-        ),
-        Side::Left => (
-            anchor.min_x() - offset - size.w,
-            along(anchor.min_y(), anchor.size.h, size.h, align),
-        ),
-    };
-    Rect::from_origin_size(Point::new(x, y), size)
-}
-
-fn along(start: f32, span: f32, length: f32, align: OverlayAlign) -> f32 {
-    match align {
-        OverlayAlign::Start => start,
-        OverlayAlign::Center => start + (span - length) * 0.5,
-        OverlayAlign::End => start + span - length,
-    }
-}
-
-fn opposite(side: Side) -> Side {
-    match side {
-        Side::Below => Side::Above,
-        Side::Above => Side::Below,
-        Side::Left => Side::Right,
-        Side::Right => Side::Left,
-    }
-}
-
-/// A centered panel has no other end to move to; only sliding can help it.
-fn flipped_align(align: OverlayAlign) -> Option<OverlayAlign> {
-    match align {
-        OverlayAlign::Start => Some(OverlayAlign::End),
-        OverlayAlign::End => Some(OverlayAlign::Start),
-        OverlayAlign::Center => None,
-    }
-}
-
-fn fits(rect: Rect, bounds: Rect, vertical: bool) -> bool {
-    let (start, end) = axis(rect, vertical);
-    let (low, high) = axis(bounds, vertical);
-    start >= low && end <= high
-}
-
-fn overflow(rect: Rect, bounds: Rect, vertical: bool) -> f32 {
-    let (start, end) = axis(rect, vertical);
-    let (low, high) = axis(bounds, vertical);
-    (low - start).max(0.0) + (end - high).max(0.0)
-}
-
-fn axis(rect: Rect, vertical: bool) -> (f32, f32) {
-    if vertical {
-        (rect.min_y(), rect.max_y())
-    } else {
-        (rect.min_x(), rect.max_x())
-    }
-}
-
-/// Move `value` the least distance that puts `length` inside `low..=high`.
-fn slide(value: f32, length: f32, low: f32, high: f32) -> f32 {
-    if length >= high - low {
-        low
-    } else {
-        value.clamp(low, high - length)
-    }
+    ui_core::layout::place_anchored(
+        spec.anchor,
+        spec.rect.size,
+        spec.side,
+        spec.align,
+        spec.offset,
+        ui_core::layout::Fit {
+            flip_along,
+            flip_across,
+            slide_x: spec.constraint.slide_x,
+            slide_y: spec.constraint.slide_y,
+        },
+        bounds,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ui_core::geom::{Point, Size};
 
     fn spec(anchor: Rect, size: (u32, u32), constraint: Constraint) -> PopupSpec {
         PopupSpec {

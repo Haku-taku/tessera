@@ -32,6 +32,11 @@ thread_local! {
     /// closure alive for the whole modal call it is about to make, and the loop only calls
     /// back on this thread, inside that call.
     static PUMP: Cell<Option<*mut dyn FnMut()>> = const { Cell::new(None) };
+    /// The slot holds a step's move-loop pump that no loop reads yet: [`attach`] fills it
+    /// before the step, in case a caption press inside that step starts the shell's move.
+    /// A gesture that starts inside the step is the only loop that will read the slot, so
+    /// it may take it over; an active loop's pump may not be displaced.
+    static STANDBY: Cell<bool> = const { Cell::new(false) };
     /// A frame is being built: a message it synchronously dispatches must not build another.
     static BUSY: Cell<bool> = const { Cell::new(false) };
     /// Nesting depth of the shell's own move or resize loop on this thread.
@@ -47,6 +52,8 @@ thread_local! {
 /// Counted, not a flag: a system menu opened inside a move opens a second loop.
 pub(crate) fn enter_shell() {
     SHELL.with(|depth| depth.set(depth.get() + 1));
+    // The slot now belongs to a loop that is reading it.
+    STANDBY.with(|standby| standby.set(false));
 }
 
 /// Record that the shell's loop returned.
@@ -59,7 +66,7 @@ pub(crate) fn exit_shell() {
 ///
 /// A gesture whose timer fails still runs; it simply keeps the last frame.
 pub(crate) fn arm(hwnd: HWND, pump: &mut dyn FnMut()) -> usize {
-    if PUMP.with(Cell::get).is_some() {
+    if PUMP.with(Cell::get).is_some() && !STANDBY.with(Cell::get) {
         // A gesture's timer is already armed on this thread and serves the pump it has.
         // Overwriting the slot would leave the outer gesture without frames, and this
         // gesture simply runs without one — it still moves, the way it did before the pump.
@@ -71,6 +78,7 @@ pub(crate) fn arm(hwnd: HWND, pump: &mut dyn FnMut()) -> usize {
         std::mem::transmute::<*mut dyn FnMut(), *mut dyn FnMut()>(pump)
     };
     PUMP.with(|slot| slot.set(Some(erased)));
+    STANDBY.with(|standby| standby.set(false));
     // SAFETY: the window is this thread's and the id is ours.
     let timer = unsafe { SetTimer(Some(hwnd), TIMER_ID, TICK_MS, None) };
     if timer == 0 {
@@ -96,6 +104,7 @@ pub(crate) fn attach(pump: &mut dyn FnMut()) -> bool {
         std::mem::transmute::<*mut dyn FnMut(), *mut dyn FnMut()>(pump)
     };
     PUMP.with(|slot| slot.set(Some(erased)));
+    STANDBY.with(|standby| standby.set(true));
     true
 }
 
@@ -105,6 +114,7 @@ pub(crate) fn detach(held: bool) {
         return;
     }
     PUMP.with(|slot| slot.set(None));
+    STANDBY.with(|standby| standby.set(false));
 }
 
 /// Stop the timer [`arm`] started and drop its pump.
@@ -115,6 +125,7 @@ pub(crate) fn disarm(hwnd: HWND, timer: usize) {
         return;
     }
     PUMP.with(|slot| slot.set(None));
+    STANDBY.with(|standby| standby.set(false));
     // SAFETY: the id came back from `SetTimer` on this window.
     unsafe {
         let _ = KillTimer(Some(hwnd), timer);

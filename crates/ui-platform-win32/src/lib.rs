@@ -15,8 +15,11 @@
 
 mod backend;
 mod capture;
+mod chooser;
 mod clipboard;
+mod context_menu;
 mod dnd;
+mod file_operation;
 mod frame_pace;
 mod hotkeys;
 mod ime;
@@ -28,14 +31,18 @@ mod outputs;
 mod presenter;
 mod render;
 mod session;
+mod shell;
 mod theme;
 mod tray;
 mod tsf;
+mod volumes;
+mod watch;
 mod wgc;
 mod window;
 
 pub use backend::Win32Backend;
 pub use capture::{ScreenCapture, ScreenFrame};
+pub use context_menu::Win32ShellMenu;
 pub use hotkeys::WINDOW_CLASS as HOTKEY_WINDOW_CLASS;
 pub use locale::system_languages;
 pub use outputs::HdrOutput;

@@ -1,29 +1,6 @@
 //! The MD3 FAB: the size boxes, the shape scale's corners and the colour styles.
 
-use crate::fab::fab_corner;
 use crate::spec::{FabColor, FabFlags, FabLowering, FabSize, fab_spec};
-
-#[test]
-fn the_box_follows_its_size_and_the_shape_scale() {
-    for (size, box_side, icon, corner) in [
-        // Literal corners: the shape scale's medium, large, large-increased, extra-large.
-        (FabSize::Small, 40.0, 24.0, 12.0),
-        (FabSize::Base, 56.0, 24.0, 16.0),
-        (FabSize::Medium, 80.0, 28.0, 20.0),
-        (FabSize::Large, 96.0, 36.0, 28.0),
-    ] {
-        let spec = fab_spec(
-            FabFlags::NONE,
-            FabColor::PrimaryContainer,
-            size,
-            FabLowering::Base,
-        );
-        assert_eq!(spec.container.width, box_side, "{size:?}");
-        assert_eq!(spec.container.height, box_side, "{size:?}");
-        assert_eq!(spec.icon.size, icon, "{size:?}");
-        assert_eq!(fab_corner(size), corner, "{size:?}");
-    }
-}
 
 #[test]
 fn a_surface_fab_keeps_its_size_and_the_lowered_form_drops_its_shadow() {

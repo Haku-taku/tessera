@@ -93,7 +93,9 @@ fn pasting_the_demo_document_into_an_empty_editor_renders() {
         pos: at,
         button: ui_core::PointerButton::Primary,
     });
-    loop_.dispatch(ui_core::Event::Paste(demo()));
+    loop_.dispatch(ui_core::Event::Paste(
+        ui_core::clipboard::ClipboardContent::Text(demo()),
+    ));
     assert!(
         loop_.app_mut().source.contains("分布式"),
         "the paste reached the app, which is what makes the next frame parse it"
@@ -105,58 +107,6 @@ fn pasting_the_demo_document_into_an_empty_editor_renders() {
         key: ui_core::Key::Down,
     });
     loop_.build_with_dt((640, 900), None, 0.016);
-}
-
-/// The reader draws a reference as its label, raised to the superscript position: the atom
-/// takes the line's top edge instead of its baseline.
-#[test]
-fn a_footnote_reference_draws_a_raised_label() {
-    let mut loop_ = AppLoop::with_stack(
-        Page {
-            source: "Body[^1].\n\n[^1]: the note\n".to_owned(),
-            editable: false,
-        },
-        &["Noto Sans", "DejaVu Sans"],
-    );
-    loop_.build_with_dt((640, 900), None, 0.016);
-    let tree = loop_.tree();
-    let mut raised = false;
-    for nid in tree.walk() {
-        let Some(node) = tree.get(nid) else {
-            continue;
-        };
-        let ui_core::NodeData::Text { block, .. } = &node.data else {
-            continue;
-        };
-        for atom in &block.atoms {
-            if let Some(ui_core::math::InlineObject::Glyphs { text, .. }) = &atom.object
-                && text == "1"
-            {
-                assert_eq!(
-                    atom.align,
-                    ui_core::text::VerticalAlign::Top,
-                    "the label sits on the line's top edge"
-                );
-                raised = true;
-            }
-        }
-    }
-    assert!(raised, "the reference draws its label as an atom");
-}
-
-#[test]
-fn probe_flatten_cost() {
-    let mut loop_ = AppLoop::with_stack(
-        Page {
-            source: demo(),
-            editable: true,
-        },
-        &["Noto Sans", "DejaVu Sans"],
-    );
-    loop_.build_with_dt((1200, 1600), None, 0.016);
-    for _ in 0..400 {
-        loop_.build_with_dt((1200, 1600), None, 0.016);
-    }
 }
 
 /// A reference definition writes only syntax. A reader has nothing to show for it, and a

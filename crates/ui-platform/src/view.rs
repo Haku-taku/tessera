@@ -6,15 +6,16 @@ use std::rc::Rc;
 
 use crate::text_pass::TextPass;
 use ui_core::collections::{FastHasher, FastMap, FastSet};
-use ui_core::draw::{DrawList, PrimKind, TextPrim};
-#[cfg(test)]
-use ui_core::geom::Insets;
-use ui_core::geom::{Rect, Size};
+use ui_core::draw::{DrawList, PrimKind, RectPrim, TextPrim};
+use ui_core::geom::{Color, Insets, Rect, Size};
 use ui_core::hit::{HitBehavior, HitIndex};
-use ui_core::layout::{AxisSize, Len, Sizing};
+use ui_core::layout::{
+    Anchor, AxisSize, Grow, Len, OverlayAlign, OverlayPlacement, Presentation, Side, SizeClass,
+    Sizing,
+};
 use ui_core::timed;
 use ui_core::{
-    AnimSpec, BuiltinLayout, Constraints, Damage, DamageAccum, Easing, Id, LayoutEngine,
+    AnimSpec, BuiltinLayout, Constraints, Damage, DamageAccum, Decl, Easing, Id, LayoutEngine,
     MonospaceMeasure, NodeData, NodeKind, Tree,
 };
 use ui_paint::CpuRenderer;
@@ -35,6 +36,8 @@ pub struct FrameInfo {
     pub pressed: Option<ui_core::Id>,
     /// The clicked node and its ancestors, root first; empty when nothing was clicked.
     clicked_path: Vec<Id>,
+    /// How many presses the click was part of: one for a single, two for a double.
+    pub clicks: u32,
     /// The drag-release chain, root first.
     dropped_path: Vec<Id>,
     /// The node that release landed on, when it accepts drops.
@@ -736,9 +739,24 @@ impl BarFade {
 /// It is kept until the release, which is where the tap/hold split is decided: the press
 /// point is what a tap's menu opens at, and the time is what makes it a tap.
 struct SecondaryPress {
-    node: Id,
+    /// The node that asked to hear the button; `None` when only a drag could start, so the
+    /// press is recorded for the tap rule alone and nobody is told about it.
+    node: Option<Id>,
     at: ui_core::geom::Point,
     since: f64,
+    /// The burst length of the press: two is a double-click on the secondary button.
+    clicks: u32,
+    /// Where the app hears the tap when no node declared a menu: the node it landed on.
+    /// Held back until the release proves the button did not travel into a right drag.
+    request: Option<Id>,
+}
+
+/// One button's last press, kept only as long as the burst rule can join the next one.
+#[derive(Clone, Copy)]
+struct MultiPress {
+    at: f64,
+    pos: ui_core::geom::Point,
+    clicks: u32,
 }
 
 /// One live scrollbar drag: the scroller, the press position, and the offset it began at.
@@ -817,6 +835,21 @@ struct SnapBurst {
 
 /// How long a wheel burst must be quiet before a snapping scroller rests on its page.
 const SNAP_IDLE: f64 = 0.12;
+
+/// Put a scroll offset on the grid text is rasterized on, in logical units.
+///
+/// The stored offset stays exact, so a slow trackpad gesture still accumulates instead of
+/// rounding itself away; what is painted lands on whole raster pixels. Text outside a scroll
+/// keeps its subpixel phase, but scrolling content must not: a glyph that changes vertical
+/// phase on every step of a glide reads as the text jittering against rows that move
+/// smoothly. Every desktop scrolls by whole device pixels for this reason.
+fn on_text_grid(offset: f32, grid: f32) -> f32 {
+    if grid.is_finite() && grid > 0.0 {
+        (offset * grid).round() / grid
+    } else {
+        offset
+    }
+}
 
 /// The page a gesture from `origin` to `offset` rests on, along one axis.
 ///
@@ -953,6 +986,12 @@ struct DragSession {
     data: Option<Rc<ui_core::DragData>>,
     /// What it offers, best first; empty for a gesture that carries nothing.
     types: Rc<Vec<String>>,
+    /// The effects the payload permits or the source announced.
+    effects: ui_core::DropEffects,
+    /// What the payload prefers when no modifier is held.
+    preferred: ui_core::DropEffect,
+    /// The button that started it: `Secondary` means a right drag, which asks.
+    button: ui_core::PointerButton,
     /// The node under the pointer that takes it.
     target: Option<Id>,
 }
@@ -964,6 +1003,11 @@ impl DragSession {
     /// exactly as it did before payloads existed.
     fn types_decide(&self) -> bool {
         self.data.is_some() || self.source.is_none()
+    }
+
+    /// The effect a release with `modifiers` held means, or `None` when nothing is allowed.
+    fn negotiated(&self, modifiers: ui_core::Modifiers) -> Option<ui_core::DropEffect> {
+        ui_core::negotiate_effect(self.effects, self.preferred, modifiers)
     }
 }
 
@@ -1003,6 +1047,14 @@ impl std::fmt::Debug for DragImage {
             .field("bytes", &self.bgra.len())
             .finish()
     }
+}
+
+/// A picture the app handed the engine, and the build that last asked for it.
+struct RegisteredImage {
+    entry: ui_core::draw::ImageEntry,
+    /// The build that registered it, or `None` for a picture [`AppLoop::register_image`]
+    /// keeps for the run.
+    seen: Option<u64>,
 }
 
 pub struct AppLoop<A: App> {
@@ -1045,6 +1097,11 @@ pub struct AppLoop<A: App> {
     time_driven: bool,
     /// An event arrived that the tree has to be rebuilt for; the loop takes it each build.
     dispatched: bool,
+    /// A modal dialog of this surface is open: it paints, but takes no input.
+    ///
+    /// The host sets this from the surfaces it owns; the platform's modal hint is only a
+    /// hint, so this is what actually holds the parent still.
+    input_blocked: bool,
     /// Pointer steps the last build asked for, relative and in logical points.
     pointer_steps: Vec<(f32, f32)>,
     /// The engine owns the animation store: it advances it, damages it, and hands it to
@@ -1063,8 +1120,10 @@ pub struct AppLoop<A: App> {
     /// A bar was mid-fade or mid-hold when the build ran; the loop keeps presenting until
     /// the fade lands, the way it does for ink and springs.
     scrollbar_awake: bool,
-    /// Textures the app registered, keyed by stable id.
-    images: FastMap<u64, ui_core::draw::ImageEntry>,
+    /// Pictures the app registered, keyed by stable id. A build's own pictures live for that
+    /// frame; [`AppLoop::register_image`] keeps one for the run. Without the split, a picker
+    /// that shows a new thumbnail every row grows this table until the app exits.
+    images: FastMap<u64, RegisteredImage>,
     /// Canvases this frame declared, in declaration order.
     canvases: Vec<ui_core::draw::Canvas>,
     /// Canvas versions already painted by the target, keyed by id: `(version, size)`.
@@ -1080,6 +1139,9 @@ pub struct AppLoop<A: App> {
     image_slots: FastMap<(u64, ui_core::draw::Sampling), u32>,
     /// Last frame's ink rect and content hash per node id, for damage diffing.
     node_prints: FastMap<Id, (Rect, u64)>,
+    /// The content box and viewport each scroller had when a build last read them; a list
+    /// windows its rows from them, so a frame that resizes one owes the next.
+    scroller_boxes: FastMap<Id, (Size, Size)>,
     /// Panels the last build painted for a surface of the platform's own: each subtree's
     /// list, rebased on the panel's own top-left, ready for that surface to take.
     panel_views: Vec<(ui_core::NodeId, ui_core::draw::DrawList)>,
@@ -1092,6 +1154,9 @@ pub struct AppLoop<A: App> {
     backdrops: FastMap<Id, ui_core::draw::BackdropEntry>,
     /// This frame's backdrops, collected while painting.
     backdrops_now: FastMap<Id, ui_core::draw::BackdropEntry>,
+    /// Set while `paint_panels` paints a panel's list: that list is shown on a surface of its
+    /// own, so nothing of the window is behind it for a backdrop to read.
+    painting_panel: bool,
     /// Last frame's offscreen layers. Their opacity and effects live outside every primitive,
     /// so a change to them alone would otherwise produce no damage at all.
     layer_prints: Vec<(Rect, Vec<ui_core::Effect>)>,
@@ -1126,6 +1191,8 @@ pub struct AppLoop<A: App> {
     native_source: Option<Id>,
     /// A native drag the host has not started yet.
     native_request: Option<NativeDrag>,
+    /// The platform menu a build asked the host to run once this frame presented.
+    shell_menu_request: Option<ui_core::cx::ShellMenuRequest>,
     /// The part of the surface the pending drag's image shows, when it is not the source's
     /// whole ink: a text drag carries the selected lines, not the block holding them.
     native_crop: Option<ui_core::geom::Rect>,
@@ -1141,8 +1208,8 @@ pub struct AppLoop<A: App> {
     press_at: Option<ui_core::geom::Point>,
     /// The secondary press a node asked for, until it is released.
     secondary: Option<SecondaryPress>,
-    /// The node a middle press was reported to, until it is released.
-    middle: Option<Id>,
+    /// The node a middle press was reported to, and its burst length, until it is released.
+    middle: Option<(Id, u32)>,
     /// The pressed node and its ancestors, so a control sees press through its children.
     pressed_path: Vec<Id>,
     /// Click target; `Escape` or a click elsewhere releases it, pointer leave does not.
@@ -1200,8 +1267,14 @@ pub struct AppLoop<A: App> {
     reveal: Option<(Id, ui_core::TextSelection)>,
     /// What was last handed to the target, so a change with no damage still presents.
     last_ime: crate::present::ImeState,
-    /// Last primary press on a selectable node, for double-click word selection.
-    last_press: Option<(f64, ui_core::geom::Point, Id)>,
+    /// Last press of each pointer button, for the multi-click rule.
+    last_clicks: [Option<MultiPress>; 3],
+    /// How this desktop joins presses into one multi-click.
+    pointer_timing: crate::host::PointerTiming,
+    /// The burst length of the primary press a pending click completes.
+    pressed_clicks: u32,
+    /// This frame's click burst length, reported with `clicked`.
+    clicks: u32,
     /// Held modifiers, reported separately from key events.
     modifiers: ui_core::Modifiers,
     /// Hit index of the last laid-out frame; input arrives between frames.
@@ -1210,12 +1283,19 @@ pub struct AppLoop<A: App> {
     input_areas: Vec<ui_core::geom::Rect>,
     /// Latest pointer position, kept so `dispatch` can re-run the hit test.
     pointer: Option<ui_core::geom::Point>,
+    /// Where the host resolved the pointer across the surfaces of this tree, for one build:
+    /// a window and the popups it hangs are one tree, and only one of them has the pointer.
+    pointer_hint: Option<ui_core::geom::Point>,
     /// The shape the target was last told; a move that only changes it still needs a frame.
     cursor_sent: ui_core::CursorShape,
-    /// When the caret's blink cycle last restarted; any caret movement moves it to now.
+    /// When the caret's blink cycle last restarted: another editor took it, or the buffer
+    /// changed. Moving the caret within one editor does not restart it.
     caret_blink_at: f64,
-    /// The caret fact of the previous frame: a change restarts the cycle.
+    /// The caret fact of the previous frame, for noticing a new editor.
     caret_last: CaretFact,
+    /// The focused input's buffer digest when the cycle last restarted, so an edit restarts
+    /// it and a caret move does not.
+    caret_digest: Option<(Id, u64)>,
     /// Whether this frame drew a caret: the blink's own reason to want the next one.
     caret_painted: bool,
     /// The caret last revealed, with a digest of its input's buffer. A caret that did not
@@ -1231,12 +1311,19 @@ pub struct AppLoop<A: App> {
     close: bool,
     /// App-level bindings and the built-in text-editing table.
     shortcuts: crate::shortcut::Bindings,
-    /// The open context menu, if any; the engine draws and hit-tests it itself.
-    menu: Option<crate::menu::OpenMenu>,
+    /// The open context menu, if any; it is declared as a panel of the platform's own.
+    menu: Option<crate::menu::Menu>,
     /// How that menu looks; a design system replaces it through `set_menu_style`.
     menu_style: crate::menu::MenuStyle,
     /// The app's words for the engine's built-in text rows; none until it supplies them.
     text_menu_labels: Option<crate::menu::TextMenuLabels>,
+    /// The surface wrapper's own child that the app's tree hangs from.
+    ///
+    /// Every surface is declared as `wrapper -> app root`, so the tree the app owns never
+    /// changes parent: a menu panel appearing and leaving is the only structural change.
+    app_root: Option<Id>,
+    /// Where a clipboard answer goes when no editor owns the caret.
+    paste_target: Option<Id>,
 }
 
 impl<A: App> AppLoop<A> {
@@ -1309,15 +1396,18 @@ impl<A: App> AppLoop<A> {
             modifier_read: false,
             time_driven: false,
             dispatched: false,
+            input_blocked: false,
             pointer_steps: Vec::new(),
             anim_store: ui_core::AnimStore::new(),
             damage: DamageAccum::new(),
             frame: 0,
             node_prints: FastMap::default(),
+            scroller_boxes: FastMap::default(),
             panel_views: Vec::new(),
             panel_presentation: FastMap::default(),
             backdrops: FastMap::default(),
             backdrops_now: FastMap::default(),
+            painting_panel: false,
             layer_prints: Vec::new(),
             hovered: None,
             pressed: None,
@@ -1346,17 +1436,22 @@ impl<A: App> AppLoop<A> {
             preedit: None,
             reveal: None,
             last_ime: crate::present::ImeState::default(),
-            last_press: None,
+            last_clicks: [None; 3],
+            pointer_timing: crate::host::PointerTiming::default(),
+            pressed_clicks: 0,
+            clicks: 0,
             modifiers: ui_core::Modifiers::default(),
             hit: HitIndex::new(),
             input_areas: Vec::new(),
             pointer: None,
+            pointer_hint: None,
             cursor_sent: ui_core::CursorShape::Arrow,
             caret_blink_at: 0.0,
             caret_last: CaretFact {
                 editing: None,
                 selection: None,
             },
+            caret_digest: None,
             caret_painted: false,
             caret_revealed: None,
             clicked: None,
@@ -1372,6 +1467,7 @@ impl<A: App> AppLoop<A> {
             drag_session: None,
             native_source: None,
             native_request: None,
+            shell_menu_request: None,
             native_crop: None,
             drag_step: None,
             hovered_path: Vec::new(),
@@ -1387,6 +1483,8 @@ impl<A: App> AppLoop<A> {
             menu: None,
             menu_style: crate::menu::MenuStyle::default(),
             text_menu_labels: None,
+            app_root: None,
+            paste_target: None,
         }
     }
 
@@ -1433,6 +1531,14 @@ impl<A: App> AppLoop<A> {
     /// Pointer steps the last build asked for, oldest first; takes them.
     pub fn take_pointer_steps(&mut self) -> Vec<(f32, f32)> {
         std::mem::take(&mut self.pointer_steps)
+    }
+
+    /// The platform menu a build asked the host to run, waiting for the frame to present.
+    ///
+    /// The host runs it from its own turn: the platform's popup blocks on a message loop of
+    /// its own, and a build that opened it would stay unpainted until the user dismissed it.
+    pub fn take_shell_menu(&mut self) -> Option<ui_core::cx::ShellMenuRequest> {
+        self.shell_menu_request.take()
     }
 
     /// The drag that asked to leave the app, waiting for the host to start it.
@@ -1521,12 +1627,7 @@ impl<A: App> AppLoop<A> {
     pub fn drop_effect(&self) -> Option<ui_core::DropEffect> {
         let session = self.drag_session.as_ref()?;
         session.target?;
-        Some(
-            session
-                .data
-                .as_ref()
-                .map_or(ui_core::DropEffect::Copy, |data| data.effect),
-        )
+        session.negotiated(self.modifiers)
     }
 
     /// The MIME types the drag over this surface offers, when one is live.
@@ -1565,6 +1666,7 @@ impl<A: App> AppLoop<A> {
             || self.pan.is_some()
             || self.select_drag.is_some()
             || self.middle.is_some()
+            || self.drag.is_dragging()
         {
             return true;
         }
@@ -1606,10 +1708,6 @@ impl<A: App> AppLoop<A> {
         self.anim_store.is_animating(self.clock.now())
             || !self.splats.is_empty()
             || !self.scroll_motion.is_empty()
-            || self
-                .menu
-                .as_ref()
-                .is_some_and(|m| m.entrance(self.clock.now()).0 < 1.0)
             // A control that read the clock must be rebuilt to see the new time.
             || self.time_driven
     }
@@ -1695,6 +1793,11 @@ impl<A: App> AppLoop<A> {
         }
     }
 
+    /// Adopt the desktop's multi-click rule: the gap and the rectangle that join two presses.
+    pub fn set_pointer_timing(&mut self, timing: crate::host::PointerTiming) {
+        self.pointer_timing = timing;
+    }
+
     /// The grid text is rasterized on: the device scale times the renderer's supersample.
     pub fn set_supersample(&mut self, ss: u32) {
         self.supersample = ss.clamp(1, 4);
@@ -1745,9 +1848,18 @@ impl<A: App> AppLoop<A> {
         self.scrollbar_fade.get(&id).map(|f| f.opacity)
     }
 
-    /// Register a texture once; the app refers to it by `ImageSpec::id`.
+    /// Register a texture for the run; the app refers to it by `ImageSpec::id`.
+    ///
+    /// A picture a build produced goes through [`crate::cx::Cx::register_image`] instead: the
+    /// engine keeps it for that frame only, so a list of many pictures does not accumulate.
     pub fn register_image(&mut self, entry: ui_core::draw::ImageEntry) {
-        self.images.insert(entry.id, entry);
+        self.images.insert(
+            entry.id,
+            RegisteredImage {
+                entry,
+                seen: None,
+            },
+        );
     }
 
     /// Register font bytes under `name`; runs naming that family resolve to them.
@@ -1876,6 +1988,25 @@ impl<A: App> AppLoop<A> {
         self.frame
     }
 
+    /// Say whether this window's host opens a surface for the panels that ask for one.
+    ///
+    /// The host is the only party that knows, and it knows before the first frame: it sets
+    /// this when it builds the loop. A loop left without it keeps every panel in the window,
+    /// laid out and painted with the parent, because an unanswered request must not make a
+    /// panel invisible — a bare loop has nobody to paint a surface it cannot open.
+    pub fn set_panel_surfaces(&mut self, presents: bool) {
+        self.tree.set_panel_surfaces(presents);
+    }
+
+    /// Name the output the platform panels are placed against, in this surface's own
+    /// coordinates; `None` leaves them at their preferred spot.
+    ///
+    /// The host owns this: only the backend knows the monitor's work area, and a panel's
+    /// surface stands where the tree placed it, so the tree is the one that constrains it.
+    pub fn set_output_bounds(&mut self, bounds: Option<ui_core::geom::Rect>) {
+        self.tree.set_output_bounds(bounds);
+    }
+
     /// Say where a panel's declaration is presented, once the host has decided.
     ///
     /// `true` when the platform opened a surface of its own for the panel, `false` when no
@@ -1898,6 +2029,21 @@ impl<A: App> AppLoop<A> {
         // only happen when unrelated input arrived, which is too late to matter.
         self.dispatched = true;
         true
+    }
+
+    /// Say where the pointer stands in this tree, for the build this turn will make.
+    ///
+    /// A window and the popups it hangs share one tree, and each surface knows the pointer
+    /// only while it is on that surface. The host steps all of them, so it is the one place
+    /// that can name the pointer wherever it is; a build with a pointer of its own still
+    /// wins over this answer.
+    pub fn set_pointer_hint(&mut self, pointer: Option<ui_core::geom::Point>) {
+        self.pointer_hint = pointer;
+    }
+
+    /// Drop a hint no build took, so it cannot outlive the turn that resolved it.
+    pub fn clear_pointer_hint(&mut self) {
+        self.pointer_hint = None;
     }
 
     /// Whether the last build painted a list for this panel.
@@ -2094,10 +2240,9 @@ impl<A: App> AppLoop<A> {
     /// Whether the pointer is on what this surface consumes, or a gesture holds it.
     ///
     /// The same set the input region claims, plus what the region cannot express: a gesture
-    /// keeps the keyboard past the node's edge, and the engine menu has no node at all.
+    /// keeps the keyboard past the node's edge.
     fn pointer_inside(&self, pointer: Option<ui_core::geom::Point>) -> bool {
-        self.menu.is_some()
-            || self.pressed.is_some()
+        self.pressed.is_some()
             || self.select_drag.is_some()
             || self.pan.is_some()
             || pointer.is_some_and(|at| self.hit.topmost_consumer(at).is_some())
@@ -2111,12 +2256,6 @@ impl<A: App> AppLoop<A> {
         let mut areas = std::mem::take(&mut self.input_areas);
         areas.clear();
         areas.extend(self.hit.consumer_areas());
-        // The menu has no node, so its panel must be named here: a row that extends past the
-        // node it belongs to would otherwise sit outside the surface's input region and the
-        // compositor would hand the click to whatever is below.
-        if let Some(menu) = &self.menu {
-            areas.push(menu.rect);
-        }
         self.input_areas = areas;
     }
 
@@ -2327,6 +2466,15 @@ impl<A: App> AppLoop<A> {
         pointer: Option<ui_core::geom::Point>,
         step: Option<f32>,
     ) -> FrameOutcome {
+        // The sample is the surface's own; the tree's own pointer came in as events and may
+        // be standing on a panel of this tree, which is a different surface. A surface has a
+        // pointer only while the pointer is on it, so its sample wins when it has one, then
+        // the hint the host resolved across the group, and the tree's answer last — one
+        // pointer, several surfaces, one hover.
+        let pointer = match pointer {
+            Some(p) => Some(p),
+            None => self.pointer_hint.take().or(self.pointer),
+        };
         // Damage is only meaningful where the frame can paint; the scroll pass below adds
         // one rect per row that moved, including the rows far past the viewport.
         self.damage
@@ -2362,13 +2510,29 @@ impl<A: App> AppLoop<A> {
             &mut self.drag_path,
             self.drag_session.as_ref().and_then(|s| s.target),
         );
-        // A caret that just moved is solid at once: restart the cycle before anything
-        // decides whether to draw it, so the frame the user typed into shows it.
+        // The cycle belongs to the editor, not to the offset: a caret walking with the
+        // arrow keys must keep blinking. Taking the caret and changing the buffer restart
+        // it, so a new editor opens lit and typing shows the caret solid as it does anywhere.
         let fact = self.caret_fact();
-        if self.caret_last != fact {
-            self.caret_last = fact;
+        let owner = fact
+            .editing
+            .map(|(id, _)| id)
+            .or_else(|| fact.selection.map(|(id, _, _, _)| id));
+        let digest = fact
+            .editing
+            .and_then(|(id, _)| self.input_digest(id).map(|digest| (id, digest)));
+        if owner
+            != self
+                .caret_last
+                .editing
+                .map(|(id, _)| id)
+                .or_else(|| self.caret_last.selection.map(|(id, _, _, _)| id))
+            || digest != self.caret_digest
+        {
             self.caret_blink_at = self.frame_now;
+            self.caret_digest = digest;
         }
+        self.caret_last = fact;
         self.caret_painted = false;
         let caret_in_text = self.caret_in_text_fact();
         let mut info = FrameInfo {
@@ -2394,6 +2558,7 @@ impl<A: App> AppLoop<A> {
             focus_visible: self.focus_visible,
             activated: self.activated,
             activated_path: self.activated_path.clone(),
+            clicks: self.clicks,
             dismissed: self.dismissed,
             // Only the front fact is answered this frame; the rest wait for later frames.
             shortcut: self
@@ -2429,6 +2594,7 @@ impl<A: App> AppLoop<A> {
         // One-frame facts: the frame that reads them also consumes them, so nothing else
         // may clear them — events arrive in bursts and would erase a click no frame has seen.
         self.clicked = None;
+        self.clicks = 0;
         self.activated = None;
         self.dismissed = None;
         self.dropped = None;
@@ -2442,6 +2608,7 @@ impl<A: App> AppLoop<A> {
         // 1. Declaration, built under the one context that owns the engine's store.
         let (
             root_element,
+            app_decl,
             decl,
             scroll_requests,
             bring_requests,
@@ -2452,6 +2619,10 @@ impl<A: App> AppLoop<A> {
             close,
             pointer_steps,
             focus_requests,
+            menu_requests,
+            menu_update,
+            shell_menu_request,
+            paste_request,
             time_driven,
             pointer_read,
             modifier_read,
@@ -2465,7 +2636,10 @@ impl<A: App> AppLoop<A> {
             };
             // A middle button down is a press on the node that hears it, so that node sees
             // the pointer in its own space for as long as the button is held.
-            let local = self.pointer_local(info.pressed.or(self.middle), info.pointer);
+            let local = self.pointer_local(
+                info.pressed.or(self.middle.map(|(node, _)| node)),
+                info.pointer,
+            );
             let inert = self.inert_ids();
             // Anything the cache cannot observe dropped its entries; start the frame clean.
             if self.decls_stale {
@@ -2552,6 +2726,7 @@ impl<A: App> AppLoop<A> {
                 hovered: info.hovered,
                 pressed: info.pressed,
                 clicked_path: info.clicked_path.clone(),
+                clicks: info.clicks,
                 dropped_path: info.dropped_path.clone(),
                 drop_target: info.drop_target,
                 drag_target: info.drag_path.last().copied(),
@@ -2588,16 +2763,20 @@ impl<A: App> AppLoop<A> {
             if !cx.settle_outside() {
                 cx.invalidate_decls();
             }
-            let (root, decl, time_driven, pointer_read, modifier_read) = timed!("decl", {
+            let (root, app_decl, decl, time_driven, pointer_read, modifier_read) = timed!("decl", {
                 // Two different costs: what the app builds, and what the engine makes of it.
                 let root = timed!("view", self.app.view(&mut cx));
                 // Asked here, before paint: the menu and the content share this frame's look.
                 if let Some(style) = self.app.menu_style() {
                     self.menu_style = style;
                 }
-                let decl = timed!("root_decl", root.decl(&mut cx));
+                let app_decl = timed!("root_decl", root.decl(&mut cx));
+                self.app_root = Some(app_decl.id);
+                let menu = menu_panel_decl(&mut cx, &mut self.menu, &self.menu_style, &self.text);
+                let decl = timed!("surface", with_menu(app_decl.clone(), menu));
                 (
                     root,
+                    app_decl,
                     decl,
                     cx.take_time_driven(),
                     cx.take_pointer_read(),
@@ -2606,6 +2785,7 @@ impl<A: App> AppLoop<A> {
             });
             (
                 root,
+                app_decl,
                 decl,
                 cx.take_scroll_requests(),
                 cx.take_bring_requests(),
@@ -2616,6 +2796,10 @@ impl<A: App> AppLoop<A> {
                 cx.take_close_request(),
                 cx.take_pointer_nudges(),
                 cx.take_focus_requests(),
+                cx.take_menu_requests(),
+                cx.take_menu_update(),
+                cx.take_shell_menu_request(),
+                cx.take_paste_request(),
                 time_driven,
                 pointer_read,
                 modifier_read,
@@ -2623,9 +2807,15 @@ impl<A: App> AppLoop<A> {
         };
         // Pictures the build minted, before paint: the shapes that refer to them resolve a
         // texture slot from this table, and a pin that zoomed this frame draws its new raster
-        // now rather than a frame late.
+        // now rather than a frame late. They name this build, so the next one drops them.
         for entry in images {
-            self.images.insert(entry.id, entry);
+            self.images.insert(
+                entry.id,
+                RegisteredImage {
+                    entry,
+                    seen: Some(self.frame),
+                },
+            );
         }
         // Canvases are known before paint as well: the image fingerprint hashes their
         // version, which is what makes a canvas change damage the node that draws it.
@@ -2697,13 +2887,14 @@ impl<A: App> AppLoop<A> {
                 // Only a scroller the engine is actively stretching may show an offset past its
                 // end; every other one is clamped by layout, as an app-declared offset is.
                 let elastic = self.elastic_scrollers();
+                let grid = self.text_scale();
                 for (id, offset) in self.scroll_offsets.iter() {
                     if let Some(nid) = self.tree.find_by_id(*id)
                         && let Some(params) =
                             self.tree.get_mut(nid).and_then(|n| n.data.params_mut())
                     {
-                        params.scroll_x = offset.x;
-                        params.scroll_y = offset.y;
+                        params.scroll_x = on_text_grid(offset.x, grid);
+                        params.scroll_y = on_text_grid(offset.y, grid);
                         params.scroll_elastic = elastic.contains(id);
                     }
                 }
@@ -2732,6 +2923,9 @@ impl<A: App> AppLoop<A> {
         // The layout just said how much content every scroller has: an offset the content no
         // longer reaches is out of range now, and nothing else brings it back.
         self.reconcile_scroll_offsets();
+        if self.scroller_boxes_moved() {
+            self.dispatched = true;
+        }
         // Panels the host has not placed yet are held back for one frame, and this is the
         // build that asks for it: the host decides right after this step, and the next
         // frame paints each panel where it will stay.
@@ -2764,6 +2958,36 @@ impl<A: App> AppLoop<A> {
                 self.damage.add(Rect::new(0.0, 0.0, w as f32, h as f32));
                 self.dispatched = true;
             }
+        }
+        // A build can ask for a menu without holding the loop; the last request wins. An
+        // identical menu already open is left alone so a per-frame request cannot churn it.
+        if let Some(request) = menu_requests.into_iter().last() {
+            let same = self.menu.as_ref().is_some_and(|menu| {
+                menu.owner == request.owner && menu.at == request.at && menu.items == request.items
+            });
+            if !same {
+                self.open_menu_at(request.owner, request.at, request.items);
+            }
+        }
+        // Rows that answered after the menu was up replace its rows where it stands, so a
+        // slow platform read joins the menu the user is looking at instead of a later one.
+        if let Some(update) = menu_update {
+            self.replace_menu_items(update.owner, update.items);
+        }
+        // The platform's own menu blocks on its popup's loop, so the host runs it from its
+        // turn, after this frame has presented with the engine's menu closed.
+        if let Some(request) = shell_menu_request {
+            self.shell_menu_request = Some(request);
+        }
+        // A control with no chord to press asks for the clipboard; the answer follows the
+        // same route a Ctrl+V request takes.
+        if paste_request {
+            // The same fallback the keyboard route uses: with no caret, the app root takes it.
+            self.paste_target = self.focused.or(self.app_root);
+            self.clipboard
+                .push(crate::clipboard::ClipboardCommand::RequestPaste {
+                    kind: crate::clipboard::ClipboardKind::Selection,
+                });
         }
         // A modal owns the keyboard, so focus must be inside it once it is laid out.
         let settled = self.settle_focus();
@@ -2815,7 +3039,10 @@ impl<A: App> AppLoop<A> {
             };
             // A middle button down is a press on the node that hears it, so that node sees
             // the pointer in its own space for as long as the button is held.
-            let local = self.pointer_local(info.pressed.or(self.middle), info.pointer);
+            let local = self.pointer_local(
+                info.pressed.or(self.middle.map(|(node, _)| node)),
+                info.pointer,
+            );
             let mut cx = ui_core::cx::Cx::new(
                 &mut self.anim_store,
                 info.frame,
@@ -2833,6 +3060,7 @@ impl<A: App> AppLoop<A> {
                 hovered: info.hovered,
                 pressed: info.pressed,
                 clicked_path: info.clicked_path.clone(),
+                clicks: info.clicks,
                 dropped_path: info.dropped_path.clone(),
                 drop_target: info.drop_target,
                 drag_target: info.drag_path.last().copied(),
@@ -2868,7 +3096,7 @@ impl<A: App> AppLoop<A> {
             let was_muted = cx.mute();
             timed!(
                 "changes",
-                collect_changes(root_element.as_ref(), &decl, &self.tree, &cx, &mut changes,)
+                collect_changes(root_element.as_ref(), &app_decl, &self.tree, &cx, &mut changes,)
             );
             cx.unmute(was_muted);
             // A control reports its own activation; a bare node has nobody but the engine.
@@ -2879,6 +3107,27 @@ impl<A: App> AppLoop<A> {
                 if !spoke {
                     changes.push((id, ui_core::change::Change::Activated));
                 }
+            }
+            // The menu's rows are the engine's own nodes, so the app's tree cannot speak for
+            // a click on one; the same pick path that answers Enter takes it here. The click
+            // lands on whatever the row draws (a label's text), so its chain names the row.
+            if let Some(id) = self.menu.as_ref().and_then(|menu| {
+                info.clicked_path
+                    .iter()
+                    .rev()
+                    .find(|id| menu.locate(**id).is_some())
+                    .copied()
+            }) {
+                changes.push((id, ui_core::change::Change::Activated));
+            }
+            // A menu panel's surface was taken back by the platform or by a press outside
+            // it; the panel is an engine node, so the change is the engine's to make too.
+            if let Some(id) = info.dismissed
+                && self.menu.as_ref().is_some_and(|menu| {
+                    (0..=menu.depth()).any(|depth| crate::menu::Menu::panel_id(depth) == id)
+                })
+            {
+                changes.push((id, ui_core::change::Change::Dismissed));
             }
         }
         let mut changed_any = false;
@@ -2903,6 +3152,18 @@ impl<A: App> AppLoop<A> {
                 changed_any |= self.focus_node(target);
                 continue;
             }
+            // The menu's rows and panels are the engine's own nodes: a click on a row is a
+            // pick, and a popup the platform took back is a dismissal, so neither reaches
+            // the app under the menu's owner id.
+            let menu_handled = match &change {
+                ui_core::change::Change::Activated => self.menu_activated(id),
+                ui_core::change::Change::Dismissed => self.menu_dismissed(id),
+                _ => false,
+            };
+            if menu_handled {
+                changed_any = true;
+                continue;
+            }
             changed_any |= self.app_changed(id, change);
         }
         if changed_any {
@@ -2921,8 +3182,6 @@ impl<A: App> AppLoop<A> {
         self.backdrops_now.clear();
         self.list.canvas = Rect::new(0.0, 0.0, w as f32, h as f32);
         timed!("paint", self.paint_tree(root));
-        // The menu is transient engine-owned UI: it paints above the tree, never inside it.
-        self.paint_menu();
 
         // 5. Hit test with this frame's rects.
         timed!(
@@ -2971,6 +3230,12 @@ impl<A: App> AppLoop<A> {
         // Panels with a surface of their own, after the root's damage is diffed: they are
         // not in that surface, so their ink must neither claim nor lose damage there.
         timed!("panels", self.paint_panels());
+        // A build's picture is answered now, so it goes with the frame: the pixels are the
+        // app's to hand over again, and a list that scrolls past them owes nothing. The
+        // surface's texture is evicted by the next present that does not name it.
+        let frame = self.frame;
+        self.images
+            .retain(|_, image| image.seen.is_none_or(|seen| seen == frame));
 
         // Springs are integrated, so the scheduler steps them: one left to a widget that
         // stopped building it would never land, and would ask for frames for ever.
@@ -2988,11 +3253,6 @@ impl<A: App> AppLoop<A> {
                 || !self.scroll_motion.is_empty()
                 // An automatic scrollbar still holding or fading is engine-owned motion too.
                 || self.scrollbar_awake
-                // A menu still travelling in is engine-owned motion like the ink above.
-                || self
-                    .menu
-                    .as_ref()
-                    .is_some_and(|m| m.entrance(self.clock.now()).0 < 1.0)
                 // A control reading the clock asked for every frame; it never settles.
                 || time_driven,
             cursor,
@@ -3063,7 +3323,9 @@ impl<A: App> AppLoop<A> {
         let (id, change) = match event {
             // A drag start carries no value yet: the first `Moved` says where the pointer
             // is inside the control, and that is what a control maps to a value.
-            DragEvent::Started { on, from, .. } => {
+            DragEvent::Started {
+                on, from, button, ..
+            } => {
                 // A new gesture starts with no movement banked: the previous drag's slice
                 // must not be added to this one if both fall inside a single frame.
                 self.drag_step = None;
@@ -3098,10 +3360,19 @@ impl<A: App> AppLoop<A> {
                             .as_ref()
                             .map(|data| data.types().map(str::to_owned).collect())
                             .unwrap_or_default();
+                        // A gesture that carries nothing is not a data transfer; it keeps
+                        // the copy-only default every such drag had.
+                        let (effects, preferred) = match &data {
+                            Some(data) => (data.effects, data.preferred),
+                            None => (ui_core::DropEffects::COPY, ui_core::DropEffect::Copy),
+                        };
                         self.drag_session = Some(DragSession {
                             source: Some(on),
                             data,
                             types: Rc::new(types),
+                            effects,
+                            preferred,
+                            button,
                             target: None,
                         });
                         // The target hears before the source does: a highlight that reads
@@ -3129,16 +3400,39 @@ impl<A: App> AppLoop<A> {
                     },
                 )
             }
-            DragEvent::Dropped { on, target } => {
+            DragEvent::Dropped {
+                on,
+                target,
+                at,
+                button,
+            } => {
                 self.dropped = Some(on);
                 self.drop_target = target;
+                let mut outcome = None;
                 if let Some(session) = self.drag_session.take() {
+                    let effect = session
+                        .negotiated(self.modifiers)
+                        .unwrap_or(session.preferred);
                     match (session.data, target) {
                         // The target takes the payload; no exit is sent, because the drop
                         // itself ends the hover.
                         (Some(data), Some(target)) => {
-                            requested |=
-                                self.app_changed(target, Change::DroppedOn((*data).clone()));
+                            requested |= self.app_changed(
+                                target,
+                                Change::DroppedOn(ui_core::DropReport {
+                                    data: (*data).clone(),
+                                    effect,
+                                    modifiers: self.modifiers,
+                                    button,
+                                    performer: ui_core::Performer::Target,
+                                    foreign: false,
+                                    pos: at,
+                                }),
+                            );
+                            outcome = Some(ui_core::DropOutcome {
+                                action: effect,
+                                performed_by: ui_core::Performer::Target,
+                            });
                         }
                         _ => {
                             // Released over nothing (or over another node): whatever was
@@ -3149,7 +3443,7 @@ impl<A: App> AppLoop<A> {
                         }
                     }
                 }
-                (on, Change::Dropped(target))
+                (on, Change::Dropped { target, outcome })
             }
             DragEvent::Cancelled { on } => {
                 if let Some(session) = self.drag_session.take()
@@ -3186,7 +3480,10 @@ impl<A: App> AppLoop<A> {
         }
         let previous = std::mem::replace(&mut session.target, next);
         let types = session.types.to_vec();
-        let mut requested = false;
+        // A target change is a frame the engine needs by itself: the host publishes
+        // `drop_effect()` from the next frame, and the app's highlight is drawn there.
+        // The app's own answer is about the data it keeps, not about this.
+        let mut requested = true;
         if let Some(previous) = previous {
             requested |= self.app_changed(previous, ui_core::change::Change::DragExited);
         }
@@ -3201,12 +3498,17 @@ impl<A: App> AppLoop<A> {
         use ui_core::DndEvent;
         use ui_core::change::Change;
         match event {
-            DndEvent::Entered { pos, types } => {
+            DndEvent::Entered { pos, types, effects } => {
                 self.pointer = Some(pos);
                 self.drag_session = Some(DragSession {
                     source: None,
                     data: None,
                     types: Rc::new(types),
+                    effects,
+                    // Another application's payload does not state a preference through
+                    // the protocol; copying is the safe default, and a modifier overrides.
+                    preferred: ui_core::DropEffect::Copy,
+                    button: ui_core::PointerButton::Primary,
                     target: None,
                 });
                 self.refresh_drag_target()
@@ -3222,15 +3524,25 @@ impl<A: App> AppLoop<A> {
                     .map(|target| self.app_changed(target, Change::DragExited))
                     .unwrap_or(false)
             }
-            DndEvent::Dropped { pos, data } => {
+            DndEvent::Dropped {
+                pos,
+                data,
+                button,
+                performer,
+            } => {
                 self.pointer = Some(pos);
                 let types: Vec<String> = data.types().map(str::to_owned).collect();
+                let effects = data.effects;
+                let preferred = data.preferred;
                 // Some platforms report the release without an enter; the drop still has
-                // to find its target against the payload it carries.
+                // to find its target against the payload it carries. An `Entered` already
+                // stated the permitted set, so only the preference — which OLE's callbacks
+                // never carry — is taken from the payload then.
                 match self.drag_session.as_mut() {
                     Some(session) => {
                         if session.source.is_none() {
-                            session.types = Rc::new(types.clone());
+                            session.preferred = preferred;
+                            session.button = button;
                         }
                     }
                     None => {
@@ -3238,15 +3550,49 @@ impl<A: App> AppLoop<A> {
                             source: None,
                             data: None,
                             types: Rc::new(types.clone()),
+                            effects,
+                            preferred,
+                            button,
                             target: None,
                         });
                     }
                 }
                 let target = self.drag_target_at(pos, Some(&types));
                 self.drop_target = target;
+                // The session knows what the source permits; the payload's own fields only
+                // describe the data. A target's own rule (same volume moves, otherwise
+                // copies) reads the permitted set, and a foreign drag is the only one whose
+                // preference is unknown.
+                let (permitted, preferred) = self
+                    .drag_session
+                    .as_ref()
+                    .map(|session| (session.effects, session.preferred))
+                    .unwrap_or((effects, preferred));
+                // A native drag of this app's own payload comes back with no session
+                // source, so the source node is the other half of the test.
+                let foreign = self.native_source.is_none()
+                    && self
+                        .drag_session
+                        .as_ref()
+                        .is_some_and(|session| session.source.is_none());
+                let mut data = data;
+                data.effects = permitted;
                 let mut requested = false;
                 if let Some(target) = target {
-                    requested |= self.app_changed(target, Change::DroppedOn(data));
+                    let effect = ui_core::negotiate_effect(permitted, preferred, self.modifiers)
+                        .unwrap_or(preferred);
+                    requested |= self.app_changed(
+                        target,
+                        Change::DroppedOn(ui_core::DropReport {
+                            data,
+                            effect,
+                            modifiers: self.modifiers,
+                            button,
+                            performer,
+                            foreign,
+                            pos,
+                        }),
+                    );
                 }
                 if let Some(session) = self.drag_session.take()
                     && let Some(stale) = session.target.filter(|t| Some(*t) != target)
@@ -3255,7 +3601,7 @@ impl<A: App> AppLoop<A> {
                 }
                 requested
             }
-            DndEvent::Finished { dropped } => {
+            DndEvent::Finished { outcome } => {
                 // The operating system owned the pointer for the whole gesture, so the
                 // release this loop would have seen never arrived. Settle the press here,
                 // or the source stays pressed (and inked) after the drag has ended.
@@ -3270,13 +3616,12 @@ impl<A: App> AppLoop<A> {
                 // A drop on one of this app's own targets is the one landing this loop did
                 // see; anything else is another application's, and the source learns only
                 // that the gesture was taken by something it cannot name.
-                let change = if !dropped {
-                    Change::Cancelled
-                } else {
-                    match self.drop_target {
-                        Some(target) => Change::Dropped(Some(target)),
-                        None => Change::Dropped(None),
-                    }
+                let change = match outcome {
+                    None => Change::Cancelled,
+                    Some(outcome) => Change::Dropped {
+                        target: self.drop_target,
+                        outcome: Some(outcome),
+                    },
                 };
                 self.app_changed(source, change)
             }
@@ -3581,7 +3926,11 @@ impl<A: App> AppLoop<A> {
                 let typing = ui_core::grapheme::next(text, 0) == text.len();
                 Some(self.math_commit_structure(owner, id, start, end, typing))
             }
-            ui_core::Event::Paste(text) => {
+            ui_core::Event::Paste(content) => {
+                let Some(text) = content.text() else {
+                    // A file list or a picture is not an edit to the formula.
+                    return Some(true);
+                };
                 let changed = self.math_edit_call(id, |edit, id| edit.insert(id, text), false);
                 if !changed {
                     return Some(true);
@@ -3626,16 +3975,6 @@ impl<A: App> AppLoop<A> {
     /// Takes the point rather than reading the live one: a move has to know what shape it
     /// is moving to before it is stored, and the answer is a pixel-independent effect.
     pub fn cursor_shape_at(&self, p: ui_core::geom::Point) -> ui_core::CursorShape {
-        // An open menu is painted above the tree and owns the pointer over itself: a row
-        // that can be chosen is a control, the rest of the surface is not.
-        if let Some(menu) = self.menu.as_ref()
-            && menu.rect.contains(p)
-        {
-            return match menu.enabled_row_at(p, self.frame_now) {
-                Some(_) => ui_core::CursorShape::PointingHand,
-                None => ui_core::CursorShape::Arrow,
-            };
-        }
         let mut cur = self.hit.topmost_consumer(p);
         while let Some(nid) = cur {
             let Some(node) = self.tree.get(nid) else {
@@ -4403,23 +4742,51 @@ impl<A: App> AppLoop<A> {
             .and_then(|id| self.selectable_text(id))
     }
 
+    /// Count a press of `button` towards its burst, and report which press this is.
+    ///
+    /// Two presses join when the desktop's gap and rectangle both hold; a press outside
+    /// either starts a new burst, as every desktop does. The count keeps climbing, so a
+    /// third press in the same place reads 3 rather than starting over.
+    fn click_burst(&mut self, button: ui_core::PointerButton, at: ui_core::geom::Point) -> u32 {
+        let index = match button {
+            ui_core::PointerButton::Primary => 0,
+            ui_core::PointerButton::Secondary => 1,
+            ui_core::PointerButton::Middle => 2,
+        };
+        let now = self.clock.live();
+        let slop = self.pointer_timing.multi_click_slop;
+        let clicks = self.last_clicks[index]
+            .filter(|last| {
+                now - last.at <= self.pointer_timing.multi_click.as_secs_f64()
+                    && (last.pos.x - at.x).abs() <= slop
+                    && (last.pos.y - at.y).abs() <= slop
+            })
+            .map_or(1, |last| last.clicks.saturating_add(1));
+        self.last_clicks[index] = Some(MultiPress {
+            at: now,
+            pos: at,
+            clicks,
+        });
+        clicks
+    }
+
     /// Start (or extend into) a selection on a read-only text node.
     ///
     /// Returns true when the selection changed, which is what asks for a repaint.
-    fn begin_selection(&mut self, node: Id, at: ui_core::geom::Point, extend: bool) -> bool {
+    fn begin_selection(
+        &mut self,
+        node: Id,
+        at: ui_core::geom::Point,
+        extend: bool,
+        clicks: u32,
+    ) -> bool {
         let Some(index) = self.text_index_at(node, at) else {
             return false;
         };
-        let now = self.clock.now();
         // Shift is the selection's own modifier: it moves the head and keeps the anchor,
-        // so a press in another block extends the range instead of replacing it.
-        let double = !extend
-            && self.last_press.is_some_and(|(t, p, n)| {
-                n == node
-                    && now - t <= 0.4
-                    && (p.x - at.x).abs() <= 4.0
-                    && (p.y - at.y).abs() <= 4.0
-            });
+        // so a press in another block extends the range instead of replacing it. The
+        // second press of a burst selects the word under it, as an editor does.
+        let double = !extend && clicks == 2;
         let ends = if double {
             let value = self.text_value(node).unwrap_or_default();
             let word = ui_core::text_input::word_at(&value, index);
@@ -4444,7 +4811,6 @@ impl<A: App> AppLoop<A> {
                 head: (node, index),
             }
         };
-        self.last_press = Some((now, at, node));
         let changed = self.selection != Some(ends);
         self.selection = Some(ends);
         // A drag that follows a shift press extends from the anchor, which may live in
@@ -5203,57 +5569,94 @@ impl<A: App> AppLoop<A> {
         ))
     }
 
-    /// Open a menu at `p` if anything there offers one; a stale menu closes first.
+    /// Open the declared menu at `p`; a stale menu closes first.
     fn open_menu(&mut self, p: ui_core::geom::Point) -> bool {
         self.close_menu();
         let Some((owner, items)) = self.menu_for(p) else {
             return false;
         };
-        let style = self.menu_style.clone();
-        let surface = ui_core::geom::Size::new(self.last_size.0 as f32, self.last_size.1 as f32);
-        let text = std::rc::Rc::clone(&self.text);
-        let menu = crate::menu::OpenMenu::open(
-            &style,
-            owner,
-            items,
-            p,
-            self.clock.live(),
-            surface,
-            |block| text.borrow_mut().measure(block, f32::INFINITY).w,
-        );
-        self.damage.add(menu.rect);
-        self.menu = Some(menu);
+        self.show_menu(owner, p, items)
+    }
+
+    /// Open an app-built menu at `at` for `owner`.
+    ///
+    /// The programmatic form of a declared menu: a pick reports `MenuItem` to `owner`, a
+    /// dismissal reports `MenuClosed`, and an empty run of dividers opens nothing.
+    pub fn open_menu_at(
+        &mut self,
+        owner: Id,
+        at: ui_core::geom::Point,
+        items: Vec<ui_core::menu::MenuItem>,
+    ) -> bool {
+        if !menu_has_rows(&items) {
+            return false;
+        }
+        self.close_menu();
+        self.show_menu(owner, at, items)
+    }
+
+    /// Replace the open menu's rows when it still belongs to `owner`.
+    ///
+    /// The panel keeps its point and does not run its entrance again; a menu that belongs to
+    /// someone else, or to nobody, is left as it is.
+    pub fn replace_menu_items(
+        &mut self,
+        owner: Id,
+        items: Vec<ui_core::menu::MenuItem>,
+    ) -> bool {
+        let Some(menu) = self.menu.as_mut().filter(|menu| menu.owner == owner) else {
+            return false;
+        };
+        if !menu.replace_items(items) {
+            return false;
+        }
+        self.decls_stale = true;
+        self.dispatched = true;
         true
     }
 
-    /// Close the menu, damaging where it was.
+    /// The shared opener; the declared and programmatic paths differ only in owner and point.
+    fn show_menu(
+        &mut self,
+        owner: Id,
+        at: ui_core::geom::Point,
+        items: Vec<ui_core::menu::MenuItem>,
+    ) -> bool {
+        if !menu_has_rows(&items) {
+            return false;
+        }
+        let menu = crate::menu::Menu::open(owner, items, at);
+        self.menu = Some(menu);
+        self.decls_stale = true;
+        self.dispatched = true;
+        true
+    }
+
+    /// Close the menu, telling its owner it was dismissed.
     fn close_menu(&mut self) -> bool {
         let Some(menu) = self.menu.take() else {
             return false;
         };
-        self.damage.add(menu.rect);
+        self.decls_stale = true;
+        self.dispatched = true;
+        self.app_changed(menu.owner, ui_core::change::Change::MenuClosed);
         true
     }
 
-    /// Run one row of the open menu, then close it.
-    fn pick_menu_row(&mut self, index: usize) -> bool {
+    /// Report one menu command, then close the menu without a dismissal report.
+    fn pick_menu_item(&mut self, item: Id) -> bool {
         let Some(menu) = self.menu.take() else {
             return false;
         };
-        self.damage.add(menu.rect);
-        let Some(item) = menu.items.get(index).cloned() else {
-            return true;
-        };
-        if !item.enabled {
-            return true;
-        }
-        let builtin = if item.id == Id::str(MENU_SELECT_ALL) {
+        self.decls_stale = true;
+        self.dispatched = true;
+        let builtin = if item == Id::str(MENU_SELECT_ALL) {
             Some(ui_core::ShortcutId::SELECT_ALL)
-        } else if item.id == Id::str(MENU_COPY) {
+        } else if item == Id::str(MENU_COPY) {
             Some(ui_core::ShortcutId::COPY)
-        } else if item.id == Id::str(MENU_CUT) {
+        } else if item == Id::str(MENU_CUT) {
             Some(ui_core::ShortcutId::CUT)
-        } else if item.id == Id::str(MENU_PASTE) {
+        } else if item == Id::str(MENU_PASTE) {
             Some(ui_core::ShortcutId::PASTE)
         } else {
             None
@@ -5263,40 +5666,16 @@ impl<A: App> AppLoop<A> {
                 self.run_builtin(id);
                 true
             }
-            None => self.app_changed(menu.owner, ui_core::change::Change::MenuItem(item.id)),
+            None => self.app_changed(menu.owner, ui_core::change::Change::MenuItem(item)),
         }
     }
 
     /// Handle one event while a menu is open. `None` means it falls through.
+    ///
+    /// The rows are ordinary nodes on a panel of their own: presses and moves are the
+    /// tree's, and only the keys stay here, where the menu's own order lives.
     fn menu_event(&mut self, event: &ui_core::Event) -> Option<bool> {
         match event {
-            ui_core::Event::PointerMoved { pos } => {
-                let hovered = self
-                    .menu
-                    .as_ref()
-                    .and_then(|m| m.row_at(*pos, self.frame_now));
-                if let Some(menu) = self.menu.as_mut()
-                    && menu.hovered != hovered
-                {
-                    menu.hovered = hovered;
-                    self.damage.add(menu.rect);
-                    return Some(true);
-                }
-                Some(false)
-            }
-            ui_core::Event::PointerPressed {
-                pos,
-                button: ui_core::PointerButton::Primary,
-            } => {
-                let row = self
-                    .menu
-                    .as_ref()
-                    .and_then(|m| m.enabled_row_at(*pos, self.frame_now));
-                match row {
-                    Some(index) => Some(self.pick_menu_row(index)),
-                    None => Some(self.close_menu()),
-                }
-            }
             // A second right-click closes this menu; the press then opens a fresh one.
             ui_core::Event::PointerPressed {
                 button: ui_core::PointerButton::Secondary,
@@ -5310,148 +5689,613 @@ impl<A: App> AppLoop<A> {
             ui_core::Event::KeyPressed { key } => {
                 let mods = self.modifiers;
                 if !self.caret_owns(*key, mods)
-                    && let Some(index) = self
+                    && let Some(id) = self
                         .menu
                         .as_ref()
-                        .and_then(|menu| menu.accelerator_at(*key, mods))
+                        .and_then(|menu| menu.accelerator_item(*key, mods))
                 {
-                    return Some(self.pick_menu_row(index));
+                    return Some(self.pick_menu_item(id));
                 }
-                if matches!(key, ui_core::Key::Escape) {
-                    return Some(self.close_menu());
+                match key {
+                    ui_core::Key::Escape => Some(self.close_menu()),
+                    // The key that opens a menu closes it, as Escape does.
+                    ui_core::Key::Menu => Some(self.close_menu()),
+                    ui_core::Key::Up => Some(self.menu_move(false)),
+                    ui_core::Key::Down => Some(self.menu_move(true)),
+                    ui_core::Key::Home => Some(self.menu_hover_edge(false)),
+                    ui_core::Key::End => Some(self.menu_hover_edge(true)),
+                    ui_core::Key::Right => Some(self.menu_open_submenu()),
+                    // Left backs out one flyout, then closes the menu when none is open.
+                    ui_core::Key::Left => match self
+                        .menu
+                        .as_mut()
+                        .is_some_and(|menu| menu.close_deepest_submenu())
+                    {
+                        true => {
+                            self.decls_stale = true;
+                            self.dispatched = true;
+                            Some(true)
+                        }
+                        false => Some(self.close_menu()),
+                    },
+                    ui_core::Key::Enter => Some(self.menu_enter()),
+                    _ => None,
                 }
-                None
             }
-            // The menu owns the pointer, not the keyboard: typing still reaches its target.
-            ui_core::Event::PointerReleased { .. } | ui_core::Event::Scroll { .. } => Some(false),
             _ => None,
         }
     }
 
-    /// Draw the open menu over everything else, in the engine's own fallback style.
-    fn paint_menu(&mut self) {
-        let Some(menu) = self.menu.clone() else {
-            return;
-        };
-        let Some(nid) = self
-            .tree
-            .find_by_id(menu.owner)
-            .or_else(|| self.tree.root())
-        else {
-            return;
-        };
-        let style = &self.menu_style;
-        let corners = crate::menu::OpenMenu::corners(style);
-        let (presence, travel) = menu.entrance(self.frame_now);
-        let shift = ui_core::geom::Point::new(0.0, travel);
-        let fade = |colour: ui_core::geom::Color| ui_core::geom::Color {
-            a: colour.a * presence,
-            ..colour
-        };
-        // The shadow is a halo around the rest position, so it stays outside the clip and
-        // simply fades in; only the surface and its rows are cut to the box.
-        self.list.push_shadow(
-            nid,
-            ui_core::draw::ShadowPrim {
-                rect: menu.rect,
-                corners,
-                colour: fade(ui_core::geom::Color::from_rgba8(0, 0, 0, 90)),
-                blur: style.shadow,
-                dy: 3.0,
-                ring: 0.0,
-                bound: None,
-            },
-        );
-        // The surface travels inside the footprint it will keep: that box is the clip, so
-        // the part still on its way in never covers what it hangs over.
-        self.list.push_clip(menu.rect, corners);
-        // A frost reads what is already painted around the menu, so it comes before the
-        // surface that will tint it.
-        if let Some(frost) = style.frost {
-            self.list.push_backdrop(ui_core::draw::BackdropEntry {
-                rect: menu.rect.translate(shift),
-                clip: menu.rect,
-                corners,
-                radius: frost.radius,
-                sigma: frost.sigma,
-                material: frost.material,
-            });
+    /// Move the hover in the deepest open level.
+    fn menu_move(&mut self, forward: bool) -> bool {
+        let moved = self
+            .menu
+            .as_mut()
+            .is_some_and(|menu| menu.move_hover(forward));
+        if moved {
+            self.decls_stale = true;
+            self.dispatched = true;
         }
-        self.list.push_rect(
-            nid,
-            ui_core::draw::RectPrim {
-                rect: menu.rect.translate(shift),
-                radius: corners,
-                fill: fade(style.surface),
-                gradient: None,
-                border: style.border.map(|(colour, width)| (fade(colour), width)),
-                border_gradient: None,
-                notch: None,
-            },
-        );
-        for (i, item) in menu.items.iter().enumerate() {
-            let row = menu.rows[i].translate(shift);
-            if menu.hovered == Some(i) && item.enabled {
-                self.list.push_rect(
-                    nid,
-                    ui_core::draw::RectPrim {
-                        rect: row,
-                        radius: ui_core::geom::Corners::all(style.radius),
-                        fill: fade(style.hover),
-                        gradient: None,
-                        border: None,
-                        border_gradient: None,
-                        notch: None,
-                    },
-                );
-            }
-            self.list.push_text(
-                nid,
-                ui_core::draw::TextPrim {
-                    block: std::sync::Arc::new(style.block(&item.label)),
-                    origin: ui_core::geom::Point::new(
-                        menu.rect.origin.x + style.pad_x,
-                        row.origin.y + (style.row_height - style.font_size * 1.25) * 0.5,
-                    ),
-                    max_width: f32::INFINITY,
-                    layout: None,
-                    height: 0.0,
-                    ink: fade(if item.enabled { style.ink } else { style.muted }),
-                    caret: None,
-                    selection: None,
-                    composing: None,
-                    zoom: None,
-                    shape_scale: 1.0,
-                },
-            );
-            let (Some(shortcut), Some(slot)) = (item.shortcut.as_deref(), menu.shortcuts[i]) else {
-                continue;
-            };
-            let chord_y = row.origin.y + (style.row_height - style.shortcut_size * 1.25) * 0.5;
-            self.list.push_text(
-                nid,
-                ui_core::draw::TextPrim {
-                    block: std::sync::Arc::new(style.shortcut_block(shortcut)),
-                    origin: ui_core::geom::Point::new(slot.origin.x, chord_y),
-                    max_width: f32::INFINITY,
-                    layout: None,
-                    height: 0.0,
-                    ink: fade(if item.enabled {
-                        style.shortcut_ink
-                    } else {
-                        style.muted
-                    }),
-                    caret: None,
-                    selection: None,
-                    composing: None,
-                    zoom: None,
-                    shape_scale: 1.0,
-                },
-            );
-        }
-        self.list.pop_clip();
+        moved
     }
 
+    fn menu_hover_edge(&mut self, last: bool) -> bool {
+        let moved = self
+            .menu
+            .as_mut()
+            .is_some_and(|menu| menu.move_hover_edge(last));
+        if moved {
+            self.decls_stale = true;
+            self.dispatched = true;
+        }
+        moved
+    }
+
+    fn menu_open_submenu(&mut self) -> bool {
+        let Some(menu) = self.menu.as_mut() else {
+            return false;
+        };
+        let opened = menu.open_hovered_submenu();
+        if opened {
+            self.decls_stale = true;
+            self.dispatched = true;
+        }
+        opened
+    }
+
+    fn menu_enter(&mut self) -> bool {
+        let outcome = match self.menu.as_mut() {
+            Some(menu) => menu.enter(),
+            None => return false,
+        };
+        match outcome {
+            crate::menu::MenuEnter::Opened => {
+                self.decls_stale = true;
+                self.dispatched = true;
+                true
+            }
+            crate::menu::MenuEnter::Pick(id) => self.pick_menu_item(id),
+            crate::menu::MenuEnter::Nothing => true,
+        }
+    }
+
+    /// A row of an open menu was activated: pick it, or open the flyout it heads.
+    fn menu_activated(&mut self, id: Id) -> bool {
+        let located = self.menu.as_ref().and_then(|menu| menu.locate(id));
+        let Some((depth, index)) = located else {
+            return false;
+        };
+        let Some((submenu, pick)) = self.menu.as_mut().and_then(|menu| {
+            let level = menu.level_mut(depth)?;
+            let item = level.items.get(index)?;
+            Some((
+                matches!(item.kind, ui_core::menu::MenuRow::Submenu(_)),
+                item.id,
+            ))
+        }) else {
+            return false;
+        };
+        if !submenu {
+            return self.pick_menu_item(pick);
+        }
+        let opened = self
+            .menu
+            .as_mut()
+            .and_then(|menu| menu.level_mut(depth))
+            .is_some_and(|level| level.open_row(index));
+        if opened {
+            self.decls_stale = true;
+            self.dispatched = true;
+        }
+        true
+    }
+
+    /// A menu panel's surface was taken back: close that flyout, or the whole menu.
+    fn menu_dismissed(&mut self, id: Id) -> bool {
+        let Some(depth) = self
+            .menu
+            .as_ref()
+            .and_then(|menu| (0..=menu.depth()).find(|depth| crate::menu::Menu::panel_id(*depth) == id))
+        else {
+            return false;
+        };
+        if depth == 0 {
+            return self.close_menu();
+        }
+        if let Some(level) = self
+            .menu
+            .as_mut()
+            .and_then(|menu| menu.level_mut(depth - 1))
+            && level.child.take().is_some()
+        {
+            self.decls_stale = true;
+            self.dispatched = true;
+        }
+        true
+    }
+
+    /// The level a press asks to close: the popup stack is one menu, so only a press
+    /// outside every open panel closes it all.
+    fn menu_dismissal(&self, at: ui_core::geom::Point, depth: usize) -> Option<Id> {
+        let contains = |level: usize| {
+            self.tree
+                .find_by_id(crate::menu::Menu::panel_id(level))
+                .and_then(|nid| self.tree.get(nid))
+                .is_some_and(|node| node.visual_rect().contains(at))
+        };
+        match (0..=depth).rev().find(|level| contains(*level)) {
+            // The press is on the deepest flyout: it is for that level's rows.
+            Some(level) if level == depth => None,
+            // A flyout hangs over its parent: pressing the parent closes only the flyout.
+            Some(level) => Some(crate::menu::Menu::panel_id(level + 1)),
+            None => Some(crate::menu::Menu::panel_id(0)),
+        }
+    }
+
+    /// Open the focused node's declared menu, or the hovered node's when nothing is
+    /// focused, anchored at that node's bottom-left.
+    fn open_menu_for_key(&mut self) -> bool {
+        let Some(start) = self.focused.or(self.hovered) else {
+            return false;
+        };
+        let mut current = self.tree.find_by_id(start);
+        while let Some(nid) = current {
+            let Some(node) = self.tree.get(nid) else {
+                break;
+            };
+            if let Some(items) = node
+                .data
+                .params()
+                .map(|params| &params.menu)
+                .filter(|menu| !menu.is_empty())
+            {
+                let owner = node.id;
+                let at = ui_core::geom::Point::new(node.rect.origin.x, node.rect.max_y());
+                let items = items.clone();
+                return self.show_menu(owner, at, items);
+            }
+            current = node.parent;
+        }
+        false
+    }
+}
+
+/// The room one line of text needs in its box, as the type ramp draws it.
+const LINE_HINT: f32 = 1.4;
+
+/// One menu level: its rows, and the flyout they opened.
+fn menu_level_decl(
+    cx: &mut ui_core::cx::Cx<'_>,
+    style: &crate::menu::MenuStyle,
+    level: &mut crate::menu::Menu,
+    depth: usize,
+    width_of: &mut impl FnMut(&ui_core::text::TextBlock) -> f32,
+) -> Decl {
+    // The rows are nodes now, so the pointer's verdict is the build's to read; the model
+    // treats it as a move only when it differs from the last read.
+    let hovered_row = (0..level.items.len()).find(|index| {
+        level.hoverable(*index)
+            && crate::WidgetState::of(cx, crate::menu::Menu::row_id(depth, *index)).hovered
+    });
+    level.pointer_over(hovered_row);
+    let items = level.items.clone();
+    // The panel is as wide as its widest row, measured this frame: a menu that outlives a
+    // font load must not keep the metrics it was opened with.
+    let width = crate::menu::level_width(style, &items, width_of);
+    let hovered = level.hovered;
+    let check = level.has_check().then(|| crate::menu::check_column(style));
+    let mut rows = Vec::with_capacity(items.len());
+    let mut index = 0;
+    while index < items.len() {
+        let end = crate::menu::strip_end(&items, index);
+        if end > index {
+            rows.push(menu_strip(
+                depth,
+                &items[index..end],
+                index,
+                hovered,
+                style,
+                width,
+            ));
+            index = end;
+            continue;
+        }
+        let item = &items[index];
+        let id = crate::menu::Menu::row_id(depth, index);
+        let hovered_item = hovered == Some(index);
+        index += 1;
+        rows.push(match item.kind {
+            ui_core::menu::MenuRow::Separator => menu_separator(id, style),
+            _ => {
+                // What the row leaves for its label: the panel can be capped by the style, and
+                // a label that took more would push the chord past the panel's edge.
+                let label_width = (width
+                    - 2.0 * style.row_inset
+                    - 2.0 * style.pad_x
+                    - check.unwrap_or(0.0)
+                    - crate::menu::trailing_width(style, item, width_of))
+                    .max(0.0);
+                menu_row(id, item, hovered_item, check, style, label_width)
+            }
+        });
+    }
+    let mut panel = Decl::container(crate::menu::Menu::panel_id(depth), NodeKind::Column)
+        .size(SizeClass {
+            width: AxisSize::fixed(width),
+            height: AxisSize::hug(0.0, f32::INFINITY),
+            grow_x: Grow::No,
+            grow_y: Grow::No,
+        })
+        .padding(Insets::new(0.0, style.pad_y, 0.0, style.pad_y))
+        .background(style.surface, ui_core::geom::Corners::all(style.radius))
+        // The style names the falloff; the lift follows it as MD3's own elevation does.
+        .shadow(ui_core::tree::ShadowSpec::black(
+            style.shadow,
+            0.18,
+            style.shadow * 0.25,
+        ))
+        .children(rows);
+    if let Some((colour, width)) = style.border {
+        panel = panel.border(colour, width);
+    }
+    if let Some(frost) = style.frost {
+        panel = panel.backdrop_blur(frost.sigma);
+    }
+    // The root hangs off the point the press named; a flyout off the row that heads it,
+    // and the platform is the one that decides whether either fits on the output.
+    let anchor = match (depth, level.header) {
+        (0, _) => Anchor::Point(level.at),
+        (_, Some(index)) => Anchor::Node(crate::menu::Menu::row_id(depth - 1, index)),
+        (_, None) => Anchor::Point(level.at),
+    };
+    let side = match depth {
+        0 => Side::Below,
+        _ => Side::Right,
+    };
+    panel = panel.overlay(OverlayPlacement {
+        anchor,
+        side,
+        align: OverlayAlign::Start,
+        offset: 0.0,
+        flip: true,
+        match_anchor_width: false,
+        match_anchor_height: false,
+        min_width: 0.0,
+        presentation: Presentation::Platform,
+    });
+    if depth == 0 {
+        // The panel travels half its height up from below the pointer and fades in. Its rows
+        // are known before layout, so the height the entrance starts from is too.
+        let height = crate::menu::level_height(style, &items) + 2.0 * style.pad_y;
+        // The panel takes no sense: the menu owns its own keys and its own light dismiss, and
+        // a focusable overlay would move the page's focus into a panel with no stops.
+        panel = panel.enter(ui_core::tree::Presence::slide(
+            crate::menu::ENTRANCE,
+            0.0,
+            ui_core::geom::Point::new(0.0, -height * 0.5),
+        ));
+    }
+    if let Some(child) = level.child.as_mut() {
+        panel = panel.child(menu_level_decl(cx, style, child, depth + 1, width_of));
+    }
+    panel
+}
+
+/// One command row: its mark column, the label (and a disabled reason), and its chord.
+fn menu_row(
+    id: Id,
+    item: &ui_core::menu::MenuItem,
+    hovered: bool,
+    check: Option<f32>,
+    style: &crate::menu::MenuStyle,
+    label_width: f32,
+) -> Decl {
+    let ink = match item.enabled {
+        true => style.ink,
+        false => style.muted,
+    };
+    let mut row = Decl::container(id, NodeKind::Row)
+        .size(SizeClass {
+            width: AxisSize::fill(0.0, f32::INFINITY),
+            height: AxisSize::fixed(crate::menu::row_height(style, item)),
+            grow_x: Grow::Yes,
+            grow_y: Grow::No,
+        })
+        .margin(Insets::new(style.row_inset, 0.0, style.row_inset, 0.0))
+        .padding(Insets::new(style.pad_x, 0.0, style.pad_x, 0.0))
+        .cross_align(0.0)
+        .cross_pos(0.5);
+    if item.enabled {
+        row = row
+            .sense(ui_core::Sense::HOVER | ui_core::Sense::CLICK)
+            .cursor(ui_core::CursorShape::PointingHand);
+    }
+    if hovered && item.enabled {
+        row = row.background(style.hover, ui_core::geom::Corners::all(style.radius));
+    }
+    if let Some(width) = check {
+        row = row.child(menu_check(id.with("check"), item.checked, width, ink, style));
+    }
+    let mut label = Decl::container(id.with("label"), NodeKind::Column)
+        .size(SizeClass {
+            width: AxisSize::fill(0.0, f32::INFINITY),
+            height: AxisSize::hug(0.0, f32::INFINITY),
+            grow_x: Grow::Yes,
+            grow_y: Grow::No,
+        })
+        .cross_align(0.0)
+        .gap(crate::menu::REASON_GAP)
+        .child(menu_text(
+            id.with("text"),
+            style.label_block(&item.label, item.is_default),
+            ink,
+            label_width,
+        ));
+    if let Some(reason) = crate::menu::reason_of(item) {
+        label = label.child(menu_text(
+            id.with("reason"),
+            style.reason_block(reason),
+            style.muted,
+            label_width,
+        ));
+    }
+    row = row.child(label);
+    if let Some(shortcut) = item.shortcut.as_deref() {
+        let chord_ink = match item.enabled {
+            true => style.shortcut_ink,
+            false => style.muted,
+        };
+        row = row.child(
+            menu_text(
+                id.with("shortcut"),
+                style.shortcut_block(shortcut),
+                chord_ink,
+                f32::INFINITY,
+            )
+            .margin(Insets::new(style.shortcut_gap, 0.0, 0.0, 0.0)),
+        );
+    }
+    if matches!(item.kind, ui_core::menu::MenuRow::Submenu(_)) {
+        // The mark is the only sign the row heads a cascade; without it a header reads as
+        // a command that does nothing when pressed.
+        let ink = match item.enabled {
+            true => style.shortcut_ink,
+            false => style.muted,
+        };
+        row = row.child(
+            menu_text(
+                id.with("chevron"),
+                style.chevron_block(),
+                ink,
+                f32::INFINITY,
+            )
+            .margin(Insets::new(style.shortcut_gap, 0.0, 0.0, 0.0)),
+        );
+    }
+    row
+}
+
+/// The strip of quick actions: equal cells of an icon over its label, side by side.
+fn menu_strip(
+    depth: usize,
+    items: &[ui_core::menu::MenuItem],
+    start: usize,
+    hovered: Option<usize>,
+    style: &crate::menu::MenuStyle,
+    width: f32,
+) -> Decl {
+    // Cells share the panel's width, so a label's room is its share minus its own padding.
+    let cell = ((width - 2.0 * style.row_inset) / items.len() as f32).max(0.0);
+    let label_width = (cell - 2.0 * style.compact_pad_x).max(0.0);
+    let cells: Vec<Decl> = items
+        .iter()
+        .enumerate()
+        .map(|(offset, item)| {
+            let index = start + offset;
+            menu_strip_cell(
+                crate::menu::Menu::row_id(depth, index),
+                item,
+                hovered == Some(index),
+                style,
+                label_width,
+            )
+        })
+        .collect();
+    Decl::container(
+        crate::menu::Menu::panel_id(depth).with("strip"),
+        NodeKind::Row,
+    )
+    .size(SizeClass {
+        width: AxisSize::fill(0.0, f32::INFINITY),
+        height: AxisSize::fixed(style.compact_height),
+        grow_x: Grow::Yes,
+        grow_y: Grow::No,
+    })
+    .margin(Insets::new(style.row_inset, 0.0, style.row_inset, 0.0))
+    .children(cells)
+}
+
+/// One strip cell: an icon over its label, centred in the share of the strip it owns.
+fn menu_strip_cell(
+    id: Id,
+    item: &ui_core::menu::MenuItem,
+    hovered: bool,
+    style: &crate::menu::MenuStyle,
+    label_width: f32,
+) -> Decl {
+    let ink = match item.enabled {
+        true => style.ink,
+        false => style.muted,
+    };
+    let mut cell = Decl::container(id, NodeKind::Stack)
+        .size(SizeClass {
+            width: AxisSize::fill(0.0, f32::INFINITY),
+            height: AxisSize::fixed(style.compact_height),
+            // A zero basis is what makes the cells equal; a content basis would start each
+            // at its own label's width and grow by the same slack from there.
+            grow_x: Grow::Split(1),
+            grow_y: Grow::No,
+        })
+        .stack_align(OverlayAlign::Center);
+    if item.enabled {
+        cell = cell
+            .sense(ui_core::Sense::HOVER | ui_core::Sense::CLICK)
+            .cursor(ui_core::CursorShape::PointingHand);
+    }
+    if hovered && item.enabled {
+        cell = cell.background(style.hover, ui_core::geom::Corners::all(style.radius));
+    }
+    let mut body = Decl::container(id.with("body"), NodeKind::Column)
+        .size(SizeClass {
+            width: AxisSize::hug(0.0, label_width.max(style.compact_icon_size)),
+            height: AxisSize::hug(0.0, f32::INFINITY),
+            grow_x: Grow::No,
+            grow_y: Grow::No,
+        })
+        .cross_align(0.0)
+        .cross_pos(0.5)
+        .gap(style.compact_gap);
+    if let Some(icon) = item.icon {
+        body = body.child(menu_text(
+            id.with("icon"),
+            style.icon_block(icon),
+            ink,
+            style.compact_icon_size,
+        ));
+    }
+    body = body.child(menu_text(
+        id.with("label"),
+        style.compact_label_block(&item.label, item.is_default),
+        ink,
+        label_width,
+    ));
+    cell.child(body)
+}
+
+/// The leading column a row's mark sits in, reserved even when that row carries none.
+fn menu_check(
+    id: Id,
+    checked: bool,
+    width: f32,
+    ink: Color,
+    style: &crate::menu::MenuStyle,
+) -> Decl {
+    let mut slot = Decl::container(id, NodeKind::Row)
+        .size(SizeClass::fixed(width, style.row_height))
+        .cross_align(0.0)
+        .cross_pos(0.5);
+    if checked {
+        slot = slot.child(menu_text(
+            id.with("mark"),
+            style.check_block(),
+            ink,
+            width,
+        ));
+    }
+    slot
+}
+
+/// A divider is a hairline inset from both edges, not a row the pointer can aim at.
+fn menu_separator(id: Id, style: &crate::menu::MenuStyle) -> Decl {
+    let inset = (crate::menu::SEPARATOR_HEIGHT - 1.0) * 0.5;
+    let line = Decl::container(id.with("line"), NodeKind::Box)
+        .size(SizeClass {
+            width: AxisSize::fill(0.0, f32::INFINITY),
+            height: AxisSize::fixed(1.0),
+            grow_x: Grow::Yes,
+            grow_y: Grow::No,
+        })
+        .background(style.muted, ui_core::geom::Corners::ZERO);
+    Decl::container(id, NodeKind::Column)
+        .size(SizeClass {
+            width: AxisSize::fill(0.0, f32::INFINITY),
+            height: AxisSize::fixed(crate::menu::SEPARATOR_HEIGHT),
+            grow_x: Grow::Yes,
+            grow_y: Grow::No,
+        })
+        .padding(Insets::new(style.pad_x, inset, style.pad_x, inset))
+        .cross_align(1.0)
+        .child(line)
+}
+
+/// One shaped line of menu text.
+///
+/// The size class is the text's own: a plain container hugs at zero, and a nowrap line is
+/// capped by that hint, so the node would measure and place at no width at all. `max_width`
+/// is the room the line owns; a line past it ends with an ellipsis.
+fn menu_text(
+    id: Id,
+    mut block: ui_core::text::TextBlock,
+    ink: Color,
+    max_width: f32,
+) -> Decl {
+    block.max_lines = Some(1);
+    let size = block.runs.first().map_or(0.0, |run| run.style.size);
+    let mut decl = Decl::container(id, NodeKind::Text).size(SizeClass {
+        width: AxisSize::hug(0.0, max_width),
+        height: AxisSize::hug(size, size * LINE_HINT),
+        grow_x: Grow::No,
+        grow_y: Grow::No,
+    });
+    decl.data = NodeData::Text {
+        block: std::sync::Arc::new(block),
+        ink,
+        caret: None,
+        selection: None,
+        composing: None,
+        nowrap: true,
+    };
+    decl
+}
+
+/// Put the open menu on the app's own root, the one node the window always has.
+///
+/// A wrapper of the engine's own would read as an ordinary parent and drop the root's
+/// fill-the-window sizing, so the panel joins the root's children and leaves the flow at
+/// once through its overlay placement.
+fn with_menu(app: Decl, menu: Option<Decl>) -> Decl {
+    match menu {
+        Some(panel) => app.child(panel),
+        None => app,
+    }
+}
+
+/// Declare the open menu, leaving the pointer's verdict recorded on it as the rows build.
+fn menu_panel_decl(
+    cx: &mut ui_core::cx::Cx<'_>,
+    menu: &mut Option<crate::menu::Menu>,
+    style: &crate::menu::MenuStyle,
+    text: &Rc<RefCell<TextPass>>,
+) -> Option<Decl> {
+    let mut open = menu.take()?;
+    let mut width_of =
+        |block: &ui_core::text::TextBlock| text.borrow_mut().measure(block, f32::INFINITY).w;
+    let decl = menu_level_decl(cx, style, &mut open, 0, &mut width_of);
+    *menu = Some(open);
+    Some(decl)
+}
+
+impl<A: App> AppLoop<A> {
     /// The nearest focused node that wants raw chords, if any.
     fn key_capture_owner(&self) -> Option<Id> {
         let mut cur = self.focused.and_then(|id| self.tree.find_by_id(id));
@@ -5561,17 +6405,25 @@ impl<A: App> AppLoop<A> {
         if let Some(result) = self.extend_readonly_selection(id) {
             return Some(result);
         }
+        // A paste with no caret belongs to whoever the app focused: the payload comes back
+        // as `Change::Paste`. Latest request wins, so a read that never answers cannot
+        // misroute a later paste.
+        if id == S::PASTE {
+            self.paste_target = match self.editing {
+                Some(_) => None,
+                // The app's own root, not the surface wrapper the menu hangs beside.
+                None => self.focused.or(self.app_root),
+            };
+            self.clipboard
+                .push(crate::clipboard::ClipboardCommand::RequestPaste {
+                    kind: crate::clipboard::ClipboardKind::Selection,
+                });
+            return Some((self.editing.is_some(), false));
+        }
         let (owner, sel) = self.editing?;
         match id {
             S::UNDO => self.step_history(owner, false),
             S::REDO => self.step_history(owner, true),
-            S::PASTE => {
-                self.clipboard
-                    .push(crate::clipboard::ClipboardCommand::RequestPaste {
-                        kind: crate::clipboard::ClipboardKind::Selection,
-                    });
-                Some((true, false))
-            }
             S::DELETE_FORWARD => {
                 let value = self.text_input_value(owner)?;
                 let range = if sel.is_collapsed() {
@@ -5767,7 +6619,18 @@ impl<A: App> AppLoop<A> {
     /// Feed one input event; returns true when a repaint is needed.
     ///
     /// Hit testing uses the last laid-out frame, because input arrives between frames.
+    /// Hold or release this surface's input, as a modal dialog of it does.
+    ///
+    /// A blocked surface still builds frames: only the events are dropped, so it stays
+    /// painted behind the dialog instead of freezing on its last frame.
+    pub fn set_input_blocked(&mut self, blocked: bool) {
+        self.input_blocked = blocked;
+    }
+
     pub fn dispatch(&mut self, event: ui_core::Event) -> bool {
+        if self.input_blocked {
+            return false;
+        }
         let before = self.editing;
         let repaint = self.dispatch_event(event);
         // Events arrive in bursts between frames, so a caret this one moved into a formula
@@ -5849,11 +6712,26 @@ impl<A: App> AppLoop<A> {
         {
             return false;
         }
-        // An open menu owns the pointer until it closes: a pick, or a dismissal.
+        // An open menu keeps its keys, and its rows are ordinary nodes: a press or a move
+        // reaches the tree, which is what routes it back as an activation of that row.
         if self.menu.is_some()
             && let Some(handled) = self.menu_event(&event)
         {
             return handled || before != (self.hovered, self.pressed, self.focused);
+        }
+        // The menu key opens the focused (or hovered) node's declared menu. With none
+        // declared the key falls through to the app's bindings, the same way a secondary
+        // tap without a declared menu is the app's to answer.
+        if self.menu.is_none()
+            && matches!(
+                &event,
+                ui_core::Event::KeyPressed {
+                    key: ui_core::Key::Menu
+                }
+            )
+            && self.open_menu_for_key()
+        {
+            return true;
         }
         // A node that captures keys turns them into chords instead of commands: a shortcut
         // editor must see the very chord it is about to bind.
@@ -5944,14 +6822,20 @@ impl<A: App> AppLoop<A> {
                 self.pan_candidate = None;
                 self.wheel_lock = None;
                 if *button == ui_core::PointerButton::Primary {
+                    // Where this press stands in its burst, decided before anything it means.
+                    self.pressed_clicks =
+                        self.click_burst(ui_core::PointerButton::Primary, *pos);
                     // A press outside an open popup asks it to close: the light dismiss every
                     // flyout has, judged here because only the engine knows both rectangles.
-                    self.dismissed = self.tree.popup_root().and_then(|nid| {
-                        self.tree
-                            .get(nid)
-                            .filter(|n| !n.visual_rect().contains(*pos))
-                            .map(|n| n.id)
-                    });
+                    self.dismissed = match self.menu.as_ref() {
+                        Some(menu) => self.menu_dismissal(*pos, menu.depth()),
+                        None => self.tree.popup_root().and_then(|nid| {
+                            self.tree
+                                .get(nid)
+                                .filter(|n| !n.visual_rect().contains(*pos))
+                                .map(|n| n.id)
+                        }),
+                    };
                     if self.dismissed.is_some() {
                         // The tap that dismisses belongs to the dismissal, as a light-dismiss
                         // layer takes it: it reaches nothing underneath and leaves no click.
@@ -5996,7 +6880,12 @@ impl<A: App> AppLoop<A> {
                             } else {
                                 self.selection_drag = None;
                                 requested |=
-                                    self.begin_selection(node, *pos, self.modifiers.shift);
+                                    self.begin_selection(
+                                        node,
+                                        *pos,
+                                        self.modifiers.shift,
+                                        self.pressed_clicks,
+                                    );
                             }
                             self.pressed = None;
                             self.press_at = None;
@@ -6082,7 +6971,7 @@ impl<A: App> AppLoop<A> {
                             }
                         }
                         if let Some(on) = self.drag_owner() {
-                            self.drag.press(on, *pos);
+                            self.drag.press(on, *pos, ui_core::PointerButton::Primary);
                         }
                     }
                 } else if *button == ui_core::PointerButton::Secondary {
@@ -6124,19 +7013,65 @@ impl<A: App> AppLoop<A> {
                             self.ancestor_with_sense(nid, ui_core::Sense::SECONDARY)
                         })
                     });
-                    match owner {
-                        Some(node) => {
+                    // The secondary button starts a drag on a node that declared a payload
+                    // even when the node never asked to hear the button: a file manager's
+                    // right drag is the same gesture as its left drag, with the menu the
+                    // tap would open held back until the release says it was not a drag.
+                    // A gesture-only `DRAG` node is the pointer's on the left button;
+                    // right-dragging a slider must not change its value.
+                    let drag = hit.and_then(|id| self.drag_owner_from(id));
+                    let transfer = drag.filter(|on| self.drag_has_payload(*on));
+                    // With no declared menu the app owns the rows, so it hears where the
+                    // tap landed; a node that declared one keeps the engine's menu. Either
+                    // way the answer waits for the release: a right drag must open nothing.
+                    let request = self.menu_for(*pos).is_none().then_some(hit).flatten();
+                    match (owner, transfer) {
+                        (Some(node), _) => {
+                            let clicks =
+                                self.click_burst(ui_core::PointerButton::Secondary, *pos);
                             self.secondary = Some(SecondaryPress {
-                                node,
+                                node: Some(node),
                                 at: *pos,
                                 since: self.clock.live(),
+                                clicks,
+                                request,
                             });
+                            if let Some(on) = drag {
+                                self.drag.press(
+                                    on,
+                                    *pos,
+                                    ui_core::PointerButton::Secondary,
+                                );
+                            }
                             requested |= self.app_changed(
                                 node,
-                                ui_core::change::Change::Secondary { down: true },
+                                ui_core::change::Change::Secondary {
+                                    down: true,
+                                    clicks,
+                                },
                             );
                         }
-                        None => requested |= self.open_menu(*pos),
+                        (None, Some(on)) => {
+                            self.secondary = Some(SecondaryPress {
+                                node: None,
+                                at: *pos,
+                                since: self.clock.live(),
+                                clicks: 0,
+                                request,
+                            });
+                            self.drag.press(on, *pos, ui_core::PointerButton::Secondary);
+                        }
+                        (None, None) => {
+                            // Nothing can travel and nothing belongs to the button, so the
+                            // press has no tap to wait for: the app or the menu answers now.
+                            requested |= match request {
+                                Some(node) => self.app_changed(
+                                    node,
+                                    ui_core::change::Change::MenuRequested(*pos),
+                                ),
+                                None => self.open_menu(*pos),
+                            };
+                        }
                     }
                 } else if *button == ui_core::PointerButton::Middle {
                     // The engine has no gesture of its own on this button: a node that
@@ -6149,10 +7084,14 @@ impl<A: App> AppLoop<A> {
                         })
                     });
                     if let Some(node) = owner {
-                        self.middle = Some(node);
+                        let clicks = self.click_burst(ui_core::PointerButton::Middle, *pos);
+                        self.middle = Some((node, clicks));
                         requested |= self.app_changed(
                             node,
-                            ui_core::change::Change::Middle { down: true },
+                            ui_core::change::Change::Middle {
+                                down: true,
+                                clicks,
+                            },
                         );
                     }
                 }
@@ -6198,7 +7137,7 @@ impl<A: App> AppLoop<A> {
                     // The drop target is what is under the pointer *now*, so it must be
                     // hit tested before the press state is cleared.
                     let target = self.drop_target();
-                    match self.drag.release(target) {
+                    match self.drag.release(target, *pos) {
                         Some(ev) => requested |= self.report_drag(self.in_node_space(ev)),
                         // No drag was live, so this was a click: report its identity.
                         None => {
@@ -6219,28 +7158,53 @@ impl<A: App> AppLoop<A> {
                                     .is_some();
                                 if subscribes {
                                     self.clicked = Some(id);
+                                    self.clicks = self.pressed_clicks;
                                 }
                             }
                         }
                     }
                 } else if *button == ui_core::PointerButton::Secondary {
+                    // A drag that travelled is a drop, not a tap: it must land on the
+                    // target under the pointer and must not also open the menu the tap
+                    // would have.
+                    let dragging = self.drag.is_dragging();
+                    let target = if dragging { self.drop_target() } else { None };
+                    if let Some(ev) = self.drag.release(target, *pos) {
+                        requested |= self.report_drag(self.in_node_space(ev));
+                    }
                     // The release ends a reported press and decides what the button meant:
                     // a tap keeps the menu the press withheld, a hold keeps only the report.
                     if let Some(press) = self.secondary.take() {
-                        requested |= self.app_changed(
-                            press.node,
-                            ui_core::change::Change::Secondary { down: false },
-                        );
-                        if self.clock.live() - press.since < SECONDARY_TAP {
-                            requested |= self.open_menu(press.at);
+                        if let Some(node) = press.node {
+                            requested |= self.app_changed(
+                                node,
+                                ui_core::change::Change::Secondary {
+                                    down: false,
+                                    clicks: press.clicks,
+                                },
+                            );
+                        }
+                        if !dragging && self.clock.live() - press.since < SECONDARY_TAP {
+                            requested |= match press.request {
+                                Some(node) => self.app_changed(
+                                    node,
+                                    ui_core::change::Change::MenuRequested(press.at),
+                                ),
+                                None => self.open_menu(press.at),
+                            };
                         }
                     }
                 } else if *button == ui_core::PointerButton::Middle {
                     // The node hears the release wherever the pointer has gone, as the
                     // secondary button does: the gesture is the node's, not the point's.
-                    if let Some(node) = self.middle.take() {
-                        requested |=
-                            self.app_changed(node, ui_core::change::Change::Middle { down: false });
+                    if let Some((node, clicks)) = self.middle.take() {
+                        requested |= self.app_changed(
+                            node,
+                            ui_core::change::Change::Middle {
+                                down: false,
+                                clicks,
+                            },
+                        );
                     }
                 }
             }
@@ -6257,6 +7221,9 @@ impl<A: App> AppLoop<A> {
                         self.pressed = None;
                         self.press_at = None;
                         self.pressed_path.clear();
+                        // A cancelled drag is not a tap: the menu its press withheld stays
+                        // closed, even though the button is still down.
+                        self.secondary = None;
                         self.end_splat();
                     }
                     None => self.focused = None,
@@ -6313,24 +7280,39 @@ impl<A: App> AppLoop<A> {
                 }
             }
             // A paste is one edit over the selection, exactly like typing one character.
-            ui_core::Event::Paste(text) => {
-                self.goal_x = None;
-                if let Some((owner, sel)) = self.editing
-                    && let Some(value) = self.text_input_value(owner)
-                {
-                    // A one-line input has nowhere to put a break; a multiline one
-                    // keeps it, normalised so the buffer holds only LF.
-                    let text = if self.input_is_multiline(owner) {
-                        text.replace("\r\n", "\n").replace('\r', "\n")
-                    } else {
-                        text.replace("\r\n", " ").replace(['\r', '\n'], " ")
-                    };
-                    if let Some(applied) =
-                        self.edit_structural(owner, &value, sel.range(), &text, false)
-                    {
-                        edited = true;
-                        requested |= applied;
+            ui_core::Event::Paste(content) => {
+                match content.text().filter(|_| self.editing.is_some()) {
+                    Some(text) => {
+                        self.goal_x = None;
+                        if let Some((owner, sel)) = self.editing
+                            && let Some(value) = self.text_input_value(owner)
+                        {
+                            // A one-line input has nowhere to put a break; a multiline one
+                            // keeps it, normalised so the buffer holds only LF.
+                            let text = if self.input_is_multiline(owner) {
+                                text.replace("\r\n", "\n").replace('\r', "\n")
+                            } else {
+                                text.replace("\r\n", " ").replace(['\r', '\n'], " ")
+                            };
+                            if let Some(applied) =
+                                self.edit_structural(owner, &value, sel.range(), &text, false)
+                            {
+                                edited = true;
+                                requested |= applied;
+                            }
+                        }
                     }
+                    // No caret took it, so the whole payload belongs to the app: a file
+                    // list has no text for an editor to insert.
+                    None => match self.paste_target.take() {
+                        Some(target) => {
+                            requested |= self.app_changed(
+                                target,
+                                ui_core::change::Change::Paste(content.clone()),
+                            );
+                        }
+                        None => return false,
+                    },
                 }
             }
             // The composition lives in the engine: the app's buffer stays committed-only.
@@ -7091,6 +8073,38 @@ impl<A: App> AppLoop<A> {
                 offset.y = offset.y.clamp(0.0, (extent.h - viewport.h).max(0.0));
             }
         }
+    }
+
+    /// Whether layout left any scroller with a different content box or viewport than the
+    /// one the build read.
+    ///
+    /// A windowed list declares the rows its scroller's viewport reaches, and it reads that
+    /// viewport before layout runs. A frame that grows or shrinks one — a short directory
+    /// replaced by a long one behind a scroller that hugs its content, say — has declared
+    /// the rows of the box it used to be, so it owes the frame that windows again.
+    fn scroller_boxes_moved(&mut self) -> bool {
+        let mut now: FastMap<Id, (Size, Size)> = FastMap::default();
+        let mut moved = false;
+        for nid in self.tree.walk() {
+            let Some(node) = self.tree.get(nid) else {
+                continue;
+            };
+            if !node.sense.contains(ui_core::Sense::SCROLL_OWNED) {
+                continue;
+            }
+            let pad = node.box_model.padding;
+            let box_now = (
+                node.scroll_extent.unwrap_or(Size::ZERO),
+                Size::new(
+                    (node.rect.size.w - pad.left - pad.right).max(0.0),
+                    (node.rect.size.h - pad.top - pad.bottom).max(0.0),
+                ),
+            );
+            moved |= self.scroller_boxes.get(&node.id) != Some(&box_now);
+            now.insert(node.id, box_now);
+        }
+        self.scroller_boxes = now;
+        moved
     }
 
     /// The scrollbar under `pos`: its scroller, the axis it drags, and that scroller's
@@ -8044,12 +9058,18 @@ impl<A: App> AppLoop<A> {
             Some(self.tree.get(nid)?.visual_rect().origin)
         };
         match ev {
-            ui_core::DragEvent::Started { on, from, local } => {
+            ui_core::DragEvent::Started {
+                on,
+                from,
+                local,
+                button,
+            } => {
                 let o = origin(on).unwrap_or(ui_core::geom::Point::new(0.0, 0.0));
                 ui_core::DragEvent::Started {
                     on,
                     from,
                     local: ui_core::geom::Point::new(local.x - o.x, local.y - o.y),
+                    button,
                 }
             }
             ui_core::DragEvent::Moved {
@@ -8071,8 +9091,12 @@ impl<A: App> AppLoop<A> {
     }
 
     fn drag_owner(&self) -> Option<Id> {
-        let pressed = self.pressed?;
-        let nid = self.tree.find_by_id(pressed)?;
+        self.drag_owner_from(self.pressed?)
+    }
+
+    /// The nearest ancestor-or-self of `start` that declared [`Sense::DRAG`].
+    fn drag_owner_from(&self, start: Id) -> Option<Id> {
+        let nid = self.tree.find_by_id(start)?;
         // The declaration is the only source: no hook can widen or veto it.
         self.ancestor_matching(nid, |id| {
             self.tree
@@ -8081,6 +9105,14 @@ impl<A: App> AppLoop<A> {
                 .map(|n| n.sense.contains(ui_core::Sense::DRAG))
                 .unwrap_or(false)
         })
+    }
+
+    /// Whether the drag owner `on` carries data, as opposed to a gesture-only drag.
+    fn drag_has_payload(&self, on: Id) -> bool {
+        self.tree
+            .find_by_id(on)
+            .and_then(|nid| self.tree.get(nid))
+            .is_some_and(|n| n.drag.is_some())
     }
 
     /// Walk from `start` up to the root, returning the first id the predicate accepts.
@@ -8537,7 +9569,7 @@ impl<A: App> AppLoop<A> {
             .platform_panels()
             .iter()
             .filter(|panel| self.panel_presentation.get(&panel.node) == Some(&true))
-            .copied()
+            .cloned()
             .collect();
         if panels.is_empty() {
             return;
@@ -8553,6 +9585,7 @@ impl<A: App> AppLoop<A> {
             });
             std::mem::swap(&mut list, &mut self.list);
             let mut deferred = Vec::new();
+            self.painting_panel = true;
             self.paint_node(panel.node, true, &mut deferred);
             let mut next = 0usize;
             while let Some(nid) = deferred.get(next).copied() {
@@ -8562,6 +9595,7 @@ impl<A: App> AppLoop<A> {
                 }
                 self.paint_node(nid, false, &mut deferred);
             }
+            self.painting_panel = false;
             std::mem::swap(&mut list, &mut self.list);
             let mut resolved = ui_core::draw::DrawList::new(canvas);
             self.text
@@ -8736,18 +9770,39 @@ impl<A: App> AppLoop<A> {
         let visual = node.visual_rect();
         // Emitted before the fill: the blur must read the backdrop, not this node's own box.
         if let Some(blur) = node.data.params().and_then(|p| p.backdrop_blur) {
-            let entry = ui_core::draw::BackdropEntry {
-                rect: visual,
-                // The frost is cut by the same clip as the box it shades: a panel sliding
-                // inside its window must not blur the page it hangs over.
-                clip: node.mask,
-                corners: node_corners(node),
-                radius: blur.radius,
-                sigma: blur.sigma,
-                material: blur.material,
-            };
-            self.list.push_backdrop(entry);
-            self.backdrops_now.insert(node.id, entry);
+            // A panel is shown on a surface of its own: the window is not behind it, so a
+            // material that samples a backdrop paints the stand-in it names instead of
+            // shading nothing and leaving the panel see-through.
+            match (self.painting_panel, blur.material.fallback()) {
+                (true, Some(fill)) => {
+                    self.list.push_rect(
+                        nid,
+                        RectPrim {
+                            rect: visual,
+                            radius: node_corners(node),
+                            fill,
+                            gradient: None,
+                            border: None,
+                            border_gradient: None,
+                            notch: None,
+                        },
+                    );
+                }
+                _ => {
+                    let entry = ui_core::draw::BackdropEntry {
+                        rect: visual,
+                        // The frost is cut by the same clip as the box it shades: a panel
+                        // sliding inside its window must not blur the page it hangs over.
+                        clip: node.mask,
+                        corners: node_corners(node),
+                        radius: blur.radius,
+                        sigma: blur.sigma,
+                        material: blur.material,
+                    };
+                    self.list.push_backdrop(entry);
+                    self.backdrops_now.insert(node.id, entry);
+                }
+            }
         }
         let corners = node_corners(node);
         // Register the textures first: the shape pass may only read the slot table.
@@ -8759,11 +9814,11 @@ impl<A: App> AppLoop<A> {
         }) {
             let key = (spec.id, spec.sampling);
             if !self.image_slots.contains_key(&key)
-                && let Some(entry) = self.images.get(&spec.id).cloned()
+                && let Some(image) = self.images.get(&spec.id)
             {
                 let slot = self.list.push_image(ui_core::draw::ImageEntry {
                     sampling: spec.sampling,
-                    ..entry
+                    ..image.entry.clone()
                 });
                 self.image_slots.insert(key, slot);
             }
@@ -8771,7 +9826,7 @@ impl<A: App> AppLoop<A> {
         let images = &self.images;
         let slots = &self.image_slots;
         ui_core::draw::push_shapes(&mut self.list, nid, node, visual, |spec, dest| {
-            let entry = images.get(&spec.id)?;
+            let entry = &images.get(&spec.id)?.entry;
             let (dest, src) = spec.fit.place(dest, (entry.width, entry.height));
             Some(ui_core::draw::ImagePrim {
                 rect: dest,
@@ -9146,6 +10201,13 @@ fn node_paints(node: &ui_core::Node) -> bool {
 ///
 /// A menu row rests on a transparent fill, so "paints nothing" would drop every command out
 /// of the keyboard's reach; the declared ring is proof enough that it is a stop.
+/// Whether a menu has any row other than a divider.
+fn menu_has_rows(items: &[ui_core::menu::MenuItem]) -> bool {
+    items
+        .iter()
+        .any(|item| !matches!(item.kind, ui_core::menu::MenuRow::Separator))
+}
+
 fn focus_stop(node: &ui_core::Node) -> bool {
     node.data.params().is_some_and(|p| p.focus_stop)
         || node_paints(node)
