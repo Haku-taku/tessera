@@ -391,15 +391,21 @@ struct PanelBinding {
 }
 
 /// What the platform is asked to show for a laid-out panel.
-fn popup_spec(panel: &PlatformPanel) -> PopupSpec {
+fn popup_spec(panel: &PlatformPanel, grid: f32) -> PopupSpec {
     PopupSpec {
-        rect: panel.rect,
-        anchor: panel.anchor,
+        rect: crate::window::snap_surface_rect(panel.rect, grid),
+        anchor: snap_panel(panel.anchor, grid),
         side: panel.side,
         align: panel.align,
         offset: panel.offset,
         constraint: crate::window::Constraint::default(),
     }
+}
+
+/// The anchor moved onto the whole pixels its surface is rasterized on, keeping its extent.
+fn snap_panel(rect: ui_core::geom::Rect, grid: f32) -> ui_core::geom::Rect {
+    let origin = crate::window::snap_surface_origin(rect.origin, grid);
+    ui_core::geom::Rect::new(origin.x, origin.y, rect.size.w, rect.size.h)
 }
 
 /// The nearest panel an inner one hangs off, so a nested panel parents the outer one.
@@ -1043,18 +1049,21 @@ fn intake_panels(group: &mut LiveSurface) {
 
 /// The one pointer a group's surfaces share, in the tree's coordinates.
 ///
-/// The panels are asked first because their intake has just run, so their answer is this
-/// turn's; the root's queue is read by its own step, later, and a stale answer from it must
-/// not shadow a panel that really has the pointer. Panels are asked deepest-first: a flyout
-/// opened off another panel is declared after it, and while the pointer is on the flyout
-/// the outer panel still remembers where it last was, which would freeze the shared hover.
+/// Only a panel answers: its intake has just run, so its answer is this turn's. The root's
+/// queue is read by its own step, which comes later, so its answer is last turn's — and a
+/// hint is what the frame hit-tests with. Handing it that place kept a pin hovered after
+/// the pointer had left: the leave's own frame was built where the pointer no longer was,
+/// so its hover came out unchanged and nothing asked for another frame. The root's place
+/// still reaches the frame as the event its step dispatches, which the tree keeps.
+/// Panels are asked deepest-first: a flyout opened off another panel is declared after it,
+/// and while the pointer is on the flyout the outer panel still remembers where it last
+/// was, which would freeze the shared hover.
 fn group_pointer(group: &LiveSurface) -> Option<ui_core::geom::Point> {
     group
         .panels
         .iter()
         .rev()
         .find_map(|binding| binding.handle.pointer())
-        .or_else(|| group.root.pointer())
 }
 
 /// Give every panel the last frame laid out a surface, and let go of the ones that left.
@@ -1078,7 +1087,7 @@ fn reconcile_panels(group: &mut LiveSurface) {
         if group.dismissed.contains(&panel.node) || group.refused.contains(&panel.node) {
             continue;
         }
-        let spec = popup_spec(panel);
+        let spec = popup_spec(panel, group.engine.text_scale());
         if let Some(index) = group
             .panels
             .iter()
@@ -1170,7 +1179,9 @@ fn panel_frame(group: &LiveSurface, node: ui_core::NodeId) -> Option<ui_core::ge
         .platform_panels()
         .iter()
         .find(|panel| panel.node == outer)
-        .map(|panel| panel.rect.origin)
+        .map(|panel| {
+            crate::window::snap_surface_rect(panel.rect, group.engine.text_scale()).origin
+        })
 }
 
 /// The same request, with both rectangles moved into a parent panel's coordinates.

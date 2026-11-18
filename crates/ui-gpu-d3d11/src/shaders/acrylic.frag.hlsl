@@ -2,15 +2,6 @@
 
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
-#ifdef LINEAR_DOMAIN
-float srgb_encode(float l) {
-    return l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055;
-}
-float srgb_decode(float c) {
-    return c <= 0.040449237 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-#endif
-
 // Skia's luminosity/colour pair: keep hue and chroma, take the requested luminosity.
 float3 set_lum(float3 c, float l) {
     float3 d = c + (float3)(l - dot(c, LUMA));
@@ -44,19 +35,9 @@ float4 main(PsIn input) : SV_Target {
     }
     // The frame holds premultiplied colour; the blend pair works on straight.
     float3 c = s.rgb / s.a;
-#ifdef LINEAR_DOMAIN
-    // These formulas were authored on sRGB-encoded values (Skia's luminosity pair), so
-    // cross the encoding around them and convert back at the end.
-    c = float3(srgb_encode(max(c.r, 0.0)), srgb_encode(max(c.g, 0.0)), srgb_encode(max(c.b, 0.0)));
-#endif
     c = lerp(c, set_lum(c, dot(u_luminosity.rgb, LUMA)), u_luminosity.a);
     float3 tinted = u_tint.a >= 0.999 ? u_tint.rgb : set_lum(u_tint.rgb, dot(c, LUMA));
     c = lerp(c, tinted, u_tint.a);
     c = lerp(c, (float3)grain(input.v_device), u_noise);
-#ifdef LINEAR_DOMAIN
-    float3 lin = float3(srgb_decode(c.r), srgb_decode(c.g), srgb_decode(c.b));
-    return float4(lin * s.a, s.a) * cov;
-#else
     return float4(c * s.a, s.a) * cov;
-#endif
 }

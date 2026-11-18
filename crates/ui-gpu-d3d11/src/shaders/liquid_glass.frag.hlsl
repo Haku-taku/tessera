@@ -8,15 +8,6 @@ static const float NORMAL_SCALE = 1.414213562 * 1000.0;
 
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
-#ifdef LINEAR_DOMAIN
-float srgb_encode(float l) {
-    return l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055;
-}
-float srgb_decode(float c) {
-    return c <= 0.040449237 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-#endif
-
 // The reference reaches its rim light through a 1414x debug gradient, which pins the whole
 // silhouette at 1.0; this gain lights the rim without flattening it into a white stroke.
 static const float RIM_GAIN = 8.0;
@@ -42,13 +33,9 @@ float3 shade_sample(float3 c) {
 }
 
 float3 straight(float4 s) {
-    float3 c = s.a > 0.0 ? s.rgb / s.a : float3(0.0, 0.0, 0.0);
-#ifdef LINEAR_DOMAIN
-    // The material's formulas, including the LAB conversions, are authored on sRGB-encoded
-    // values; the capture is linear light.
-    c = float3(srgb_encode(max(c.r, 0.0)), srgb_encode(max(c.g, 0.0)), srgb_encode(max(c.b, 0.0)));
-#endif
-    return c;
+    // The material's formulas, including the LAB conversions, are authored on sRGB values,
+    // which is what every surface's frame holds.
+    return s.a > 0.0 ? s.rgb / s.a : float3(0.0, 0.0, 0.0);
 }
 
 // Branchless smooth union: at k = 0 this is exactly min(d1, d2).
@@ -254,8 +241,5 @@ float4 main(PsIn input) : SV_Target {
     float t = clamp(AA - d, 0.0, 1.0);
     float alpha = t * t * (3.0 - 2.0 * t);
     float3 colour = lens_colour(input.v_device, foot_x, foot_y);
-#ifdef LINEAR_DOMAIN
-    colour = float3(srgb_decode(colour.r), srgb_decode(colour.g), srgb_decode(colour.b));
-#endif
     return float4(colour * alpha, alpha);
 }

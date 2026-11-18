@@ -26,13 +26,13 @@ fn windows_main() -> Result<(), String> {
     use ui_core::Damage;
     use ui_core::NodeId;
     use ui_core::colour::{
-        LinearEncoding, SCRGB_WHITE_NITS, TransferFunction, encode_for_pq_output,
+        OutputEncoding, SCRGB_WHITE_NITS, TransferFunction, encode_for_pq_output,
     };
     use ui_core::draw::{DrawList, RectPrim};
     use ui_core::geom::{Color, Corners, Rect};
     use ui_platform::present::SceneTarget;
     use ui_platform::text_pass::TextPass;
-    use ui_platform::window::SurfaceSpec;
+    use ui_platform::window::{ColourPolicy, SurfaceSpec};
     use ui_platform_win32::{Win32Presenter, Win32Window};
 
     /// sRGB codes the buffer is read at: black, dark, mid, bright, white.
@@ -57,7 +57,8 @@ fn windows_main() -> Result<(), String> {
         list
     }
 
-    let spec = SurfaceSpec::window("crabsnap-win32-hdr", "crabsnap — Win32 HDR", (480, 320));
+    let spec = SurfaceSpec::window("crabsnap-win32-hdr", "crabsnap — Win32 HDR", (480, 320))
+        .with_colour(ColourPolicy::Auto);
     let mut window = Win32Window::new(spec).map_err(|error| error.to_string())?;
     let mut presenter = Win32Presenter::new(&window).map_err(|error| error.to_string())?;
     let hdr = presenter.hdr();
@@ -88,11 +89,11 @@ fn windows_main() -> Result<(), String> {
         let actual = pixels[index] as f32 / 255.0;
         let linear = TransferFunction::Srgb.decode(code as f32 / 255.0);
         let expected = match (hdr, encoding) {
-            (Some(output), Some(LinearEncoding::Pq)) => {
+            (Some(output), Some(OutputEncoding::Pq)) => {
                 encode_for_pq_output(linear, output.reference_nits, output.min_nits)
             }
             // scRGB's unit is 80 nits, and the readback stops at the surface's own 1.0.
-            (Some(output), Some(LinearEncoding::ScRgb)) => {
+            (Some(output), Some(OutputEncoding::ScRgb)) => {
                 (linear * output.reference_nits / SCRGB_WHITE_NITS).min(1.0)
             }
             _ => code as f32 / 255.0,
@@ -115,11 +116,11 @@ fn windows_main() -> Result<(), String> {
     // scRGB a mid grey lands where linear light puts it rather than where the sRGB code does.
     let mid = 128.0 / 255.0;
     let (moved, observed) = match (hdr, encoding) {
-        (Some(output), Some(LinearEncoding::Pq)) => {
+        (Some(output), Some(OutputEncoding::Pq)) => {
             let white = encode_for_pq_output(1.0, output.reference_nits, output.min_nits);
             (white < 0.75, format!("white at {white:.4}"))
         }
-        (Some(output), Some(LinearEncoding::ScRgb)) => {
+        (Some(output), Some(OutputEncoding::ScRgb)) => {
             let value = (TransferFunction::Srgb.decode(mid) * output.reference_nits
                 / SCRGB_WHITE_NITS)
                 .min(1.0);
@@ -144,8 +145,8 @@ fn windows_main() -> Result<(), String> {
     println!(
         "PASS: {}",
         match encoding {
-            Some(LinearEncoding::Pq) => "the buffer holds PQ codes the output describes",
-            Some(LinearEncoding::ScRgb) => "the buffer holds scRGB light the output describes",
+            Some(OutputEncoding::Pq) => "the buffer holds PQ codes the output describes",
+            Some(OutputEncoding::ScRgb) => "the buffer holds scRGB light the output describes",
             None => "the buffer holds sRGB codes, as an SDR output expects",
         }
     );

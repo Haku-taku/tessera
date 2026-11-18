@@ -1261,6 +1261,107 @@ fn a_pointer_crossing_between_surfaces_reaches_the_frame_it_builds() {
     );
 }
 
+/// A page recording the pointer each frame is built with, and nothing else.
+struct PlainPage {
+    seen: Rc<RefCell<Vec<Option<ui_core::geom::Point>>>>,
+}
+
+impl App for PlainPage {
+    fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn Element> {
+        self.seen.borrow_mut().push(cx.pointer());
+        ui_platform::from_decl(Decl::container(Id::str("page"), NodeKind::Box).child(
+            Decl::container(Id::str("pin"), NodeKind::Box)
+                .size(ui_core::layout::SizeClass::fixed(80.0, 80.0))
+                .sense(ui_core::Sense::HOVER),
+        ))
+    }
+}
+
+/// A window as the host loop sees it: the pointer it reports is the one its queue held
+/// before this turn, and reading that queue in its own step is what ends the hover.
+struct LeavingWindow {
+    /// Where the pointer last stood before the window's queue was read.
+    pointer: Cell<Option<ui_core::geom::Point>>,
+    steps: Cell<usize>,
+}
+
+const INSIDE: ui_core::geom::Point = ui_core::geom::Point::new(40.0, 40.0);
+
+impl SurfaceHandle for LeavingWindow {
+    fn step(&mut self, engine: &mut Engine) -> Result<SurfaceStep, String> {
+        let step = self.steps.get();
+        match step {
+            0 => {
+                engine.dispatch(ui_core::Event::PointerMoved { pos: INSIDE });
+            }
+            1 => {
+                engine.dispatch(ui_core::Event::PointerLeft);
+                self.pointer.set(None);
+            }
+            _ => {}
+        }
+        let mut target = OwnerTarget::default();
+        let pointer = (step == 0).then_some(INSIDE);
+        engine.frame_scene(&mut target, pointer)?;
+        self.steps.set(step + 1);
+        Ok(SurfaceStep { drew: true })
+    }
+
+    fn pointer(&self) -> Option<ui_core::geom::Point> {
+        self.pointer.get()
+    }
+
+    fn next_deadline(&self, _engine: &Engine) -> Option<Instant> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        self.steps.get() > 1
+    }
+
+    fn take_copies(&mut self, _engine: &mut Engine) -> Vec<ClipboardCopy> {
+        Vec::new()
+    }
+}
+
+/// The frame the leave builds sees no pointer, so the hover it paints is gone in that turn.
+///
+/// A window's queue is read by its own step; the place it reports before that is last
+/// turn's. The root's answer was used as the frame's pointer hint, so the leave's frame was
+/// hit-tested where the pointer no longer was: the hover came out unchanged, no damage was
+/// asked for, and a pin kept its hover skin until the next pointer event anywhere.
+#[test]
+fn a_leave_ends_the_hover_in_the_frame_it_builds() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let backend = FakeBackend {
+        prepared: VecDeque::from([Box::new(LeavingWindow {
+            pointer: Cell::new(Some(INSIDE)),
+            steps: Cell::new(0),
+        }) as Box<dyn SurfaceHandle>]),
+        log: Rc::new(RefCell::new(Log::default())),
+        stop_after: usize::MAX,
+        hotkeys: None,
+        thumbnailer: None,
+        file_icon_provider: None,
+    };
+    let mut host = Host::new(Box::new(backend));
+    host.open(
+        spec("page"),
+        PlainPage {
+            seen: Rc::clone(&seen),
+        },
+        OpenOptions::default(),
+    )
+    .expect("the page opens");
+    host.run_until(None).expect("the page closes");
+    let frames = seen.borrow().clone();
+    assert_eq!(
+        frames,
+        vec![Some(INSIDE), None],
+        "the leave's own frame is built with no pointer: {frames:?}"
+    );
+}
+
 /// A page with a panel inside a panel, both asking for a surface of their own.
 struct NestedPage;
 

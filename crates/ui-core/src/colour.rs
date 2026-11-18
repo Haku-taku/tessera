@@ -1,7 +1,8 @@
 //! Colour management: transfer functions, colour spaces, output description.
 //!
-//! Storage and working domain are separate concerns. SDR stays in 8-bit sRGB and
-//! linearises through a LUT; only HDR needs a wide domain.
+//! Precision and working domain are separate concerns. Every surface blends sRGB-encoded
+//! values, so a control looks the same on both; only an HDR surface's codes may exceed
+//! 1.0, which is what its f16 storage is for.
 
 /// How encoded values map to linear light.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -94,6 +95,48 @@ impl TransferFunction {
         }
     }
 
+    /// Linear light to an encoded value with no clamp: above 1.0 the sRGB curve keeps
+    /// climbing, which is how an extended-range buffer stores light past white.
+    ///
+    /// Negative light is a colour outside the working triangle, and the curve is mirrored
+    /// through the origin to carry it: a wide-gamut capture's out-of-triangle channel is
+    /// light, not an error, and clamping it there is what desaturated such a picture.
+    pub fn encode_extended(self, linear: f32) -> f32 {
+        match self {
+            Self::Srgb => {
+                let magnitude = linear.abs();
+                let encoded = if magnitude <= 0.003_130_8 {
+                    magnitude * 12.92
+                } else {
+                    1.055 * magnitude.powf(1.0 / 2.4) - 0.055
+                };
+                encoded.copysign(linear)
+            }
+            Self::Linear => linear,
+            // A PQ or HLG code tops out at the container's peak; only the working
+            // domain's own curves are ever asked for light above white.
+            _ => self.encode(linear),
+        }
+    }
+
+    /// An encoded extended value back to light: [`encode_extended`](Self::encode_extended)'s
+    /// inverse, mirrored below zero for the same reason.
+    pub fn decode_extended(self, encoded: f32) -> f32 {
+        match self {
+            Self::Srgb => {
+                let magnitude = encoded.abs();
+                let linear = if magnitude <= 0.040_449_237 {
+                    magnitude / 12.92
+                } else {
+                    ((magnitude + 0.055) / 1.055).powf(2.4)
+                };
+                linear.copysign(encoded)
+            }
+            Self::Linear => encoded,
+            _ => self.decode(encoded),
+        }
+    }
+
     /// Whether this function can express more than SDR's ~100 nits.
     pub fn is_hdr(self) -> bool {
         matches!(self, Self::Pq | Self::Hlg)
@@ -123,7 +166,8 @@ impl Encoding {
         premultiplied: true,
     };
 
-    /// The working domain an HDR pipeline blends in.
+    /// A linear buffer, which no surface presents: the diagnostic alternative
+    /// `composite_over_in` measures the encoded domain against.
     pub const LINEAR_PREMULTIPLIED: Self = Self {
         transfer: TransferFunction::Linear,
         premultiplied: true,
@@ -510,14 +554,21 @@ impl ContentColour {
 
     /// The transform that draws this picture on `destination`, derived once per texture.
     pub fn placement(self, destination: Destination) -> Placement {
-        let encoded = matches!(destination.domain, Domain::Encoded);
         let reference_nits = match destination.domain {
             Domain::Encoded => SDR_WHITE_NITS,
-            Domain::Linear { reference_nits, .. } => reference_nits,
+            Domain::Extended { reference_nits, .. } => reference_nits,
         };
         let peak_nits = match destination.domain {
             Domain::Encoded => reference_nits,
-            Domain::Linear { peak_nits, .. } => peak_nits,
+            Domain::Extended { peak_nits, .. } => peak_nits,
+        };
+        // An extended surface's codes climb past 1.0 along the same sRGB curve, so the
+        // table that indexes light has to reach the surface's peak, not the white.
+        let extended = !matches!(destination.domain, Domain::Encoded);
+        let encode_max = if extended {
+            peak_nits / reference_nits.max(1.0)
+        } else {
+            1.0
         };
         // PQ decodes to a fraction of 10000 nits, an absolute luminance; sRGB and gamma
         // codes mean "this display's white", and the destination is the same desktop, so
@@ -536,7 +587,7 @@ impl ContentColour {
         } else {
             1.0
         };
-        let identity = encoded
+        let identity = !extended
             && self.storage == PixelStorage::Sdr8
             && self.transfer == TransferFunction::Srgb
             && self.primaries == Chromaticities::SRGB;
@@ -565,7 +616,8 @@ impl ContentColour {
             reference_nits,
             tone,
             identity,
-            encoded,
+            extended,
+            encode_max,
             decode: None,
             encode: None,
         }
@@ -587,24 +639,29 @@ impl Destination {
     };
 }
 
-/// The domain a destination blends in.
+/// What a destination's frame holds and blends.
+///
+/// Both domains hold the same thing: sRGB-encoded values. They differ in range and in
+/// precision — an extended frame may hold light past 1.0 and needs f16 to do it — not in
+/// the space the blend runs in, because a control must look the same on either surface.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Domain {
-    /// 8-bit sRGB codes, blended in the encoded domain.
+    /// sRGB codes in `[0, 1]`, stored in eight bits.
     Encoded,
-    /// Linear light whose 1.0 is the surface's reference white.
-    Linear {
+    /// sRGB codes that may exceed 1.0, stored as f16: light above the surface's
+    /// reference white. The output pass decodes them into the surface's encoding.
+    Extended {
         reference_nits: f32,
         /// Black level, in nits; the output pass places it in PQ.
         min_nits: f32,
         peak_nits: f32,
-        encoding: LinearEncoding,
+        encoding: OutputEncoding,
     },
 }
 
-/// How a linear destination's bytes are encoded.
+/// How an extended destination's presented buffer is encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LinearEncoding {
+pub enum OutputEncoding {
     /// PQ codes over BT.2020, which is what a Wayland colour manager asks for.
     Pq,
     /// scRGB: linear light whose 1.0 is [`SCRGB_WHITE_NITS`] over BT.709, which is what a
@@ -676,17 +733,19 @@ pub struct Placement {
     tone: Option<(ToneMapping, f32, f32)>,
     /// The codes are already what the destination wants; texels need no transform.
     identity: bool,
-    /// The destination takes encoded codes rather than linear light.
-    encoded: bool,
+    /// The destination's codes may exceed 1.0: light above its reference white.
+    extended: bool,
+    /// Light, in destination-white units, the top of the tabulated encode holds.
+    encode_max: f32,
     /// Decoded linear light per code, when this placement is tabulated for a whole buffer.
     decode: Option<Box<[f32; MAX_CODES]>>,
-    /// The encoded value at each step of destination linear light, likewise.
+    /// The encoded value at each step of destination light, likewise.
     encode: Option<Box<[f32; ENCODE_STEPS]>>,
 }
 
 /// Codes a 10-bit packing can hold, the most any storage uses.
 const MAX_CODES: usize = 1024;
-/// Steps of destination linear light in the tabulated encode; one step is 1/65535.
+/// Steps of destination light in the tabulated encode; each is 1/65535 of its range.
 const ENCODE_STEPS: usize = 65_536;
 
 impl Placement {
@@ -698,19 +757,14 @@ impl Placement {
         self.identity
     }
 
-    /// Whether the result is encoded codes (`true`) rather than linear light.
-    pub fn is_encoded(&self) -> bool {
-        self.encoded
-    }
-
     /// The same transform with its transfer functions tabulated, for a whole buffer.
     ///
     /// A frame is millions of texels and each transfer function is a `powf`: measured at
-    /// 348 ms against 10 ms for a 2560x1440 PQ rendition on this machine. A table is only
-    /// built where it is exact: the decode covers every code the packing holds, the encode
-    /// every step of an encoded destination. A linear destination keeps the direct encode,
-    /// and a tone curve is a luminance ratio rather than a per-channel map, so neither is
-    /// tabulated.
+    /// 348 ms against 10 ms for a 2560x1440 rendition on this machine. The decode covers
+    /// every code the packing holds; the encode covers the light the destination's codes
+    /// reach, which is 1.0 for SDR and the declared peak for an extended surface — beyond
+    /// that, which is light a compositor may still carry, the curve answers directly.
+    /// A tone curve is a luminance ratio rather than a per-channel map, so it stays direct.
     pub fn tabulated(mut self) -> Self {
         // A float packing has no code space to index; its texels decode directly.
         if self.storage.is_integer() {
@@ -721,17 +775,16 @@ impl Placement {
             }
             self.decode = Some(decode);
         }
-        if self.encoded {
-            let mut encode = Box::new([0.0f32; ENCODE_STEPS]);
-            for (step, slot) in encode.iter_mut().enumerate() {
-                *slot = TransferFunction::Srgb.encode(step as f32 / (ENCODE_STEPS - 1) as f32);
-            }
-            self.encode = Some(encode);
+        let mut encode = Box::new([0.0f32; ENCODE_STEPS]);
+        for (step, slot) in encode.iter_mut().enumerate() {
+            let light = step as f32 / (ENCODE_STEPS - 1) as f32 * self.encode_max;
+            *slot = self.encode_value(light);
         }
+        self.encode = Some(encode);
         self
     }
 
-    /// One texel as straight-alpha values in the destination's domain.
+    /// One texel as straight-alpha values in the destination's codes.
     ///
     /// `inline` because the caller is a loop over millions of texels, and the crate boundary
     /// would otherwise keep this a call per texel.
@@ -767,7 +820,7 @@ impl Placement {
         self.place(linear, alpha)
     }
 
-    /// Linear light into the destination's domain: primaries, gain, curve, encoding.
+    /// Linear light into the destination's codes: primaries, gain, curve, encoding.
     fn place(&self, linear: [f32; 3], alpha: f32) -> [f32; 4] {
         let m = &self.matrix;
         let mut rgb = [
@@ -785,24 +838,36 @@ impl Placement {
                 rgb = [rgb[0] * ratio, rgb[1] * ratio, rgb[2] * ratio];
             }
         }
-        if self.encoded {
-            match &self.encode {
-                Some(table) => {
-                    let encoded = |value: f32| {
-                        let step = (value.clamp(0.0, 1.0) * (ENCODE_STEPS - 1) as f32) as usize;
-                        table[step]
-                    };
-                    [encoded(rgb[0]), encoded(rgb[1]), encoded(rgb[2]), alpha]
-                }
-                None => [
-                    TransferFunction::Srgb.encode(rgb[0]),
-                    TransferFunction::Srgb.encode(rgb[1]),
-                    TransferFunction::Srgb.encode(rgb[2]),
-                    alpha,
-                ],
+        match &self.encode {
+            Some(table) => {
+                let last = ENCODE_STEPS - 1;
+                let encoded = |value: f32| {
+                    // The table answers only for light inside its range: below zero a channel is
+                    // outside the working triangle, and above the top the output's declared peak
+                    // is not a limit the compositor applies, so the curve answers both.
+                    if value < 0.0 || value >= self.encode_max {
+                        return self.encode_value(value);
+                    }
+                    let step = (value / self.encode_max * last as f32) as usize;
+                    table[step.min(last)]
+                };
+                [encoded(rgb[0]), encoded(rgb[1]), encoded(rgb[2]), alpha]
             }
+            None => [
+                self.encode_value(rgb[0]),
+                self.encode_value(rgb[1]),
+                self.encode_value(rgb[2]),
+                alpha,
+            ],
+        }
+    }
+
+    /// Light to a code, clamped at white unless the destination holds light past it.
+    fn encode_value(&self, light: f32) -> f32 {
+        if self.extended {
+            TransferFunction::Srgb.encode_extended(light)
         } else {
-            [rgb[0].max(0.0), rgb[1].max(0.0), rgb[2].max(0.0), alpha]
+            TransferFunction::Srgb.encode(light)
         }
     }
 }
@@ -1007,13 +1072,13 @@ mod tests {
             assert!((byte - 128.0).abs() <= 1.0, "mid grey became {byte}");
         }
         // On an HDR surface the same picture is a picture of light: every code keeps its
-        // luminance, and 203 nits is exactly one unit of the working domain.
+        // luminance, white encodes to 1.0, and 406 nits climbs along the extended curve.
         let hdr = Destination {
-            domain: Domain::Linear {
+            domain: Domain::Extended {
                 reference_nits: 203.0,
                 min_nits: 0.0,
                 peak_nits: 417.0,
-                encoding: LinearEncoding::Pq,
+                encoding: OutputEncoding::Pq,
             },
             tone: ToneMapping::Bt2390,
         };
@@ -1024,8 +1089,9 @@ mod tests {
         let placement = fits.placement(hdr);
         for (nits, want) in [(203.0, 1.0), (406.0, 2.0)] {
             let placed = placement.texel(&packed10(pq_code(nits)));
+            let code = TransferFunction::Srgb.encode_extended(want);
             assert!(
-                (placed[0] - want).abs() < 0.01,
+                (placed[0] - code).abs() < 0.01,
                 "{nits} nits became {} of the working domain",
                 placed[0]
             );
@@ -1034,7 +1100,7 @@ mod tests {
         // 1000-nit picture puts 406 nits below the 2.0 the fitted one reached.
         let compressed = content.placement(hdr).texel(&packed10(pq_code(406.0)));
         assert!(
-            compressed[0] < 1.95,
+            compressed[0] < TransferFunction::Srgb.encode_extended(1.95),
             "the tone curve did not run: {}",
             compressed[0]
         );
@@ -1064,23 +1130,25 @@ mod tests {
     fn a_float_picture_keeps_its_light_above_the_reference_white() {
         let content = ContentColour::scrgb(1000.0);
         let hdr = Destination {
-            domain: Domain::Linear {
+            domain: Domain::Extended {
                 reference_nits: 203.0,
                 min_nits: 0.0,
                 peak_nits: 1000.0,
-                encoding: LinearEncoding::Pq,
+                encoding: OutputEncoding::Pq,
             },
             tone: ToneMapping::Bt2390,
         };
         // scRGB's 2.5 is 200 nits, just under the destination's white; 8.0 is 640 nits.
+        // The destination's codes are sRGB, so light above white climbs the same curve.
+        let code = |light: f32| TransferFunction::Srgb.encode_extended(light);
         let white = content.placement(hdr).texel(&scrgb(2.5));
         assert!(
-            (white[0] - 200.0 / 203.0).abs() < 1e-3,
+            (white[0] - code(200.0 / 203.0)).abs() < 1e-3,
             "SDR white landed at {white:?}"
         );
         let highlight = content.placement(hdr).texel(&scrgb(8.0));
         assert!(
-            (highlight[0] - 640.0 / 203.0).abs() < 1e-2,
+            (highlight[0] - code(640.0 / 203.0)).abs() < 1e-2,
             "light above white was reduced on the way in: {highlight:?}"
         );
         // A file is SDR, so the same texel lands on the peak while white stays white.
@@ -1102,6 +1170,90 @@ mod tests {
         );
     }
 
+    /// One scRGB texel with the given red, green and blue, opaque, in binary16.
+    fn light_texel(channels: [f32; 3]) -> [u8; 8] {
+        let mut bytes = [0u8; 8];
+        let values = channels.into_iter().chain([1.0]).map(f32_to_half);
+        for (slot, bits) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(values) {
+            *slot = bits.to_le_bytes();
+        }
+        bytes
+    }
+
+    /// A wide-gamut colour is a negative channel in the working triangle. An extended frame
+    /// has to carry it as light: clamping it to zero is what desaturated a pinned HDR capture
+    /// (the user's testufo patch lost its saturation while the pin reported HDR, and a
+    /// re-capture of the flattened pin showed the same colour, because a clamp is a projection).
+    #[test]
+    fn light_outside_the_working_triangle_survives_an_extended_frame() {
+        let content = ContentColour::scrgb(1000.0);
+        let destination = Destination {
+            domain: Domain::Extended {
+                reference_nits: 203.0,
+                min_nits: 0.0,
+                peak_nits: 1000.0,
+                encoding: OutputEncoding::ScRgb,
+            },
+            tone: ToneMapping::Bt2390,
+        };
+        let outside = [-0.5, 0.25, 0.125];
+        let placement = content.placement(destination);
+        let placed = placement.texel(&light_texel(outside));
+        assert!(
+            placed[0] < 0.0,
+            "the out-of-triangle channel was clamped: {placed:?}"
+        );
+        // The frame's own curve, which both output shaders transcribe, brings it back.
+        let gain = SCRGB_WHITE_NITS / 203.0;
+        for (code, want) in placed[..3].iter().zip(outside) {
+            let light = TransferFunction::Srgb.decode_extended(*code) / gain;
+            assert!(
+                (light - want).abs() < 1e-3,
+                "the channel came back as {light}, not {want}"
+            );
+        }
+        // The tabulated placement every texture upload uses must agree with it.
+        let tabulated = placement.tabulated().texel(&light_texel(outside));
+        for (fast, direct) in tabulated[..3].iter().zip(&placed[..3]) {
+            assert!(
+                (fast - direct).abs() < 1e-2,
+                "the table dropped a channel: {fast} against {direct}"
+            );
+        }
+    }
+
+    /// A display's peak is what it declares, not a clamp its compositor applies: this machine
+    /// carries 2670 nits on the desktop while the output says 470, so a frame that clipped at
+    /// the declared peak drew every HDR highlight darker than the source beside it.
+    #[test]
+    fn light_above_the_surfaces_peak_still_reaches_an_extended_frame() {
+        let content = ContentColour::scrgb(470.0);
+        let destination = Destination {
+            domain: Domain::Extended {
+                reference_nits: 203.0,
+                min_nits: 0.0,
+                peak_nits: 470.0,
+                encoding: OutputEncoding::ScRgb,
+            },
+            // Nothing compresses: the light is the picture's, whatever the output declares.
+            tone: ToneMapping::Clip,
+        };
+        let placement = content.placement(destination);
+        // scRGB 32.0 is 2560 nits, three times what the output declares.
+        let above = light_texel([32.0, 32.0, 32.0]);
+        let want = TransferFunction::Srgb.encode_extended(32.0 * SCRGB_WHITE_NITS / 203.0);
+        let direct = placement.texel(&above);
+        assert!(
+            (direct[0] - want).abs() < 1e-2,
+            "the direct path lost the light: {direct:?}"
+        );
+        let tabulated = placement.tabulated().texel(&above);
+        assert!(
+            (tabulated[0] - direct[0]).abs() < 1e-2,
+            "the table clipped at its top: {tabulated:?} against {direct:?}"
+        );
+    }
+
     #[test]
     fn only_srgb_codes_on_an_sdr_surface_are_handed_over_untouched() {
         // The identity branch is what keeps every existing SDR picture byte-exact; widening
@@ -1117,18 +1269,49 @@ mod tests {
             "a wider gamut needs a conversion even into eight bits"
         );
         let hdr = Destination {
-            domain: Domain::Linear {
+            domain: Domain::Extended {
                 reference_nits: 203.0,
                 min_nits: 0.0,
                 peak_nits: 417.0,
-                encoding: LinearEncoding::Pq,
+                encoding: OutputEncoding::Pq,
             },
             tone: ToneMapping::Bt2390,
         };
         assert!(
             !ContentColour::SDR.placement(hdr).is_identity(),
-            "the same codes mean different light in a linear domain"
+            "the same codes mean different light in an extended domain"
         );
+    }
+
+    /// A surface is one data stream at two precisions: what makes glyph coverage, a
+    /// gradient stop and a translucent wash look the same on an SDR and an HDR window.
+    #[test]
+    fn an_hdr_surface_stores_the_same_codes_as_an_sdr_one() {
+        // The bug this pins: the HDR frame held linear light, so 8-bit code 128 reached the
+        // frame as 0.216 and coverage blended those values — a dark-on-light text edge lost
+        // up to 47 levels and the strokes read as washed out, in light appearance only.
+        let hdr = Destination {
+            domain: Domain::Extended {
+                reference_nits: 203.0,
+                min_nits: 0.0,
+                peak_nits: 417.0,
+                encoding: OutputEncoding::Pq,
+            },
+            tone: ToneMapping::Bt2390,
+        };
+        let sdr = ContentColour::SDR.placement(Destination::SDR);
+        let extended = ContentColour::SDR.placement(hdr);
+        for code in [0u8, 32, 128, 192, 255] {
+            let texel = [code, code, code, 255];
+            let a = sdr.texel(&texel);
+            let b = extended.texel(&texel);
+            assert!(
+                (a[0] - b[0]).abs() < 1e-3,
+                "code {code} became {} on the SDR surface and {} on the HDR one",
+                a[0],
+                b[0]
+            );
+        }
     }
 
     #[test]

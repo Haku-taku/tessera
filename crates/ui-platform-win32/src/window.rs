@@ -11,7 +11,7 @@ use ui_platform::ThemeWatcher as _;
 use ui_platform::driver::FrameHost;
 use ui_platform::present::ImeState;
 use ui_platform::window::{
-    AutoHide, KeyboardMode, Layer, LayerSpec, PopupSpec, SurfaceRole, SurfaceSpec,
+    AutoHide, ColourPolicy, KeyboardMode, Layer, LayerSpec, PopupSpec, SurfaceRole, SurfaceSpec,
 };
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
@@ -32,6 +32,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI,
     SetProcessDpiAwarenessContext,
 };
+use windows::Win32::UI::Input::Ime::HIMC;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
     TrackMouseEvent, VK_ESCAPE,
@@ -115,8 +116,6 @@ struct WindowState {
     modifiers: ui_core::Modifiers,
     close_requested: bool,
     cursor: Option<CursorShape>,
-    /// A `WM_MOUSELEAVE` is armed; Windows sends it once per entry.
-    tracking_leave: bool,
     /// Focus, extent or scale changed without an `Event`; a frame is still owed.
     silent_change: bool,
     /// The display mode or topology changed: what the output presents has to be re-read.
@@ -133,6 +132,8 @@ struct WindowState {
     keyboard: Option<KeyboardMode>,
     /// The input-method state the last frame published, so one change applies once.
     ime: Option<ImeState>,
+    /// The input context taken away while the window has no field; restored when one needs it.
+    imm: Option<HIMC>,
     /// Whether the input context is open, which is the last state that reached it.
     ime_open: bool,
     /// The buffer is secret: the input method's own candidate list is hidden too.
@@ -193,6 +194,8 @@ pub struct Win32Window {
     /// Whether the frame's own alpha reaches the desktop: a layer shows it, a decorated
     /// window is opaque and the compositor ignores it.
     alpha: crate::presenter::Alpha,
+    /// What the surface's colour follows, as the surface spec asked.
+    colour: ColourPolicy,
     /// The surface's frame window, set once its session exists. Absent for a window a
     /// caller drives directly, which is always drawable and paces on `DwmFlush`.
     pace: Option<std::sync::Arc<crate::frame_pace::FramePace>>,
@@ -481,6 +484,7 @@ impl Win32Window {
             drag,
             drop_target,
             alpha: opening.alpha,
+            colour: surface.colour,
             pace: None,
             owner,
             dialog_parent,
@@ -505,6 +509,11 @@ impl Win32Window {
     /// Whether the frame's own alpha is composed over the desktop.
     pub fn alpha(&self) -> crate::presenter::Alpha {
         self.alpha
+    }
+
+    /// What this surface's colour follows, as its spec asked.
+    pub fn colour(&self) -> ColourPolicy {
+        self.colour
     }
 
     /// Whether the shell's move or resize loop has this window's thread and pointer.
@@ -825,9 +834,9 @@ impl Win32Window {
             (window.ime_open, window.dpi)
         };
         let wants_tsf = state.enabled && !state.hidden;
-        let session = self.tsf(wants_tsf);
-        if let Some(session) = session {
-            let attached = {
+        let mut attached = false;
+        if let Some(session) = self.tsf(wants_tsf) {
+            attached = {
                 let mut session = session.borrow_mut();
                 if !wants_tsf {
                     session.set_attached(false);
@@ -845,16 +854,20 @@ impl Win32Window {
                 attached
             };
             self.drain_tsf();
-            if attached {
-                return;
-            }
+        }
+        // IMM32 serves every state TSF does not. A window with no field keeps no context at
+        // all: an associated one lets the user's own switch open a composition nothing takes.
+        associate_ime(&self.state, self.hwnd, state.enabled && !attached);
+        if attached {
+            return;
+        }
+        if !state.enabled {
+            return;
         }
         if crate::ime::set_open(self.hwnd, state.enabled, open) {
             self.state.borrow_mut().ime_open = state.enabled;
         }
-        if state.enabled
-            && let Some(caret) = state.cursor
-        {
+        if let Some(caret) = state.cursor {
             crate::ime::place(self.hwnd, dpi, caret);
         }
     }
@@ -1394,7 +1407,13 @@ unsafe fn handle(
             Some(LRESULT(0))
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
+            let enabled = state.borrow().ime.as_ref().is_some_and(|ime| ime.enabled);
             state.borrow_mut().silent_change = true;
+            // An activated window can come back with an association the input method made
+            // for it; a window with no field takes none, whatever the method did meanwhile.
+            if message == WM_SETFOCUS && !enabled {
+                associate_ime(state, hwnd, false);
+            }
             None
         }
         WM_GETMINMAXINFO => {
@@ -1521,29 +1540,27 @@ unsafe fn handle(
             let mut window = state.borrow_mut();
             window.pointer = Some(pos);
             window.events.push(Event::PointerMoved { pos });
-            let arm = !window.tracking_leave;
-            window.tracking_leave = true;
             let following = window.keyboard == Some(KeyboardMode::FollowPointer);
             drop(window);
             if following {
                 remember_foreground(state, hwnd);
             }
-            if arm {
-                let mut track = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                // A refusal only means the leave event is missing; the pointer still moves.
-                let _ = unsafe { TrackMouseEvent(&mut track) };
-            }
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            // Armed on every move rather than once per entry: the call is idempotent, and
+            // a tracking the system ended without a message must not leave the window
+            // unable to hear the next leave. A refusal only means the leave event is
+            // missing; the pointer still moves.
+            let _ = unsafe { TrackMouseEvent(&mut track) };
             Some(LRESULT(0))
         }
         WM_MOUSELEAVE => {
             let mut window = state.borrow_mut();
             window.pointer = None;
-            window.tracking_leave = false;
             window.events.push(Event::PointerLeft);
             drop(window);
             hand_back_keyboard(state, hwnd);
@@ -1832,6 +1849,13 @@ fn tsf_attached(state: &RefCell<WindowState>) -> bool {
         .unwrap_or(false)
 }
 
+/// Give the window its input context, or take it away; the taken one is kept on the state.
+fn associate_ime(state: &RefCell<WindowState>, hwnd: HWND, wanted: bool) {
+    let mut saved = state.borrow_mut().imm.take();
+    crate::ime::set_associated(hwnd, wanted, &mut saved);
+    state.borrow_mut().imm = saved;
+}
+
 /// Whether the pending character belongs to a key an input method already handled.
 fn tsf_swallows_char(state: &RefCell<WindowState>) -> bool {
     let session = state.borrow().tsf.clone();
@@ -2030,7 +2054,15 @@ fn logical(state: &RefCell<WindowState>, lparam: LPARAM) -> Point {
 /// A client position in logical units.
 fn logical_point(state: &RefCell<WindowState>, point: POINT) -> Point {
     let scale = state.borrow().dpi.max(96) as f32 / 96.0;
-    Point::new(point.x as f32 / scale, point.y as f32 / scale)
+    pointer_position(point.x, point.y, scale)
+}
+
+/// Where the pointer is, given the client pixel it is over.
+///
+/// A Win32 client position names a pixel by its top-left corner, while the pointer sits
+/// inside the pixel it is over; its centre keeps the far edge of the surface reachable.
+fn pointer_position(x: i32, y: i32, scale: f32) -> Point {
+    Point::new((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale)
 }
 
 /// Give the window the shape of the areas it consumes, in window coordinates.
@@ -2197,4 +2229,22 @@ pub fn set_system_clipboard(content: ClipboardContent) -> bool {
 
 pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pointer_over_the_last_pixel_sits_inside_it() {
+        // A 2560×1440 client reports its last pixel as 2559: at the corner the pointer never
+        // reaches 2560, and a crop rounded outwards loses the last row and column.
+        assert_eq!(pointer_position(0, 0, 1.0), Point::new(0.5, 0.5));
+        assert_eq!(
+            pointer_position(2559, 1439, 1.0),
+            Point::new(2559.5, 1439.5)
+        );
+        let scaled = pointer_position(0, 0, 1.25);
+        assert!((scaled.x - 0.4).abs() < 1e-6 && (scaled.y - 0.4).abs() < 1e-6);
+    }
 }

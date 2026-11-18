@@ -617,7 +617,7 @@ fn main() {
             colour: if std::env::var("CRABSNAP_SDR").is_ok() {
                 ColourPolicy::Sdr
             } else {
-                ColourPolicy::Output
+                ColourPolicy::Auto
             },
         },
     ) {

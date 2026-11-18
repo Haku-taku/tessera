@@ -16,6 +16,7 @@ mod divider;
 mod list_tile;
 mod math;
 mod menu;
+mod menu_style;
 mod modal_sheet;
 mod morph;
 mod overlay;
@@ -75,6 +76,7 @@ pub use menu::{
     MENU_ICON, MENU_ICON_GAP, MENU_ITEM_RADIUS, MENU_PAD, MENU_RADIUS, MENU_ROW_GAP, MENU_ROW_H,
     MENU_ROW_PAD_X, MENU_ROW_PAD_Y, MENU_W, menu_row_fill,
 };
+pub use menu_style::*;
 pub use popover::{
     GlassPopover, GlassPopoverParams, POPOVER_DISMISS_SHORTCUT, POPOVER_PAD, POPOVER_RADIUS,
     POPOVER_W,

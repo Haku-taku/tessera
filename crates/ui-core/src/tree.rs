@@ -56,6 +56,9 @@ impl Default for GridItem {
 }
 
 /// Backdrop blur parameters: kernel radius in pixels and its Gaussian sigma.
+///
+/// A zero `sigma` with a named material reads the frame and shades it unblurred, which is
+/// what a scrim is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BackdropBlur {
     pub radius: u32,
@@ -1361,6 +1364,24 @@ impl Decl {
             && let Some(blur) = p.backdrop_blur.as_mut()
         {
             blur.material = material;
+        }
+        self
+    }
+
+    /// Dim what lies behind this node: a scrim reads the frame here and writes it back darker.
+    ///
+    /// `hole` (in this node's own space, empty for none) stays lit, in one pass: bands that
+    /// meet each other would dim their shared edge twice. The entry carries no blur.
+    pub fn scrim(mut self, opacity: f32, hole: Rect) -> Self {
+        if let NodeData::Container(p) = &mut self.data {
+            p.backdrop_blur = Some(BackdropBlur {
+                radius: 0,
+                sigma: 0.0,
+                material: crate::draw::BackdropMaterial::Scrim(crate::draw::Scrim {
+                    opacity: opacity.clamp(0.0, 1.0),
+                    hole,
+                }),
+            });
         }
         self
     }

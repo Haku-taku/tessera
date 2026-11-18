@@ -51,7 +51,8 @@ pub struct ScrollbarConf {
     pub style: ScrollbarStyle,
     /// The shortest a thumb may be, so a huge content does not shrink it to nothing.
     pub thumb_min: f32,
-    /// The thumb and track colours when the pack does not provide roles for them.
+    /// The thumb colour. The default is translucent black, which is invisible on a dark
+    /// surface; a scroller that knows its pack takes [`ScrollbarConf::on`] instead.
     pub thumb: Color,
     pub track: Color,
 }
@@ -86,6 +87,22 @@ impl ScrollbarConf {
     pub fn never() -> Self {
         Self {
             visibility: ScrollbarVisibility::Never,
+            ..Self::default()
+        }
+    }
+
+    /// The bar a pack draws over its own surface: the pack's ink at 40 %.
+    ///
+    /// The shared default is translucent black, which is right on a light surface and
+    /// invisible on a dark one. A scroller that knows its pack takes this, so the bar is
+    /// visible in both appearances without each caller deriving a colour of its own.
+    pub fn on(pack: &ui_style::Style) -> Self {
+        let thumb = Color {
+            a: 0.4,
+            ..pack.colour_or(ui_design::CommonColor::OnSurface, Color::WHITE)
+        };
+        Self {
+            thumb,
             ..Self::default()
         }
     }

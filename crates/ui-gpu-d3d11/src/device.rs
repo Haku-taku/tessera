@@ -707,7 +707,7 @@ impl Device for D3d11Device {
             },
             Some(as_bytes(&UNIT_QUAD)),
         )?;
-        let stride = spec.stride as u32 * 4;
+        let stride = spec.stride() as u32 * 4;
         let instances =
             self.dynamic_buffer(MIN_INSTANCES * stride, D3D11_BIND_VERTEX_BUFFER.0 as u32)?;
         let constants = self.dynamic_buffer(source.size, D3D11_BIND_CONSTANT_BUFFER.0 as u32)?;
@@ -1106,12 +1106,7 @@ impl Device for D3d11Device {
         self.write(slot, as_bytes(values));
     }
 
-    fn draw_instanced(
-        &mut self,
-        program: ProgramId,
-        instances: &[u8],
-        count: u32,
-    ) -> Result<(), GpuError> {
+    fn draw_instanced(&mut self, program: ProgramId, instances: &[u8]) -> Result<(), GpuError> {
         self.take_pending()?;
         let index = program.0 as usize;
         let Some(entry) = self.programs.get(index) else {
@@ -1119,6 +1114,10 @@ impl Device for D3d11Device {
         };
         let stride = entry.stride;
         let capacity = entry.capacity;
+        let count = (instances.len() / stride as usize) as u32;
+        if count == 0 {
+            return Ok(());
+        }
         if count > capacity {
             let capacity = capacity.max(count).next_power_of_two();
             let buffer =
@@ -1133,7 +1132,7 @@ impl Device for D3d11Device {
         let Some(entry) = self.programs.get_mut(index) else {
             return Err(GpuError::Device(format!("no program {}", program.0)));
         };
-        let bytes = instances.len().min(count as usize * stride as usize);
+        let bytes = count as usize * stride as usize;
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         // SAFETY: both buffers are DYNAMIC with CPU write access, are unmapped again below,
         // and the copies stay inside the sizes their descriptors declared.

@@ -77,3 +77,12 @@ pub fn menu_style(pack: &Style, blur: f32) -> ui_widgets::MenuStyle {
         compact_gap: 2.0,
     }
 }
+
+/// The same look for an appearance, as `PickerOptions::menu_style_of` and a host's
+/// `App::menu_style` take it.
+///
+/// The engine's menu is a platform panel, whose surface has nothing behind it to frost, so the
+/// surface is the opaque one.
+pub fn menu_style_of(appearance: crate::Appearance) -> ui_widgets::MenuStyle {
+    menu_style(crate::pack_of(appearance), 0.0)
+}

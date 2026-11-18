@@ -51,11 +51,11 @@ const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50
 /// The destination one declared surface gives the renderer.
 fn destination(surface: HdrSurface) -> ui_core::colour::Destination {
     ui_core::colour::Destination {
-        domain: ui_core::colour::Domain::Linear {
+        domain: ui_core::colour::Domain::Extended {
             reference_nits: surface.reference_nits as f32,
             min_nits: surface.min_nits,
             peak_nits: surface.max_nits,
-            encoding: ui_core::colour::LinearEncoding::Pq,
+            encoding: ui_core::colour::OutputEncoding::Pq,
         },
         tone: ui_core::colour::ToneMapping::Bt2390,
     }
@@ -72,14 +72,8 @@ pub struct GpuWindowConfig {
     pub colour: ColourPolicy,
 }
 
-/// What a caller asks for; the surface's actual colour is resolved at open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColourPolicy {
-    /// Take the output's own description: HDR where it is HDR, SDR otherwise.
-    Output,
-    /// Present SDR even on an HDR output, leaving the compositor to map it.
-    Sdr,
-}
+/// What a caller asks for, from the surface spec; the actual colour is resolved at open.
+pub use ui_platform::window::ColourPolicy;
 
 /// What a surface actually presents, as resolved from its output.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -103,7 +97,7 @@ impl Default for GpuWindowConfig {
         Self {
             render_node: None,
             format: BufferFormat::Bgra8Srgb,
-            colour: ColourPolicy::Output,
+            colour: ColourPolicy::Sdr,
         }
     }
 }
@@ -237,10 +231,10 @@ impl GpuWindow {
         let ctx = context_for(&node, cnode.as_c_str())?;
         let mut device = GlDevice::new(ctx.gl_handle(), ctx.is_gles());
         let mut renderer = GpuRenderer::new(&mut device)?;
-        // The surface takes its output's description, so its pixels mean what the display
-        // expects; on an HDR output that also means encoding to PQ in a wide-enough buffer.
+        // A surface that asked for `Auto` takes its output's description; on an HDR output
+        // that also means encoding to PQ in a wide-enough buffer. Everything else is SDR.
         let colour = match config.colour {
-            ColourPolicy::Output => win
+            ColourPolicy::Auto => win
                 .declare_hdr_surface()
                 .map_or(SurfaceColour::Sdr, SurfaceColour::Hdr),
             ColourPolicy::Sdr => SurfaceColour::Sdr,
@@ -598,7 +592,7 @@ impl GpuWindow {
             return false;
         }
         let colour = match self.policy {
-            ColourPolicy::Output => win
+            ColourPolicy::Auto => win
                 .refresh_surface_colour(true)
                 .map_or(SurfaceColour::Sdr, SurfaceColour::Hdr),
             ColourPolicy::Sdr => {
@@ -632,8 +626,8 @@ impl GpuWindow {
                     .set_gamut([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
             }
         }
-        // Atlases and image textures carry the domain in their channels; forcing their
-        // versions makes the next frame upload them again.
+        // A picture's texture is built for the destination's range, so the next frame
+        // uploads it again; the atlases follow, so no upload outlives the switch.
         self.atlas_version = u64::MAX;
         self.color_atlas_version = u64::MAX;
         self.rebuild_needed = true;

@@ -1186,6 +1186,19 @@ pub enum BackdropMaterial {
     Plain,
     Acrylic(Acrylic),
     LiquidGlass(LiquidGlass),
+    /// Dim what is behind: the frame read here, written back darker.
+    Scrim(Scrim),
+}
+
+/// What a scrim hides, and how much of it: light is clamped at the destination's peak first,
+/// because past that peak a display shows the peak whatever the frame holds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scrim {
+    /// The fraction of the light it hides: `0` changes nothing, `1` leaves black.
+    pub opacity: f32,
+    /// A rect inside the node that stays lit, in the node's own space; empty for none. One
+    /// scrim with a hole rather than halves that meet: those would dim their edge twice.
+    pub hole: Rect,
 }
 
 impl BackdropMaterial {
@@ -1199,7 +1212,7 @@ impl BackdropMaterial {
     /// it is defined over content, so a glass panel keeps its declared fill and nothing more.
     pub fn fallback(&self) -> Option<Color> {
         match self {
-            Self::Plain | Self::LiquidGlass(_) => None,
+            Self::Plain | Self::LiquidGlass(_) | Self::Scrim(_) => None,
             Self::Acrylic(acrylic) => Some(acrylic.fallback),
         }
     }
@@ -1728,6 +1741,15 @@ impl DrawList {
             entry.clip = t.apply_rect(entry.clip);
             entry.corners = t.apply_corners(entry.corners);
             entry.sigma *= t.scale;
+            // A hole is node-relative, so the offset leaves it alone and the scale does not.
+            if let BackdropMaterial::Scrim(s) = &mut entry.material {
+                s.hole = Rect::new(
+                    s.hole.origin.x * t.scale,
+                    s.hole.origin.y * t.scale,
+                    s.hole.size.w * t.scale,
+                    s.hole.size.h * t.scale,
+                );
+            }
         }
         let index = self.backdrops.len() as u32;
         self.backdrops.push(entry);

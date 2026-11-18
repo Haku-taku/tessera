@@ -99,6 +99,7 @@ impl Presenter {
             win.visual_hwnd(),
             win.client_size(),
             win.alpha(),
+            win.colour(),
             uncapped,
             win.refresh_hz(),
             Arc::clone(&pace),
@@ -830,6 +831,8 @@ fn popup_surface_spec(parent: &SurfaceSpec, spec: PopupSpec) -> SurfaceSpec {
             ),
         },
         min_size: None,
+        // A panel is the parent surface's chrome, and shows what the parent shows.
+        colour: parent.colour,
     }
 }
 
@@ -854,6 +857,7 @@ fn open_panel(
         win.visual_hwnd(),
         win.client_size(),
         win.alpha(),
+        win.colour(),
         uncapped,
         win.refresh_hz(),
         Arc::clone(&pace),
@@ -895,7 +899,9 @@ fn open_panel_window(
         spec.rect.size.w.round().max(1.0) as u32,
         spec.rect.size.h.round().max(1.0) as u32,
     );
-    let surface = SurfaceSpec::dialog(parent_spec.app_id.clone(), title, size).with_modal(false);
+    let surface = SurfaceSpec::dialog(parent_spec.app_id.clone(), title, size)
+        .with_modal(false)
+        .with_colour(parent_spec.colour);
     let mut win = Win32Window::new_panel_dialog(parent, surface.clone())
         .map_err(|error| format!("cannot open the panel's window: {error}"))?;
     let pace = Arc::new(FramePace::new());
@@ -903,6 +909,7 @@ fn open_panel_window(
         win.visual_hwnd(),
         win.client_size(),
         win.alpha(),
+        win.colour(),
         uncapped,
         win.refresh_hz(),
         Arc::clone(&pace),

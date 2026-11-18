@@ -35,7 +35,7 @@ use ui_platform::volumes::VolumesState;
 use ui_platform::{Container, Element, FileKind, WidgetState, from_decl};
 use ui_style::{MotionName, Style};
 use ui_widgets::scroll::ScrollbarConf;
-use ui_widgets::{Button, Cx, IconSet, IconSource, Pressable, Scroll, Text};
+use ui_widgets::{Button, Cx, IconSet, IconSource, Pressable, RowWindow, Scroll, Text};
 
 use crate::icons;
 use crate::RenameError;
@@ -110,6 +110,17 @@ const MENU_ROW_HEIGHT: f32 = 28.0;
 const MENU_MAX_HEIGHT: f32 = 320.0;
 /// The Replace question's panel: wider than a menu, because its sentence wraps.
 const ASK_WIDTH: f32 = 340.0;
+/// The band above the footer that names the files a job or a save touches: a card's height,
+/// the gap between cards, the band's own inset, and how many cards it shows before the list
+/// scrolls inside it.
+const JOB_CARD_HEIGHT: f32 = 28.0;
+const JOB_CARD_GAP: f32 = 4.0;
+const JOB_BAND_PADDING: f32 = 8.0;
+const JOB_VISIBLE_CARDS: usize = 4;
+/// One card's pitch, which the band's row window steps by.
+const JOB_CARD_PITCH: f32 = JOB_CARD_HEIGHT + JOB_CARD_GAP;
+/// A card's own inset for its path.
+const JOB_CARD_INSET: f32 = 10.0;
 
 const ROOT: &str = "picker/root";
 const TOOLBAR: &str = "picker/toolbar";
@@ -159,9 +170,9 @@ pub(crate) fn retry_id() -> Id {
     Id::str("picker/retry")
 }
 
-/// The field a save mode types its file name into.
-pub(crate) fn save_name_id() -> Id {
-    Id::str("picker/save-name")
+/// The field a single mode's answer is typed into: a save's name, or a path.
+pub(crate) fn answer_id() -> Id {
+    Id::str("picker/answer")
 }
 
 /// The sidebar's own scroller, which a drag near its edge moves.
@@ -199,6 +210,21 @@ pub(crate) fn grid_cell_id(entry: &Entry) -> Id {
 
 fn options_band_id() -> Id {
     Id::str("picker/choices/band")
+}
+
+/// The band above the footer that lists the files a job or a save names, and one card in it.
+fn job_band_id() -> Id {
+    Id::str("picker/job/band")
+}
+
+fn job_card_id(index: usize) -> Id {
+    Id::of(("picker/job/card", index))
+}
+
+/// The questions that list their own files — the permanent delete and the undo — and one
+/// card in such a list.
+fn asking_card_id(id: Id, index: usize) -> Id {
+    id.with("card").with(index)
 }
 
 fn header_scroll_id() -> Id {
@@ -512,10 +538,14 @@ pub(crate) fn build(
         )
     };
     let band_height = CHOICES_HEIGHT * unfold;
+    // The files a running job or a SaveFiles request names, listed above the footer. It is
+    // there for as long as that set is, so it takes its own height out of the body.
+    let (job_paths, job_current) = job_items(state);
+    let job_height = job_band_height(job_paths.len());
     // Both rules take their own pixel out of the body, so the column's fixed children add up
     // to the dialog's height instead of overflowing it by one.
     let body_height =
-        (height - TOOLBAR_HEIGHT - FOOTER_HEIGHT - band_height - 2.0 * RULE).max(0.0);
+        (height - TOOLBAR_HEIGHT - FOOTER_HEIGHT - band_height - job_height - 2.0 * RULE).max(0.0);
     let sidebar_width = if state.places.is_empty() || width < SIDEBAR_MIN_WIDTH {
         0.0
     } else {
@@ -541,6 +571,18 @@ pub(crate) fn build(
     // close and the controls keep their ids; the clip is what hides them until it opens.
     if !state.choices.is_empty() {
         children.push(choices_band(state, cx, width, band_height));
+    }
+    // Between the caller's controls and the footer's own progress line, so the list sits
+    // beside the sentence that sums it up.
+    if job_height > 0.0 {
+        children.push(job_band(
+            state,
+            cx,
+            &job_paths,
+            job_current.as_deref(),
+            width,
+            job_height,
+        ));
     }
     children.push(footer(state, cx, width));
     // The name tooltip is declared after the body that asked for it, and before the menus
@@ -881,7 +923,8 @@ fn crumb_menu(state: &mut PickerState, cx: &mut Cx<'_, '_>, folder: &Path) -> Bo
             }
         }
     }
-    let scroll = Scroll::vertical(id.with("scroll"), MENU_MAX_HEIGHT);
+    let scroll = Scroll::vertical(id.with("scroll"), MENU_MAX_HEIGHT)
+        .with_scrollbar(ScrollbarConf::on(pack));
     let contents = element(
         Decl::container(id.with("content"), NodeKind::Column)
             .size(SizeClass {
@@ -1253,7 +1296,6 @@ fn context_menu_items(
     // folder itself for the background and a sidebar row, as Explorer's menus are.
     let shell_paths = state.shell_paths(target);
     let single = selection.len() == 1;
-    let multi = state.model.mode().is_multi();
     let operations = state.file_operations.clone();
     let destination = state.menu_destination.clone();
     let mut items: Vec<MenuItem> = Vec::new();
@@ -1439,18 +1481,14 @@ fn context_menu_items(
             Msg::PICKER_SELECT_ALL,
             Some((KeyChord::new(Key::Char('a'), ctrl), "Ctrl+A")),
         );
-        items.push(if multi {
-            select_all
-        } else {
-            select_all.disabled()
-        });
+        items.push(select_all);
         let invert = command_item(
             cx,
             crate::MenuCommand::Invert,
             Msg::PICKER_INVERT_SELECTION,
             None,
         );
-        items.push(if multi { invert } else { invert.disabled() });
+        items.push(invert);
     } else if matches!(target, crate::MenuTarget::Place { .. }) {
         // A sidebar row offers what acts on its folder without the list's own verbs: the
         // folder is not on screen, so Select All or Refresh would speak for another one.
@@ -1498,18 +1536,14 @@ fn context_menu_items(
             Msg::PICKER_SELECT_ALL,
             Some((KeyChord::new(Key::Char('a'), ctrl), "Ctrl+A")),
         );
-        items.push(if multi {
-            select_all
-        } else {
-            select_all.disabled()
-        });
+        items.push(select_all);
         let invert = command_item(
             cx,
             crate::MenuCommand::Invert,
             Msg::PICKER_INVERT_SELECTION,
             None,
         );
-        items.push(if multi { invert } else { invert.disabled() });
+        items.push(invert);
         items.push(MenuItem::separator());
         items.push(
             command_item(
@@ -1871,7 +1905,7 @@ fn sidebar(
     );
     // A machine with many mounts outgrows the panel; the list scrolls rather than clipping
     // the volumes a user may be looking for.
-    let scroller = Scroll::fill(sidebar_scroll_id());
+    let scroller = Scroll::fill(sidebar_scroll_id()).with_scrollbar(ScrollbarConf::on(&pack));
     element(
         Decl::container(Id::str(SIDEBAR), NodeKind::Column)
             .size(SizeClass::fixed(width, height))
@@ -2177,19 +2211,11 @@ fn list(
     let window = state.heights.window(cx.core(), scroller, count, ROW_HEIGHT * 3.0, |index| {
         row_id(&state.model.rows()[index])
     });
-    let thumb = Color {
-        a: 0.4,
-        ..pack.colour_or(CommonColor::OnSurface, Color::WHITE)
-    };
-    let bar = ScrollbarConf {
-        thumb,
-        ..ScrollbarConf::default()
-    };
     // Only vertically: the header above owns the horizontal offset, and a list that also
     // scrolled sideways would move a row under the pointer without the header moving.
     // The inset is still content padding, which keeps the upright bar and the clip over the
     // padding instead of directly on a column.
-    let scroll = Scroll::fill(scroller).with_scrollbar(bar);
+    let scroll = Scroll::fill(scroller).with_scrollbar(ScrollbarConf::on(pack));
     let mut children: Vec<Box<dyn Element>> = Vec::new();
     if window.above > 0.0 {
         children.push(from_decl(spacer(
@@ -2269,15 +2295,7 @@ fn grid(
         GRID_ROW_PITCH * 2.0,
         grid_row_id,
     );
-    let thumb = Color {
-        a: 0.4,
-        ..pack.colour_or(CommonColor::OnSurface, Color::WHITE)
-    };
-    let bar = ScrollbarConf {
-        thumb,
-        ..ScrollbarConf::default()
-    };
-    let scroll = Scroll::fill(scroller).with_scrollbar(bar);
+    let scroll = Scroll::fill(scroller).with_scrollbar(ScrollbarConf::on(pack));
     let mut children: Vec<Box<dyn Element>> = Vec::new();
     if window.above > 0.0 {
         children.push(from_decl(spacer(scroller.with("above"), content, window.above)));
@@ -2968,11 +2986,15 @@ fn footer(state: &mut PickerState, cx: &mut Cx<'_, '_>, width: f32) -> Box<dyn E
             .nowrap()
             .resolve(),
         ));
-        if !running.current.is_empty() {
+        if let Some(current) = running.current.as_deref() {
+            let name = current
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| current.display().to_string());
             left.push(from_decl(
                 Text::new(
                     Id::str("picker/progress/name"),
-                    running.current,
+                    name,
                     caption_size(pack),
                     muted,
                 )
@@ -3007,7 +3029,7 @@ fn footer(state: &mut PickerState, cx: &mut Cx<'_, '_>, width: f32) -> Box<dyn E
         ));
     }
     match mode {
-        Mode::SaveFile => left.push(save_name_field(state, cx)),
+        Mode::SaveFile | Mode::OpenFile | Mode::SelectFolder => left.push(answer_field(state, cx)),
         Mode::SaveFiles => left.push(save_files_caption(state, cx)),
         _ => {}
     }
@@ -3142,6 +3164,243 @@ fn save_files_caption(state: &PickerState, cx: &Cx<'_, '_>) -> Box<dyn Element> 
             .nowrap()
             .resolve(),
     )
+}
+
+/// The files the band above the footer lists, and the one being worked on.
+///
+/// A running job names its own batch; a `SaveFiles` request names the paths it will write
+/// under the folder on screen. Both are sorted the same way, so one batch reads in one order
+/// wherever the dialog shows it.
+fn job_items(state: &PickerState) -> (Vec<PathBuf>, Option<PathBuf>) {
+    if let Some(running) = &state.running {
+        if running.items.is_empty() {
+            // A job the dialog did not start names only its current file.
+            return match &running.current {
+                Some(current) => (vec![current.clone()], Some(current.clone())),
+                None => (Vec::new(), None),
+            };
+        }
+        return (running.items.clone(), running.current.clone());
+    }
+    if state.model.mode() == Mode::SaveFiles {
+        let folder = state.model.path();
+        let mut paths: Vec<PathBuf> = state
+            .model
+            .save_names()
+            .iter()
+            .map(|name| folder.join(name))
+            .collect();
+        crate::sort_paths(&mut paths);
+        return (paths, None);
+    }
+    (Vec::new(), None)
+}
+
+/// The band's height for its list: its inset and the cards it shows, capped so a long batch
+/// scrolls instead of taking the list's room.
+fn job_band_height(count: usize) -> f32 {
+    if count == 0 {
+        return 0.0;
+    }
+    let visible = count.min(JOB_VISIBLE_CARDS);
+    2.0 * JOB_BAND_PADDING
+        + visible as f32 * JOB_CARD_HEIGHT
+        + visible.saturating_sub(1) as f32 * JOB_CARD_GAP
+}
+
+/// The height a confirmation's file list takes: a few cards, then it scrolls.
+fn ask_files_height(count: usize) -> f32 {
+    let visible = count.min(JOB_VISIBLE_CARDS);
+    visible as f32 * JOB_CARD_HEIGHT + visible.saturating_sub(1) as f32 * JOB_CARD_GAP
+}
+
+/// The cards above the footer: one per file, the current one lifted, scrolling inside the
+/// band's own height.
+fn job_band(
+    state: &PickerState,
+    cx: &mut Cx<'_, '_>,
+    paths: &[PathBuf],
+    current: Option<&Path>,
+    width: f32,
+    height: f32,
+) -> Box<dyn Element> {
+    path_list(
+        state,
+        cx,
+        job_band_id(),
+        paths,
+        current,
+        width,
+        height,
+        JOB_BAND_PADDING,
+        job_card_id,
+    )
+}
+
+/// One card per path over a scroller of a fixed height: the band's, or a question's files.
+///
+/// The rows are one height, so the window steps by their pitch and a thousand names cost
+/// the handful of cards the viewport shows.
+#[allow(clippy::too_many_arguments)]
+fn path_list(
+    state: &PickerState,
+    cx: &mut Cx<'_, '_>,
+    id: Id,
+    paths: &[PathBuf],
+    current: Option<&Path>,
+    width: f32,
+    height: f32,
+    inset: f32,
+    card_id: impl Fn(usize) -> Id,
+) -> Box<dyn Element> {
+    let window = RowWindow::of(cx.core(), id, paths.len(), JOB_CARD_PITCH * 2.0, |_| {
+        JOB_CARD_PITCH
+    });
+    // The bar floats over the trailing 4 dp, so the card stops short of it.
+    let card_width = (width - 2.0 * inset - 12.0).max(40.0);
+    let label_width = (card_width - 2.0 * JOB_CARD_INSET).max(20.0);
+    let mut cards: Vec<Box<dyn Element>> = Vec::new();
+    if window.above > 0.0 {
+        cards.push(from_decl(spacer(id.with("above"), card_width, window.above)));
+    }
+    for index in window.first..window.last {
+        let path = &paths[index];
+        cards.push(job_card(
+            state,
+            cx,
+            card_id(index),
+            path,
+            current == Some(path.as_path()),
+            card_width,
+            label_width,
+        ));
+    }
+    if window.below > 0.0 {
+        cards.push(from_decl(spacer(id.with("below"), card_width, window.below)));
+    }
+    let list = element(
+        Decl::container(id.with("list"), NodeKind::Column)
+            .size(SizeClass {
+                width: AxisSize::fill(0.0, 0.0),
+                height: AxisSize::hug(0.0, f32::INFINITY),
+                grow_x: Grow::No,
+                grow_y: Grow::No,
+            })
+            // The inset is content padding, so the bar and the clip stay at the region's
+            // edge over the padding rather than on a card.
+            .padding(Insets::new(inset, inset, inset, inset))
+            .gap(JOB_CARD_GAP),
+        cards,
+    );
+    let scroll = Scroll::fixed(id, width, height).with_scrollbar(ScrollbarConf::on(&state.pack));
+    Box::new(scroll.element_in(cx).children(vec![list]))
+}
+
+/// One file in a list: its whole path on a card, lifted while the job works on it.
+fn job_card(
+    state: &PickerState,
+    cx: &Cx<'_, '_>,
+    id: Id,
+    path: &Path,
+    current: bool,
+    card_width: f32,
+    label_width: f32,
+) -> Box<dyn Element> {
+    let pack = state.pack;
+    let ink = pack.colour_or(CommonColor::OnSurface, Color::WHITE);
+    let fill = if current {
+        pack.colour_or(
+            CommonColor::SurfaceSelected,
+            Color::from_rgba8(255, 255, 255, 36),
+        )
+    } else {
+        pack.colour_or(
+            CommonColor::SurfaceHover,
+            Color::from_rgba8(255, 255, 255, 18),
+        )
+    };
+    let radius = pack.metric_or(CommonMetric::Radius, 6.0);
+    from_decl(
+        Decl::container(id, NodeKind::Row)
+            .size(SizeClass {
+                width: AxisSize::fixed(card_width),
+                height: AxisSize::fixed(JOB_CARD_HEIGHT),
+                grow_x: Grow::No,
+                grow_y: Grow::No,
+            })
+            .padding(Insets::new(JOB_CARD_INSET, 0.0, JOB_CARD_INSET, 0.0))
+            .cross_align(0.0)
+            .cross_pos(0.5)
+            .background(fill, Corners::all(radius))
+            .child(
+                Text::new(
+                    id.with("path"),
+                    path_line(path, cx, pack, label_width),
+                    caption_size(pack),
+                    ink,
+                )
+                .max_lines(1)
+                .max_width(label_width)
+                .resolve(),
+            ),
+    )
+}
+
+/// A path on one card line.
+///
+/// One too wide for the card loses its middle: the name at the end identifies the item and
+/// the deepest folders are how a reader recognises it, so neither end is the one to cut. No
+/// measurer means the painter's own end ellipsis is what stands.
+fn path_line(path: &Path, cx: &Cx<'_, '_>, pack: &Style, max_width: f32) -> String {
+    let full = path.display().to_string();
+    let width_of = |body: &str| {
+        Text::new(
+            Id::str("picker/job/measure"),
+            body.to_string(),
+            caption_size(pack),
+            Color::WHITE,
+        )
+        .width_in(cx)
+    };
+    let Some(width) = width_of(&full) else {
+        return full;
+    };
+    if width <= max_width {
+        return full;
+    }
+    let chars: Vec<char> = full.chars().collect();
+    let mut tail = 0usize;
+    let mut low = 0usize;
+    let mut high = chars.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let candidate = ellipsized(&chars[chars.len() - mid..]);
+        match width_of(&candidate) {
+            Some(width) if width <= max_width => {
+                low = mid;
+                tail = mid;
+            }
+            _ => high = mid - 1,
+        }
+    }
+    if tail == 0 {
+        return full;
+    }
+    // The tail starts at a separator where one follows, so the ellipsis replaces whole
+    // folders instead of the front of a name; cutting only shortens what fits.
+    let start = chars.len() - tail;
+    let cut = (start..chars.len())
+        .find(|&index| is_separator(chars[index]))
+        .unwrap_or(start);
+    ellipsized(&chars[cut..])
+}
+
+fn ellipsized(tail: &[char]) -> String {
+    std::iter::once('…').chain(tail.iter().copied()).collect()
+}
+
+fn is_separator(glyph: char) -> bool {
+    glyph == '\\' || glyph == '/'
 }
 
 /// The band above the footer: one control per caller choice, scrolling sideways when the
@@ -3324,7 +3583,8 @@ fn footer_menu(
     );
     let divider = pack.colour_or(CommonColor::Divider, Color::from_rgba8(255, 255, 255, 30));
     let radius = pack.metric_or(CommonMetric::Radius, 6.0);
-    let scroll = Scroll::vertical(id.with("scroll"), MENU_MAX_HEIGHT);
+    let scroll = Scroll::vertical(id.with("scroll"), MENU_MAX_HEIGHT)
+        .with_scrollbar(ScrollbarConf::on(pack));
     let contents = element(
         Decl::container(id.with("content"), NodeKind::Column)
             .size(SizeClass {
@@ -3745,7 +4005,8 @@ fn failures_panel(state: &mut PickerState, cx: &mut Cx<'_, '_>) -> Box<dyn Eleme
             .gap(2.0),
         items,
     );
-    let scroll = Scroll::vertical(id.with("scroll"), MENU_MAX_HEIGHT);
+    let scroll = Scroll::vertical(id.with("scroll"), MENU_MAX_HEIGHT)
+        .with_scrollbar(ScrollbarConf::on(pack));
     let rows = vec![
         header,
         Box::new(scroll.element_in(cx).children(vec![list])),
@@ -3777,6 +4038,21 @@ fn delete_panel(state: &mut PickerState, cx: &mut Cx<'_, '_>) -> Box<dyn Element
             .max_width(ASK_WIDTH - 24.0)
             .resolve(),
     );
+    // The sentence counts them; the cards say which ones, so a delete nothing can undo is
+    // read before it is answered.
+    let mut sorted = paths.clone();
+    crate::sort_paths(&mut sorted);
+    let files = path_list(
+        state,
+        cx,
+        id.with("files"),
+        &sorted,
+        None,
+        ASK_WIDTH - 24.0,
+        ask_files_height(sorted.len()),
+        0.0,
+        |index| asking_card_id(id, index),
+    );
     let answers = element(
         Decl::container(id.with("answers"), NodeKind::Row)
             .gap(GAP)
@@ -3802,7 +4078,7 @@ fn delete_panel(state: &mut PickerState, cx: &mut Cx<'_, '_>) -> Box<dyn Element
     question_modal(
         pack,
         id,
-        question_panel(pack, id.with("panel"), vec![question, answers]),
+        question_panel(pack, id.with("panel"), vec![question, files, answers]),
     )
 }
 
@@ -3822,6 +4098,19 @@ fn undo_panel(state: &mut PickerState, cx: &mut Cx<'_, '_>) -> Box<dyn Element> 
             .max_lines(3)
             .max_width(ASK_WIDTH - 24.0)
             .resolve(),
+    );
+    let mut sorted = paths.clone();
+    crate::sort_paths(&mut sorted);
+    let files = path_list(
+        state,
+        cx,
+        id.with("files"),
+        &sorted,
+        None,
+        ASK_WIDTH - 24.0,
+        ask_files_height(sorted.len()),
+        0.0,
+        |index| asking_card_id(id, index),
     );
     let answers = element(
         Decl::container(id.with("answers"), NodeKind::Row)
@@ -3848,7 +4137,7 @@ fn undo_panel(state: &mut PickerState, cx: &mut Cx<'_, '_>) -> Box<dyn Element> 
     question_modal(
         pack,
         id,
-        question_panel(pack, id.with("panel"), vec![question, answers]),
+        question_panel(pack, id.with("panel"), vec![question, files, answers]),
     )
 }
 
@@ -4052,7 +4341,8 @@ fn transfer_panel(state: &mut PickerState, cx: &mut Cx<'_, '_>) -> Box<dyn Eleme
             .gap(2.0),
         rows,
     );
-    let scroll = Scroll::vertical(id.with("scroll"), MENU_MAX_HEIGHT);
+    let scroll = Scroll::vertical(id.with("scroll"), MENU_MAX_HEIGHT)
+        .with_scrollbar(ScrollbarConf::on(pack));
     let accept = match effect {
         DropEffect::Move => Msg::PICKER_MOVE_HERE,
         DropEffect::Copy => Msg::PICKER_COPY_HERE,
@@ -4120,20 +4410,21 @@ fn fact_row(pack: &Style, id: Id, label: String, value: String) -> Box<dyn Eleme
     )
 }
 
-/// The name a save would write: an editable field that takes the rest of the footer.
+/// The answer a single mode would return, editable: a name for a save, a path for the modes
+/// that answer with one. The selection writes it, and the user may type or paste over it.
 ///
 /// The buffer lives on the container, so the field is the container and the text is one of
 /// its views; the engine reports every edit through [`Change::Text`](ui_core::change::Change)
 /// on the field's id, and the model keeps what it reports.
-fn save_name_field(state: &mut PickerState, cx: &mut Cx<'_, '_>) -> Box<dyn Element> {
-    let value = state.model.save_name.clone();
+fn answer_field(state: &mut PickerState, cx: &mut Cx<'_, '_>) -> Box<dyn Element> {
+    let value = state.model.answer().to_string();
     let size = SizeClass {
         width: AxisSize::fill(0.0, 0.0),
         height: AxisSize::fixed(34.0),
         grow_x: Grow::Yes,
         grow_y: Grow::No,
     };
-    input_field(cx, state.pack, save_name_id(), &value, size, false)
+    input_field(cx, state.pack, answer_id(), &value, size, false)
 }
 
 /// The address or search field, in the toolbar's one filled slot.
@@ -4539,6 +4830,7 @@ mod tests {
             OneFile(start.clone()),
             start,
             pack,
+            ui_widgets_md3::menu_style_of,
             ui_style::Env::root(),
         )
         .places(places.clone())
@@ -4616,6 +4908,7 @@ mod tests {
             Many(entries.clone()),
             start,
             pack,
+            ui_widgets_md3::menu_style_of,
             ui_style::Env::root(),
         );
         let mut state = PickerState::new(options);
@@ -4667,6 +4960,7 @@ mod tests {
             OneFile(start.clone()),
             start.clone(),
             pack,
+            ui_widgets_md3::menu_style_of,
             ui_style::Env::root(),
         )
         .filters(vec![
@@ -4730,6 +5024,7 @@ mod tests {
             OneFile(dir.clone()),
             dir.clone(),
             pack,
+            ui_widgets_md3::menu_style_of,
             ui_style::Env::root(),
         );
         let mut state = PickerState::new(options);
@@ -4758,6 +5053,7 @@ mod tests {
             OneFile(start.clone()),
             start,
             pack,
+            ui_widgets_md3::menu_style_of,
             ui_style::Env::root(),
         );
         let mut state = PickerState::new(options);
@@ -4779,6 +5075,7 @@ mod tests {
             OneFile(start.clone()),
             start,
             pack,
+            ui_widgets_md3::menu_style_of,
             ui_style::Env::root(),
         )
         .devices(vec![device.clone()]);
@@ -4794,7 +5091,13 @@ mod tests {
     #[test]
     fn a_crumb_arrow_opens_its_subfolders_and_a_choice_navigates() {
         let pack = ui_widgets_md3::pack_of;
-        let options = PickerOptions::new(Folders, PathBuf::from("/a/b"), pack, ui_style::Env::root());
+        let options = PickerOptions::new(
+            Folders,
+            PathBuf::from("/a/b"),
+            pack,
+            ui_widgets_md3::menu_style_of,
+            ui_style::Env::root(),
+        );
         let mut state = PickerState::new(options);
         let mut store = ui_core::AnimStore::new();
         let mut core = ui_core::cx::Cx::new(&mut store, 0, 900, 600, 0.0, 0.0, 1.0, None);
@@ -4863,6 +5166,7 @@ mod tests {
             OneFile(start.clone()),
             start.clone(),
             ui_widgets_md3::pack_of,
+            ui_widgets_md3::menu_style_of,
             ui_style::Env::root(),
         );
         let mut app = AppLoop::new(Panel(PickerState::new(options)));
@@ -4911,6 +5215,7 @@ mod tests {
             OneFile(start.clone()),
             start.clone(),
             ui_widgets_md3::pack_of,
+            ui_widgets_md3::menu_style_of,
             ui_style::Env::root(),
         );
         let mut app = AppLoop::new(Panel(PickerState::new(options)));

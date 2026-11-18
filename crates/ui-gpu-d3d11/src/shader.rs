@@ -145,6 +145,8 @@ const RECT: &[Uniform] = &[
     uniform("u_opacity", Kind::Float),
     uniform("u_layer", Kind::Int),
     uniform("u_skip_empty", Kind::Float),
+    uniform("u_scrim", Kind::Vec4),
+    uniform("u_scrim_hole", Kind::Vec4),
 ];
 
 const CLIP_UNIFORMS: &[Uniform] = &[
@@ -186,7 +188,6 @@ const RESOLVE: &[Uniform] = &[
     uniform("u_viewport", Kind::Vec2),
     uniform("u_src", Kind::Int),
     uniform("u_ss", Kind::Int),
-    uniform("u_encode", Kind::Int),
 ];
 
 const CAPTURE: &[Uniform] = &[
@@ -249,7 +250,7 @@ fn uniforms(key: ProgramKey) -> &'static [Uniform] {
         ProgramKey::Layers => RECT,
         ProgramKey::Effects => EFFECT,
         ProgramKey::Box => BOX,
-        ProgramKey::OutputSrgb | ProgramKey::OutputLinear | ProgramKey::OutputScRgb => OUTPUT,
+        ProgramKey::OutputSrgb | ProgramKey::OutputScRgb => OUTPUT,
         ProgramKey::Resolve => RESOLVE,
         ProgramKey::Capture => CAPTURE,
         ProgramKey::Rects
@@ -259,8 +260,8 @@ fn uniforms(key: ProgramKey) -> &'static [Uniform] {
         | ProgramKey::Shadows => CLIP_UNIFORMS,
         ProgramKey::Glyphs => GLYPH,
         ProgramKey::Images => IMAGE,
-        ProgramKey::Acrylic | ProgramKey::AcrylicLinear => ACRYLIC,
-        ProgramKey::GlassKit | ProgramKey::GlassKitLinear => GLASS_KIT,
+        ProgramKey::Acrylic => ACRYLIC,
+        ProgramKey::GlassKit => GLASS_KIT,
     }
 }
 
@@ -343,28 +344,24 @@ fn varyings(key: ProgramKey) -> &'static [(&'static str, u32)] {
     }
 }
 
-/// The shader pair, and whether the linear-domain variant is wanted.
-fn bodies(key: ProgramKey) -> (&'static str, &'static str, bool) {
+/// The shader pair for one program.
+fn bodies(key: ProgramKey) -> (&'static str, &'static str) {
     match key {
-        ProgramKey::Layers => (LAYER_VERTEX, LAYER_FRAGMENT, false),
-        ProgramKey::Effects => (LAYER_VERTEX, EFFECT_FRAGMENT, false),
-        ProgramKey::Box => (LAYER_VERTEX, BOX_FRAGMENT, false),
-        ProgramKey::OutputSrgb => (LAYER_VERTEX, OUTPUT_FRAGMENT, false),
-        ProgramKey::OutputLinear => (LAYER_VERTEX, OUTPUT_FRAGMENT, true),
-        ProgramKey::OutputScRgb => (LAYER_VERTEX, OUTPUT_FRAGMENT, true),
-        ProgramKey::Resolve => (LAYER_VERTEX, RESOLVE_FRAGMENT, false),
-        ProgramKey::Capture => (LAYER_VERTEX, CAPTURE_FRAGMENT, false),
-        ProgramKey::Rects => (RECT_VERTEX, RECT_FRAGMENT, false),
-        ProgramKey::Sectors => (SECTOR_VERTEX, SECTOR_FRAGMENT, false),
-        ProgramKey::Ellipses => (ELLIPSE_VERTEX, ELLIPSE_FRAGMENT, false),
-        ProgramKey::Lines => (LINE_VERTEX, LINE_FRAGMENT, false),
-        ProgramKey::Glyphs => (GLYPH_VERTEX, GLYPH_FRAGMENT, false),
-        ProgramKey::Shadows => (SHADOW_VERTEX, SHADOW_FRAGMENT, false),
-        ProgramKey::Images => (IMAGE_VERTEX, IMAGE_FRAGMENT, false),
-        ProgramKey::Acrylic => (LAYER_VERTEX, ACRYLIC_FRAGMENT, false),
-        ProgramKey::AcrylicLinear => (LAYER_VERTEX, ACRYLIC_FRAGMENT, true),
-        ProgramKey::GlassKit => (LAYER_VERTEX, LIQUID_GLASS_FRAGMENT, false),
-        ProgramKey::GlassKitLinear => (LAYER_VERTEX, LIQUID_GLASS_FRAGMENT, true),
+        ProgramKey::Layers => (LAYER_VERTEX, LAYER_FRAGMENT),
+        ProgramKey::Effects => (LAYER_VERTEX, EFFECT_FRAGMENT),
+        ProgramKey::Box => (LAYER_VERTEX, BOX_FRAGMENT),
+        ProgramKey::OutputSrgb | ProgramKey::OutputScRgb => (LAYER_VERTEX, OUTPUT_FRAGMENT),
+        ProgramKey::Resolve => (LAYER_VERTEX, RESOLVE_FRAGMENT),
+        ProgramKey::Capture => (LAYER_VERTEX, CAPTURE_FRAGMENT),
+        ProgramKey::Rects => (RECT_VERTEX, RECT_FRAGMENT),
+        ProgramKey::Sectors => (SECTOR_VERTEX, SECTOR_FRAGMENT),
+        ProgramKey::Ellipses => (ELLIPSE_VERTEX, ELLIPSE_FRAGMENT),
+        ProgramKey::Lines => (LINE_VERTEX, LINE_FRAGMENT),
+        ProgramKey::Glyphs => (GLYPH_VERTEX, GLYPH_FRAGMENT),
+        ProgramKey::Shadows => (SHADOW_VERTEX, SHADOW_FRAGMENT),
+        ProgramKey::Images => (IMAGE_VERTEX, IMAGE_FRAGMENT),
+        ProgramKey::Acrylic => (LAYER_VERTEX, ACRYLIC_FRAGMENT),
+        ProgramKey::GlassKit => (LAYER_VERTEX, LIQUID_GLASS_FRAGMENT),
     }
 }
 
@@ -374,8 +371,8 @@ fn fragment_blocks(key: ProgramKey) -> String {
     match key {
         Rects | Shadows | Images => format!("{CLIP}\n{SDF}\n"),
         Sectors | Ellipses | Lines | Glyphs => format!("{CLIP}\n"),
-        Layers | Acrylic | AcrylicLinear => format!("{COVERAGE}\n"),
-        GlassKit | GlassKitLinear => format!("{COVERAGE}\n{SDF}\n"),
+        Layers | Acrylic => format!("{COVERAGE}\n"),
+        GlassKit => format!("{COVERAGE}\n{SDF}\n"),
         _ => String::new(),
     }
 }
@@ -433,7 +430,7 @@ pub fn build(key: ProgramKey) -> Program {
         buffer.push_str(WEIGHTS);
     }
 
-    let (vertex_body, fragment_body, linear) = bodies(key);
+    let (vertex_body, fragment_body) = bodies(key);
     let spec = key.spec();
     let mut inputs: Vec<(&str, u32)> = vec![("a_unit", 2)];
     inputs.extend(
@@ -443,11 +440,9 @@ pub fn build(key: ProgramKey) -> Program {
     );
     let varyings = varyings(key);
 
-    let header = match (linear, key) {
-        (true, ProgramKey::OutputScRgb) => "#define LINEAR_DOMAIN 1\n#define SCRGB_OUTPUT 1\n",
-        (true, _) => "#define LINEAR_DOMAIN 1\n",
-        (false, ProgramKey::OutputScRgb) => "#define SCRGB_OUTPUT 1\n",
-        (false, _) => "",
+    let header = match key {
+        ProgramKey::OutputScRgb => "#define SCRGB_OUTPUT 1\n",
+        _ => "",
     };
     let vertex = format!(
         "{header}{buffer}{COMMON}\n{}{}{vertex_body}",

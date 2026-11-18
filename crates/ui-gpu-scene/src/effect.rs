@@ -57,7 +57,7 @@ fn box_pass(
         device.set_uniform_mat4(u, &column_major);
     }
     let rect = [0.0f32, 0.0, width as f32, height as f32];
-    device.draw_instanced(program.id, as_bytes(&rect), 1)
+    device.draw_instanced(program.id, as_bytes(&rect))
 }
 
 /// Run one full-screen convolution/colour pass from `src` into `dest`.
@@ -116,7 +116,7 @@ fn effect_pass(
         device.set_uniform_mat4(u, &column_major);
     }
     let rect = [0.0f32, 0.0, width as f32, height as f32];
-    device.draw_instanced(program.id, as_bytes(&rect), 1)
+    device.draw_instanced(program.id, as_bytes(&rect))
 }
 
 /// Targets kept alive across frames purely as scratch space: the ping-pong textures the
@@ -132,6 +132,44 @@ pub(crate) struct Scratch {
     pub(crate) scratch: Option<Target>,
     /// Second intermediate, so a multi-pass chain never reads a target it writes.
     pub(crate) band: Option<Target>,
+}
+
+/// Copy the region into the scratch output, leaving the rest of the target clear: a material
+/// that filters nothing still cannot read the frame while that frame is bound for writing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy(
+    scratch: &mut Scratch,
+    device: &mut dyn Device,
+    program: &Program,
+    src: TextureId,
+    width: u32,
+    height: u32,
+    bounds: ui_core::geom::Rect,
+    format: TargetFormat,
+) -> Result<TextureId, GpuError> {
+    let dest = ensure_target(&mut scratch.output, device, width, height, format)?;
+    let area = device_scissor(bounds, 1.0);
+    device.set_blend(false);
+    device.bind_target(Some(dest.fbo));
+    device.set_scissor(Some(area));
+    device.set_clear_color([0.0, 0.0, 0.0, 0.0]);
+    device.clear();
+    const UNIT: [f32; 1] = [1.0];
+    effect_pass(
+        device,
+        program,
+        dest,
+        src,
+        width,
+        height,
+        [0.0, 0.0],
+        &UNIT[..],
+        &ColorMatrix::IDENTITY,
+        area,
+    )?;
+    device.set_blend(true);
+    device.set_sampling(dest.tex, Sampling::Smooth, false);
+    Ok(dest.tex)
 }
 
 /// Apply the whole `effects` chain over `src` into `scratch`, recomputing every pixel.

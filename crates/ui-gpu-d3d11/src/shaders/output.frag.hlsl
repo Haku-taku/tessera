@@ -1,7 +1,13 @@
 // Output transform: sRGB-encoded premultiplied in, PQ or scRGB premultiplied out.
 
 float srgb_decode(float c) {
-    return c <= 0.040449237 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+    // Mirrored through the origin: a channel outside the working triangle decodes as
+    // negative light instead of collapsing to black.
+    float magnitude = abs(c);
+    float decoded = magnitude <= 0.040449237
+        ? magnitude / 12.92
+        : pow((magnitude + 0.055) / 1.055, 2.4);
+    return c < 0.0 ? -decoded : decoded;
 }
 
 float pq_encode(float l) {
@@ -21,19 +27,16 @@ float4 main(PsIn input) : SV_Target {
     }
     // Premultiplied encoded values cannot be decoded directly; un-premultiply first.
     float3 straight = c.rgb / c.a;
-#ifdef LINEAR_DOMAIN
-    // The frame already holds linear light: the decode happened when the primitives
-    // were written, so only the gamut and the transfer to the output remain.
-    float3 lin = float3(max(straight.r, 0.0), max(straight.g, 0.0), max(straight.b, 0.0));
-#else
+    // The frame holds sRGB codes on every surface; an extended one lets them climb past
+    // 1.0 and fall below zero, and the decode follows the curve both ways.
     float3 lin = float3(srgb_decode(straight.r), srgb_decode(straight.g), srgb_decode(straight.b));
-#endif
     // The surface's own gamut: BT.2020 on a PQ surface, the identity on scRGB.
     lin = mul(u_gamut, lin);
 #ifdef SCRGB_OUTPUT
     // scRGB is linear light whose 1.0 is 80 nits, so the scale has already carried the
-    // scene's white into the surface's unit and nothing is left to encode.
-    float3 code = max(u_scale * lin + u_offset, 0.0);
+    // scene's white into the surface's unit and nothing is left to encode. Negative
+    // channels are colours the display holds outside sRGB's triangle.
+    float3 code = u_scale * lin + u_offset;
 #else
     float3 code = float3(pq_encode(clamp(u_scale * lin.r + u_offset, 0.0, 1.0)),
                          pq_encode(clamp(u_scale * lin.g + u_offset, 0.0, 1.0)),

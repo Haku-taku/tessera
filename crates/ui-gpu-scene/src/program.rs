@@ -1,8 +1,7 @@
-//! The eighteen programs, their instance layouts and their uniform slots.
+//! The sixteen programs, their instance layouts and their uniform slots.
 
 use crate::device::{Device, ProgramId, UniformSlot};
 use crate::error::GpuError;
-use crate::layout;
 
 /// One program pair a backend must supply shader sources for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -10,8 +9,9 @@ pub enum ProgramKey {
     Layers,
     Effects,
     Box,
+    /// Decodes the encoded frame and writes the surface's PQ codes.
     OutputSrgb,
-    OutputLinear,
+    /// The same, for an scRGB surface, whose light is written unencoded.
     OutputScRgb,
     Resolve,
     Capture,
@@ -23,19 +23,16 @@ pub enum ProgramKey {
     Shadows,
     Images,
     Acrylic,
-    AcrylicLinear,
     GlassKit,
-    GlassKitLinear,
 }
 
 impl ProgramKey {
     /// Every program, in declaration order: what a backend precompiles in the background.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 16] = [
         Self::Layers,
         Self::Effects,
         Self::Box,
         Self::OutputSrgb,
-        Self::OutputLinear,
         Self::OutputScRgb,
         Self::Resolve,
         Self::Capture,
@@ -47,9 +44,7 @@ impl ProgramKey {
         Self::Shadows,
         Self::Images,
         Self::Acrylic,
-        Self::AcrylicLinear,
         Self::GlassKit,
-        Self::GlassKitLinear,
     ];
 
     /// A dense slot for a per-program table in a backend.
@@ -60,12 +55,18 @@ impl ProgramKey {
 
 /// What the painter and the backend must agree on for one program.
 pub struct ProgramSpec {
-    /// Floats per instance.
-    pub stride: i32,
     /// Per-instance vertex attributes, in buffer order.
     pub attributes: &'static [(&'static str, i32)],
     /// Uniforms the shader must declare; a missing one is a startup error.
     pub required: &'static [&'static str],
+}
+
+impl ProgramSpec {
+    /// Floats per instance, derived from the attributes: a stride stated apart from the
+    /// layout can disagree with what the painter uploads.
+    pub fn stride(&self) -> i32 {
+        self.attributes.iter().map(|&(_, size)| size).sum()
+    }
 }
 
 const CLIP: &[&str] = &[
@@ -98,7 +99,6 @@ impl ProgramKey {
     pub fn spec(self) -> ProgramSpec {
         match self {
             Self::Layers => ProgramSpec {
-                stride: layout::RECT_STRIDE,
                 attributes: LAYER,
                 required: &[
                     "u_viewport",
@@ -108,10 +108,11 @@ impl ProgramKey {
                     "u_radius",
                     "u_exp",
                     "u_skip_empty",
+                    "u_scrim",
+                    "u_scrim_hole",
                 ],
             },
             Self::Effects => ProgramSpec {
-                stride: layout::RECT_STRIDE,
                 attributes: LAYER,
                 required: &[
                     "u_viewport",
@@ -124,7 +125,6 @@ impl ProgramKey {
                 ],
             },
             Self::Box => ProgramSpec {
-                stride: layout::RECT_STRIDE,
                 attributes: LAYER,
                 required: &[
                     "u_viewport",
@@ -135,33 +135,27 @@ impl ProgramKey {
                     "u_color",
                 ],
             },
-            Self::OutputSrgb | Self::OutputLinear | Self::OutputScRgb => ProgramSpec {
-                stride: layout::RECT_STRIDE,
+            Self::OutputSrgb | Self::OutputScRgb => ProgramSpec {
                 attributes: LAYER,
                 required: &["u_viewport", "u_src", "u_scale", "u_offset", "u_gamut"],
             },
             Self::Resolve => ProgramSpec {
-                stride: layout::RECT_STRIDE,
                 attributes: LAYER,
-                required: &["u_viewport", "u_src", "u_ss", "u_encode"],
+                required: &["u_viewport", "u_src", "u_ss"],
             },
             Self::Capture => ProgramSpec {
-                stride: layout::RECT_STRIDE,
                 attributes: LAYER,
                 required: &["u_viewport", "u_src", "u_region"],
             },
             Self::Rects => ProgramSpec {
-                stride: layout::RECT_STRIDE,
                 attributes: RECT_ATTRS,
                 required: CLIP,
             },
             Self::Sectors => ProgramSpec {
-                stride: layout::SECTOR_STRIDE,
                 attributes: &[("a_centre", 2), ("a_geom", 4), ("a_fill", 4), ("a_caps", 1)],
                 required: CLIP,
             },
             Self::Ellipses => ProgramSpec {
-                stride: layout::ELLIPSE_STRIDE,
                 attributes: &[
                     ("a_centre", 2),
                     ("a_radii", 2),
@@ -172,12 +166,10 @@ impl ProgramKey {
                 required: CLIP,
             },
             Self::Lines => ProgramSpec {
-                stride: layout::LINE_STRIDE,
                 attributes: &[("a_from", 2), ("a_to", 2), ("a_width", 1), ("a_fill", 4)],
                 required: CLIP,
             },
             Self::Glyphs => ProgramSpec {
-                stride: layout::GLYPH_STRIDE,
                 attributes: &[("a_rect", 4), ("a_atlas", 4), ("a_color", 4), ("a_kind", 1)],
                 required: &[
                     "u_viewport",
@@ -192,7 +184,6 @@ impl ProgramKey {
                 ],
             },
             Self::Shadows => ProgramSpec {
-                stride: layout::SHADOW_STRIDE,
                 attributes: &[
                     ("a_rect", 4),
                     ("a_radius", 4),
@@ -206,7 +197,6 @@ impl ProgramKey {
                 required: CLIP,
             },
             Self::Images => ProgramSpec {
-                stride: layout::IMAGE_STRIDE,
                 attributes: &[("a_rect", 4), ("a_radius", 4), ("a_uv", 4), ("a_shape", 1)],
                 required: &[
                     "u_viewport",
@@ -217,8 +207,7 @@ impl ProgramKey {
                     "u_clip_on",
                 ],
             },
-            Self::Acrylic | Self::AcrylicLinear => ProgramSpec {
-                stride: layout::RECT_STRIDE,
+            Self::Acrylic => ProgramSpec {
                 attributes: LAYER,
                 required: &[
                     "u_viewport",
@@ -231,8 +220,7 @@ impl ProgramKey {
                     "u_noise",
                 ],
             },
-            Self::GlassKit | Self::GlassKitLinear => ProgramSpec {
-                stride: layout::RECT_STRIDE,
+            Self::GlassKit => ProgramSpec {
                 attributes: LAYER,
                 required: &[
                     "u_viewport",
@@ -281,7 +269,6 @@ pub(crate) struct Uniforms {
     pub(crate) taps: Option<UniformSlot>,
     pub(crate) radius: Option<UniformSlot>,
     pub(crate) supersample: Option<UniformSlot>,
-    pub(crate) encode: Option<UniformSlot>,
     pub(crate) capture: Option<UniformSlot>,
     pub(crate) region: Option<UniformSlot>,
     pub(crate) weights: Option<UniformSlot>,
@@ -293,6 +280,10 @@ pub(crate) struct Uniforms {
     pub(crate) layer_radius: Option<UniformSlot>,
     pub(crate) layer_exp: Option<UniformSlot>,
     pub(crate) layer_skip_empty: Option<UniformSlot>,
+    /// `(runs, what light is left, the peak's code, has a hole)` for a scrim.
+    pub(crate) scrim: Option<UniformSlot>,
+    /// The hole the scrim leaves lit, as device-space `(x0, y0, x1, y1)`.
+    pub(crate) scrim_hole: Option<UniformSlot>,
     pub(crate) tint: Option<UniformSlot>,
     pub(crate) luminosity: Option<UniformSlot>,
     pub(crate) noise: Option<UniformSlot>,
@@ -328,7 +319,6 @@ impl Uniforms {
             taps: slot("u_taps"),
             radius: slot("u_radius"),
             supersample: slot("u_ss"),
-            encode: slot("u_encode"),
             capture: slot("u_capture"),
             region: slot("u_region"),
             weights: slot("u_weights"),
@@ -340,6 +330,8 @@ impl Uniforms {
             layer_radius: slot("u_radius"),
             layer_exp: slot("u_exp"),
             layer_skip_empty: slot("u_skip_empty"),
+            scrim: slot("u_scrim"),
+            scrim_hole: slot("u_scrim_hole"),
             tint: slot("u_tint"),
             luminosity: slot("u_luminosity"),
             noise: slot("u_noise"),

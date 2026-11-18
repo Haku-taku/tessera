@@ -469,12 +469,14 @@ pub(crate) fn set_i18n_env(env: std::sync::Arc<Env>) {
 
 /// Build and publish the frame's language from `--locale` (default: the system's list).
 ///
+/// `system` is what the platform reports, not the environment: a session that keeps its list
+/// in Settings states nothing in the variables a POSIX session would.
+///
 /// The gallery is the only binary that takes a language on the command line, because it
 /// is a test surface: a screenshot of another language must not need a config file.
-pub(crate) fn init_locale() {
+pub(crate) fn init_locale(system: &[String]) {
     let choice = locale_argument().unwrap_or(ui_i18n::LanguageChoice::Auto);
-    let system = ui_platform::posix_system_languages();
-    let language = ui_i18n::Language::builtin(choice, &system)
+    let language = ui_i18n::Language::builtin(choice, system)
         .expect("the built-in English catalog always builds");
     set_i18n_env(Env::with(Some(Env::root()), language));
 }

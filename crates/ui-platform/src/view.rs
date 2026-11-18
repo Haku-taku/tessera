@@ -1803,7 +1803,11 @@ impl<A: App> AppLoop<A> {
         self.supersample = ss.clamp(1, 4);
     }
 
-    fn text_scale(&self) -> f32 {
+    /// The grid a surface's content is rasterized on: the device scale times the supersample.
+    ///
+    /// Glyph tiles are authored on this grid, so a surface's origin and the screen places it
+    /// stands on are whole multiples of it.
+    pub fn text_scale(&self) -> f32 {
         self.scale * self.supersample as f32
     }
 
@@ -9580,12 +9584,15 @@ impl<A: App> AppLoop<A> {
         }
         let scale = self.text_scale();
         for panel in panels {
-            let rect = panel.rect;
-            let canvas = Rect::new(0.0, 0.0, rect.size.w, rect.size.h);
+            // A surface stands on whole pixels and glyph tiles are authored on the tree's
+            // grid: a fractional origin samples every glyph between texels, a fractional edge
+            // rounds one off.
+            let surface = crate::window::snap_surface_rect(panel.rect, scale);
+            let canvas = Rect::new(0.0, 0.0, surface.size.w, surface.size.h);
             let mut list = ui_core::draw::DrawList::new(canvas);
             list.transform = Some(ui_core::draw::Transform {
                 scale: 1.0,
-                offset: ui_core::geom::Point::new(-rect.origin.x, -rect.origin.y),
+                offset: ui_core::geom::Point::new(-surface.origin.x, -surface.origin.y),
             });
             std::mem::swap(&mut list, &mut self.list);
             let mut deferred = Vec::new();

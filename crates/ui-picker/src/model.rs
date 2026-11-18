@@ -102,6 +102,13 @@ pub(crate) enum RangeShape {
     Grid { columns: usize },
 }
 
+/// What the answer field's text names, as the filesystem or the listing describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnswerKind {
+    File,
+    Folder,
+}
+
 /// A pointer drag over the rows: where it began and the marks it must extend.
 struct DragSelect {
     anchor: usize,
@@ -116,11 +123,11 @@ pub(crate) struct Model {
     /// The rows the view draws: `entries` through the filter, in the view's order.
     rows: Vec<Entry>,
     pub(crate) load: Load,
-    /// The keyboard's row, and the row the next click extends from. In a multi mode it may
-    /// be unmarked: moving with the arrows does not change what is selected, as in every
-    /// native dialog.
+    /// The keyboard's row, and the row the next click extends from. It may be unmarked: a
+    /// plain move marks its row, and `Ctrl` moves browse without changing the answer.
     pub(crate) cursor: Option<usize>,
-    /// Rows marked in a multi mode, always sorted: the answer comes back in row order.
+    /// Rows the user has marked, always sorted. The answer in a multi mode, and the set the
+    /// file verbs act on in every mode.
     marked: Vec<usize>,
     /// The row a Shift extension grows from: the last row a plain click or arrow selected.
     anchor: Option<usize>,
@@ -131,8 +138,11 @@ pub(crate) struct Model {
     filters: Vec<FileTypeFilter>,
     active: Option<usize>,
     mode: Mode,
-    /// The name a save mode would write; kept while navigating, as native dialogs do.
-    pub(crate) save_name: String,
+    /// The text of the answer field: a name for a save, a path for a mode that answers with
+    /// one. A single mode's accept reads this and nothing else.
+    pub(crate) answer: String,
+    /// What `answer` was last resolved to, with the kind of thing it names.
+    answer_checked: Option<(PathBuf, AnswerKind)>,
     /// The names a `SaveFiles` mode writes into the folder the user picks.
     save_names: Vec<String>,
     /// Applied to a save name that has no extension of its own.
@@ -149,7 +159,7 @@ pub(crate) struct Model {
 
 impl Model {
     pub(crate) fn new(source: Arc<dyn ListingSource>, start: PathBuf, mode: Mode) -> Self {
-        Self {
+        let mut model = Self {
             source,
             request: ListingRequest::new(start),
             entries: Arc::new(Vec::new()),
@@ -162,14 +172,18 @@ impl Model {
             filters: Vec::new(),
             active: None,
             mode,
-            save_name: String::new(),
+            answer: String::new(),
+            answer_checked: None,
             save_names: Vec::new(),
             default_extension: None,
             overwrite: OverwritePolicy::Prompt,
             strict_types: false,
             pending_select: None,
             searching: false,
-        }
+        };
+        // A folder picker answers with the folder it is in until a row says otherwise.
+        model.sync_answer();
+        model
     }
 
     /// Put the cursor on `path` as soon as a listing names it; a path the directory does
@@ -272,23 +286,30 @@ impl Model {
         self.mode
     }
 
-    /// Whether the row at `index` is part of what accept would return.
-    ///
-    /// A single mode's cursor is its selection even when the row is a directory the mode
-    /// will not accept: the highlight says where the keyboard is, and `accepted` is what
-    /// decides whether the button may be pressed.
-    pub(crate) fn is_selected(&self, index: usize) -> bool {
-        if self.mode.is_multi() {
-            return self.marked.contains(&index);
+    /// The answer field's text, which a single mode's accept reads as its answer.
+    pub(crate) fn answer(&self) -> &str {
+        &self.answer
+    }
+
+    /// The user edited the answer field: their text is the answer until the selection
+    /// changes, as a platform dialog's name box is.
+    pub(crate) fn set_answer(&mut self, text: String) {
+        self.answer = text;
+        // A save's text is a name joined to the folder, not a path to resolve.
+        if !self.mode.is_save() {
+            self.refresh_answer();
         }
-        self.cursor == Some(index)
+    }
+
+    /// Whether the row at `index` is marked.
+    pub(crate) fn is_selected(&self, index: usize) -> bool {
+        self.marked.contains(&index)
     }
 
     /// Whether the keyboard's cursor stands on `index`.
     ///
-    /// A multi mode can hold marks the cursor is not on (`Ctrl+Arrow` browses without
-    /// changing the answer), so the marks alone cannot say where the keyboard is: the view
-    /// paints the cursor apart from the selection.
+    /// The marks may not include the cursor (`Ctrl+Arrow` browses without changing them), so
+    /// the marks alone cannot say where the keyboard is: the view paints it separately.
     pub(crate) fn is_cursor(&self, index: usize) -> bool {
         self.cursor == Some(index)
     }
@@ -315,7 +336,26 @@ impl Model {
                 self.save_accepts(&chosen).then_some((paths, filter))
             }
             Mode::SelectFolder if self.searching => None,
-            Mode::SelectFolder => Some((vec![self.request.path.clone()], filter)),
+            // An empty field is the folder on screen; a marked or typed one has to name a
+            // folder, and two marked folders leave the answer to the user.
+            Mode::SelectFolder => {
+                let folders = self
+                    .marked
+                    .iter()
+                    .filter_map(|index| self.rows.get(*index))
+                    .filter(|entry| entry.directory)
+                    .count();
+                if folders > 1 {
+                    return None;
+                }
+                if self.answer.trim().is_empty() {
+                    return Some((vec![self.request.path.clone()], filter));
+                }
+                match &self.answer_checked {
+                    Some((path, AnswerKind::Folder)) => Some((vec![path.clone()], filter)),
+                    _ => None,
+                }
+            }
             Mode::SelectFolders => {
                 let paths: Vec<PathBuf> = self
                     .marked
@@ -326,11 +366,10 @@ impl Model {
                     .collect();
                 (!paths.is_empty()).then_some((paths, filter))
             }
-            Mode::OpenFile => self
-                .cursor
-                .and_then(|index| self.rows.get(index))
-                .filter(|entry| !entry.directory)
-                .map(|entry| (vec![entry.path.clone()], filter)),
+            Mode::OpenFile => match &self.answer_checked {
+                Some((path, AnswerKind::File)) => Some((vec![path.clone()], filter)),
+                _ => None,
+            },
             Mode::OpenFiles => {
                 let paths: Vec<PathBuf> = self
                     .marked
@@ -342,6 +381,83 @@ impl Model {
                 (!paths.is_empty()).then_some((paths, filter))
             }
         }
+    }
+
+    /// Rewrite the answer field from the marks: a single mode's answer is one row the mode
+    /// can name, and none leaves a folder mode with the folder it is standing in.
+    ///
+    /// The selection is the verbs' set first, so the rows a mode cannot name are counted
+    /// but never chosen: marking a folder to delete cannot take an open dialog's answer.
+    fn sync_answer(&mut self) {
+        let eligible = |model: &Self, directories: bool| -> Vec<PathBuf> {
+            model
+                .marked
+                .iter()
+                .filter_map(|index| model.rows.get(*index))
+                .filter(|entry| entry.directory == directories)
+                .map(|entry| entry.path.clone())
+                .collect()
+        };
+        match self.mode {
+            Mode::OpenFile => {
+                self.answer = match eligible(self, false).as_slice() {
+                    [path] => path.display().to_string(),
+                    _ => String::new(),
+                };
+            }
+            Mode::SelectFolder => {
+                self.answer = match eligible(self, true).as_slice() {
+                    [path] => path.display().to_string(),
+                    [] => self.request.path.display().to_string(),
+                    _ => String::new(),
+                };
+            }
+            _ => return,
+        }
+        self.refresh_answer();
+    }
+
+    /// Resolve the answer text to what it names. The rows answer first, so a selection costs
+    /// no filesystem call; a typed path is asked of the filesystem, which is what lets the
+    /// dialog answer with something the listing does not show.
+    fn refresh_answer(&mut self) {
+        let text = self.answer.trim();
+        self.answer_checked = if text.is_empty() {
+            None
+        } else {
+            let path = typed_path(&self.request.path, text);
+            // The folder on screen needs no filesystem call, and a folder mode's field
+            // starts out naming it.
+            let kind = if path == self.request.path {
+                Some(AnswerKind::Folder)
+            } else {
+                self.rows
+                    .iter()
+                    .find(|entry| entry.path == path)
+                    .map(|entry| {
+                        if entry.directory {
+                            AnswerKind::Folder
+                        } else {
+                            AnswerKind::File
+                        }
+                    })
+                    .or_else(|| match std::fs::metadata(&path) {
+                        Ok(metadata) if metadata.is_dir() => Some(AnswerKind::Folder),
+                        Ok(metadata) if metadata.is_file() => Some(AnswerKind::File),
+                        _ => None,
+                    })
+            };
+            kind.map(|kind| (path, kind))
+        };
+    }
+
+    /// Drop every mark, as `Ctrl+D` does. The cursor stays, so the keyboard keeps its place
+    /// and a folder mode's answer falls back to the folder on screen.
+    pub(crate) fn clear_selection(&mut self) {
+        self.marked.clear();
+        self.anchor = None;
+        self.drag = None;
+        self.sync_answer();
     }
 
     /// Whether a save may accept these names: the active filter, when the request enforces
@@ -372,7 +488,7 @@ impl Model {
     /// The path a save would write: the current folder plus the typed name, with the
     /// default extension appended when the name has none.
     fn save_path(&self) -> Option<PathBuf> {
-        let name = self.save_name.trim();
+        let name = self.answer.trim();
         if name.is_empty() || name.contains(['/', '\\', '\0']) {
             return None;
         }
@@ -415,6 +531,7 @@ impl Model {
         self.marked.clear();
         self.anchor = None;
         self.drag = None;
+        self.sync_answer();
     }
 
     pub(crate) fn up(&mut self) {
@@ -447,10 +564,9 @@ impl Model {
                 self.sort_and_filter();
                 self.load = Load::Ready;
                 if let Some(path) = self.pending_select.take() {
-                    self.cursor = self
-                        .rows
-                        .iter()
-                        .position(|entry| entry.path == path);
+                    if let Some(index) = self.rows.iter().position(|entry| entry.path == path) {
+                        self.place_cursor(index);
+                    }
                 }
             }
             ListingState::Failed(reason) => {
@@ -514,18 +630,9 @@ impl Model {
         self.load = Load::Loading;
     }
 
-    /// Put the cursor on `index`. A single mode's selection moves with it; a multi mode's
-    /// marks are left alone, so the arrows can browse without changing the answer.
-    pub(crate) fn select(&mut self, index: usize) {
-        if index >= self.rows.len() {
-            return;
-        }
-        self.cursor = Some(index);
-    }
-
-    /// Mark or unmark the row at `index`, the way a click does in a multi mode.
+    /// Mark or unmark the row at `index`, as `Ctrl` click and `Space` do.
     pub(crate) fn toggle(&mut self, index: usize) {
-        if index >= self.rows.len() || !self.mode.is_multi() {
+        if index >= self.rows.len() {
             return;
         }
         match self.marked.binary_search(&index) {
@@ -534,14 +641,16 @@ impl Model {
             }
             Err(at) => self.marked.insert(at, index),
         }
+        self.sync_answer();
     }
 
-    /// The paths a file verb acts on: the marked rows in a multi mode, the cursor's row in
-    /// a single one.
+    /// The paths a file verb acts on: the marked rows, or the cursor's row when nothing is
+    /// marked.
     ///
-    /// The cursor answers even when the mode will not accept it (a folder in a file mode):
-    /// "Select folder" and "Rename" are about the row the user stands on, not about what the
-    /// dialog's accept button would return.
+    /// Marks are the user's set in every mode, so a verb can act on several rows in a
+    /// dialog that answers with one; the cursor is the fallback for a listing the user has
+    /// only focused, and it answers even when accept would not (a folder in a file mode),
+    /// because "Rename" is about the row the user stands on.
     pub(crate) fn selection_paths(&self) -> Vec<PathBuf> {
         self.selection_entries()
             .iter()
@@ -552,7 +661,7 @@ impl Model {
     /// The rows a verb acts on, as the listing knows them: a mark answers both the path and
     /// whether the row is a folder, and a verb that must refuse one needs both.
     pub(crate) fn selection_entries(&self) -> Vec<&Entry> {
-        if self.mode.is_multi() {
+        if !self.marked.is_empty() {
             return self
                 .marked
                 .iter()
@@ -565,22 +674,20 @@ impl Model {
             .collect()
     }
 
-    /// Mark every row the mode can answer that is not marked, and unmark the rest.
+    /// Mark every unmarked row and unmark the rest.
     pub(crate) fn invert_selection(&mut self) -> Action {
-        if !self.mode.is_multi() {
-            return Action::Redraw;
-        }
         self.marked = (0..self.rows.len())
-            .filter(|index| self.row_takes(*index) && self.marked.binary_search(index).is_err())
+            .filter(|index| self.marked.binary_search(index).is_err())
             .collect();
         if let Some(first) = self.marked.first().copied() {
             self.cursor = Some(first);
             self.anchor = Some(first);
         }
+        self.sync_answer();
         Action::Redraw
     }
 
-    /// Mark the cursor's row in a multi mode, so Enter and the accept button agree.
+    /// Mark the cursor's row, so Enter and the accept button agree.
     pub(crate) fn toggle_cursor(&mut self) {
         if let Some(index) = self.cursor {
             self.toggle(index);
@@ -592,16 +699,16 @@ impl Model {
     /// The caller decides what one screen row means — one entry in the list, a row of cells
     /// in the grid — because that is the view's geometry, not the model's.
     pub(crate) fn move_selection(&mut self, next: usize) -> Action {
-        self.cursor = Some(next);
-        if self.mode.is_multi() {
-            // An arrow moves the selection, as it does in Explorer and Dolphin: a cursor
-            // the answer does not follow would leave the highlighted row unexplained.
-            if self.row_takes(next) {
-                self.marked.clear();
-                self.marked.push(next);
-            }
-            self.anchor = Some(next);
+        if next >= self.rows.len() {
+            return Action::Redraw;
         }
+        self.cursor = Some(next);
+        // An arrow moves the selection, as it does in Explorer and Dolphin: a cursor the
+        // answer does not follow would leave the highlighted row unexplained.
+        self.marked.clear();
+        self.marked.push(next);
+        self.anchor = Some(next);
+        self.sync_answer();
         Action::Redraw
     }
 
@@ -616,9 +723,8 @@ impl Model {
         let anchor = self.anchor.or(self.cursor).unwrap_or(next);
         self.anchor = Some(anchor);
         self.cursor = Some(next);
-        if self.mode.is_multi() {
-            self.marked = self.marks_in(anchor, next, shape);
-        }
+        self.marked = self.marks_in(anchor, next, shape);
+        self.sync_answer();
         Action::Redraw
     }
 
@@ -649,18 +755,14 @@ impl Model {
         true
     }
 
-    /// Select every row the mode can answer (Ctrl+A).
+    /// Select every row (Ctrl+A).
     pub(crate) fn select_all(&mut self) -> Action {
-        if !self.mode.is_multi() {
-            return Action::Redraw;
-        }
-        self.marked = (0..self.rows.len())
-            .filter(|index| self.row_takes(*index))
-            .collect();
+        self.marked = (0..self.rows.len()).collect();
         if let Some(first) = self.marked.first().copied() {
             self.cursor = Some(first);
             self.anchor = Some(first);
         }
+        self.sync_answer();
         Action::Redraw
     }
 
@@ -676,31 +778,19 @@ impl Model {
         Action::Redraw
     }
 
-    /// Move the cursor the way a plain selection does: the marks follow it in a multi mode.
+    /// Move the cursor the way a plain selection does: the marks follow it.
     fn place_cursor(&mut self, index: usize) {
         if index >= self.rows.len() {
             return;
         }
         self.cursor = Some(index);
-        if self.mode.is_multi() && self.row_takes(index) {
-            self.marked.clear();
-            self.marked.push(index);
-        }
+        self.marked.clear();
+        self.marked.push(index);
         self.anchor = Some(index);
+        self.sync_answer();
     }
 
-    /// Whether the mode's answer can name this row, which is also what a click may mark.
-    fn row_takes(&self, index: usize) -> bool {
-        self.rows.get(index).is_some_and(|entry| {
-            if self.mode.takes_directories() {
-                entry.directory
-            } else {
-                !entry.directory
-            }
-        })
-    }
-
-    /// Every acceptable cell between two indices, inclusive, in the shape the view shows.
+    /// Every cell between two indices, inclusive, in the shape the view shows.
     fn marks_in(&self, from: usize, to: usize, shape: RangeShape) -> Vec<usize> {
         let cells: Vec<usize> = match shape {
             RangeShape::Grid { columns } if columns > 1 => {
@@ -723,9 +813,6 @@ impl Model {
             _ => (from.min(to)..=from.max(to)).collect(),
         };
         cells
-            .into_iter()
-            .filter(|index| self.row_takes(*index))
-            .collect()
     }
 
     /// The engine reported a press travelled past the drag threshold on `anchor`.
@@ -746,7 +833,7 @@ impl Model {
     /// it carries only itself, because dragging an unmarked row must not smuggle the old
     /// selection out of the dialog.
     pub(crate) fn drag_paths(&self, index: usize) -> Vec<PathBuf> {
-        let marked = self.mode.is_multi() && self.marked.contains(&index);
+        let marked = self.marked.contains(&index);
         if marked {
             let paths: Vec<PathBuf> = self
                 .marked
@@ -795,15 +882,14 @@ impl Model {
         }
         let anchor = anchor.min(self.rows.len() - 1);
         self.cursor = Some(row);
-        if self.mode.is_multi() {
-            let mut marks = self.marks_in(anchor, row, shape);
-            if modifiers.ctrl {
-                marks.extend(base);
-                marks.sort_unstable();
-                marks.dedup();
-            }
-            self.marked = marks;
+        let mut marks = self.marks_in(anchor, row, shape);
+        if modifiers.ctrl {
+            marks.extend(base);
+            marks.sort_unstable();
+            marks.dedup();
         }
+        self.marked = marks;
+        self.sync_answer();
         Action::Redraw
     }
 
@@ -812,11 +898,12 @@ impl Model {
         self.drag = None;
     }
 
-    /// What Enter does to the cursor's row.
+    /// What Enter does.
     ///
-    /// A directory is always a step into it; a folder picker accepts its current folder
-    /// with the button, not with Enter. A save mode's Enter is the accept button's, since
-    /// the name field, not the row, is what it would write.
+    /// The answer field is read first, because its answer is what the button would return;
+    /// a typed folder in an open mode is a step into it, as a platform's name box enters
+    /// one. A directory row is always a step into it; a folder picker accepts its folder
+    /// with the button, not with Enter. A save mode's Enter is the accept button's.
     ///
     /// A listing that has not landed yet answers nothing: the rows on screen are the
     /// directory the user left, and accepting one of them would hand the app a path the
@@ -827,6 +914,13 @@ impl Model {
         }
         if let Some((paths, _)) = self.accepted() {
             return Action::Accept(paths);
+        }
+        if !self.mode.is_save()
+            && !self.mode.takes_directories()
+            && let Some((path, AnswerKind::Folder)) = self.answer_checked.clone()
+        {
+            self.navigate(path);
+            return Action::Redraw;
         }
         let Some(entry) = self.cursor.and_then(|index| self.rows.get(index)) else {
             return Action::Redraw;
@@ -856,10 +950,13 @@ impl Model {
         self.drag = None;
         let is_file = !self.rows[index].directory;
         // A save with a name field takes an existing file's name, as native dialogs do;
-        // `SaveFiles` has no field, its names come from the request.
+        // `SaveFiles` has no field, its names come from the request. A modified click is
+        // the selection gesture, so it must not overwrite a name the user is typing.
         if self.mode == Mode::SaveFile && is_file {
             self.take_click(index, modifiers, shape);
-            self.save_name = self.rows[index].name.clone();
+            if !modifiers.ctrl && !modifiers.shift {
+                self.set_answer(self.rows[index].name.clone());
+            }
             return Action::Redraw;
         }
         if open {
@@ -869,13 +966,10 @@ impl Model {
                 return Action::Redraw;
             }
             self.take_click(index, modifiers, shape);
-            // A file is the answer in the modes that open one; a mode that answers with
-            // directories, or with names no click names, has nothing to take here.
+            // A double click commits the file it names, whatever else is marked: a set the
+            // answer cannot take must not keep the gesture from answering its own row.
             if !self.mode.is_save() && !self.mode.takes_directories() {
-                return match self.accepted() {
-                    Some((paths, _)) => Action::Accept(paths),
-                    None => Action::Redraw,
-                };
+                return Action::Accept(vec![self.rows[index].path.clone()]);
             }
             return Action::Redraw;
         }
@@ -885,34 +979,24 @@ impl Model {
 
     /// Mark the row a click touched: plain replaces, Ctrl toggles, Shift extends.
     fn take_click(&mut self, index: usize, modifiers: Modifiers, shape: RangeShape) {
-        if self.mode.is_multi() {
-            let takes = self.row_takes(index);
-            if modifiers.ctrl {
-                self.cursor = Some(index);
-                self.anchor = Some(index);
-                if takes {
-                    self.toggle(index);
-                }
-                return;
-            }
-            if modifiers.shift {
-                let anchor = self.anchor.or(self.cursor).unwrap_or(index);
-                self.cursor = Some(index);
-                self.marked = self.marks_in(anchor, index, shape);
-                return;
-            }
+        if modifiers.ctrl {
             self.cursor = Some(index);
             self.anchor = Some(index);
-            // A row the mode cannot answer is a step of navigation; clicking it while
-            // browsing must not throw away the marks the user is assembling.
-            if takes {
-                self.marked.clear();
-                self.marked.push(index);
-            }
+            self.toggle(index);
             return;
         }
-        self.select(index);
+        if modifiers.shift {
+            let anchor = self.anchor.or(self.cursor).unwrap_or(index);
+            self.cursor = Some(index);
+            self.marked = self.marks_in(anchor, index, shape);
+            self.sync_answer();
+            return;
+        }
+        self.cursor = Some(index);
         self.anchor = Some(index);
+        self.marked.clear();
+        self.marked.push(index);
+        self.sync_answer();
     }
 
     pub(crate) fn accept_enabled(&self) -> bool {
@@ -987,6 +1071,7 @@ impl Model {
             .collect();
         self.marked.sort_unstable();
         self.marked.dedup();
+        self.sync_answer();
     }
 }
 
@@ -1044,6 +1129,30 @@ fn significant(run: &[u8]) -> &[u8] {
         // All zeros: one zero, so `0` and `000` compare equal and the tie-break decides.
         None => &run[run.len().saturating_sub(1)..],
     }
+}
+
+/// The path a typed address or answer names, resolved against the directory on screen when
+/// relative. One resolver for the address bar and the answer field keeps their rules alike.
+pub(crate) fn typed_path(base: &Path, input: &str) -> PathBuf {
+    use std::path::Component;
+
+    let raw = Path::new(input);
+    let mut path = PathBuf::new();
+    if !raw.is_absolute() {
+        path.push(base);
+    }
+    for component in raw.components() {
+        match component {
+            Component::Prefix(prefix) => path.push(prefix.as_os_str()),
+            Component::RootDir => path.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                path.pop();
+            }
+            Component::Normal(name) => path.push(name),
+        }
+    }
+    path
 }
 
 #[cfg(test)]
@@ -1168,11 +1277,11 @@ mod tests {
         model.navigate(PathBuf::from("/second"));
         // The previous directory's row is still on screen and still clickable; accepting it
         // would hand the app a path the dialog is no longer showing.
-        model.select(0);
+        model.place_cursor(0);
         assert!(!model.accept_enabled());
         assert!(matches!(model.activate(), Action::Redraw));
         model.poll();
-        model.select(0);
+        model.place_cursor(0);
         assert!(model.accept_enabled());
         assert!(matches!(model.activate(), Action::Accept(_)));
     }
@@ -1302,6 +1411,84 @@ mod tests {
     }
 
     #[test]
+    fn a_single_mode_answers_one_mark_and_clears_when_the_set_cannot() {
+        let mut model = model_with(
+            "/a",
+            vec![entry("folder", true), entry("a.txt", false), entry("b.txt", false)],
+        );
+        model.row_clicked(1, Modifiers::NONE, RangeShape::Column, false);
+        let (paths, _) = model.accepted().expect("one file is the answer");
+        assert_eq!(paths, [PathBuf::from("/dir/a.txt")]);
+        // A folder marked for the verbs is not a second candidate.
+        model.row_clicked(0, ctrl(), RangeShape::Column, false);
+        let (paths, _) = model.accepted().expect("the folder does not take the file's place");
+        assert_eq!(paths, [PathBuf::from("/dir/a.txt")]);
+        model.row_clicked(2, ctrl(), RangeShape::Column, false);
+        assert!(
+            model.accepted().is_none(),
+            "two files answer no single-file mode"
+        );
+        assert!(model.answer().is_empty(), "the field says there is no answer");
+        model.clear_selection();
+        assert!(model.accepted().is_none(), "no mark answers no file");
+    }
+
+    #[test]
+    fn a_folder_mode_answers_the_marked_folder_or_the_folder_on_screen() {
+        let mut model = model_with(
+            "/a",
+            vec![entry("one", true), entry("two", true), entry("notes.txt", false)],
+        );
+        model.mode = Mode::SelectFolder;
+        model.sync_answer();
+        let (paths, _) = model.accepted().expect("the folder on screen is the answer");
+        assert_eq!(paths, [PathBuf::from("/a")]);
+        model.row_clicked(0, Modifiers::NONE, RangeShape::Column, false);
+        let (paths, _) = model.accepted().expect("the marked folder is the answer");
+        assert_eq!(paths, [PathBuf::from("/dir/one")]);
+        model.row_clicked(2, ctrl(), RangeShape::Column, false);
+        let (paths, _) = model.accepted().expect("a marked file does not take the folder's place");
+        assert_eq!(paths, [PathBuf::from("/dir/one")]);
+        model.row_clicked(1, ctrl(), RangeShape::Column, false);
+        assert!(
+            model.accepted().is_none(),
+            "two folders answer no single-folder mode"
+        );
+        model.clear_selection();
+        let (paths, _) = model.accepted().expect("Ctrl+D falls back to the folder on screen");
+        assert_eq!(paths, [PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn a_double_click_commits_the_file_it_names_not_the_marked_set() {
+        let mut model = model_with("/a", vec![entry("a.txt", false), entry("b.txt", false)]);
+        model.mode = Mode::OpenFiles;
+        model.row_clicked(0, Modifiers::NONE, RangeShape::Column, false);
+        model.row_clicked(1, ctrl(), RangeShape::Column, false);
+        // Ctrl takes the row out of the marks as the gesture lands; the item still answers.
+        match model.row_clicked(0, ctrl(), RangeShape::Column, true) {
+            Action::Accept(paths) => assert_eq!(paths, [PathBuf::from("/dir/a.txt")]),
+            Action::Redraw => panic!("a double click on a file answers its row"),
+        }
+    }
+
+    #[test]
+    fn a_typed_path_answers_without_being_on_screen() {
+        let file = std::env::temp_dir().join("crabsnap-picker-typed-answer");
+        std::fs::write(&file, b"x").expect("the test writes its own file");
+        let mut model = model_with("/a", vec![entry("on-screen.txt", false)]);
+        model.set_answer(file.display().to_string());
+        let (paths, _) = model.accepted().expect("a typed path is the answer");
+        assert_eq!(paths, [file.clone()]);
+        // Enter on a folder path is a step into it, as the platform's name box enters one.
+        model.set_answer(std::env::temp_dir().display().to_string());
+        assert!(model.accepted().is_none(), "a folder is no answer in a file mode");
+        assert!(matches!(model.activate(), Action::Redraw));
+        assert_eq!(model.path(), std::env::temp_dir());
+        std::fs::remove_file(&file).expect("the test removes its own file");
+    }
+
+    #[test]
     fn type_ahead_advances_through_names_with_the_same_initial_and_wraps() {
         let mut model = model_with(
             "/a",
@@ -1358,13 +1545,13 @@ mod tests {
         let mut model = model_with("/a", vec![entry("old.txt", false)]);
         model.mode = Mode::SaveFile;
         model.set_default_extension(Some("png".to_string()));
-        model.save_name = "shot".to_string();
+        model.set_answer("shot".to_string());
         let (paths, _) = model.accepted().expect("a name in a readable folder is a path");
         assert_eq!(paths, [PathBuf::from("/a/shot.png")]);
-        model.save_name = "shot.png".to_string();
+        model.set_answer("shot.png".to_string());
         let (paths, _) = model.accepted().expect("the name already has an extension");
         assert_eq!(paths, [PathBuf::from("/a/shot.png")]);
-        model.save_name = "no/slashes".to_string();
+        model.set_answer("no/slashes".to_string());
         assert!(
             model.accepted().is_none(),
             "a name carrying a path is not a file name"
@@ -1382,7 +1569,7 @@ mod tests {
         answer(&source, "/dir/two", vec![entry("inside", true)]);
         let mut model = Model::new(Arc::new(source), PathBuf::from("/a"), Mode::SelectFolders);
         model.poll();
-        // A file is not an answer in a folder mode, so clicking one marks nothing.
+        // A file is no answer in a folder mode; marking it leaves the folders to answer.
         model.row_clicked(2, Modifiers::NONE, RangeShape::Column, false);
         assert!(model.accepted().is_none());
         model.row_clicked(0, ctrl(), RangeShape::Column, false);
@@ -1424,12 +1611,12 @@ mod tests {
             Some(0),
         );
         model.set_save_policy(OverwritePolicy::Allow, true);
-        model.save_name = "notes.txt".to_string();
+        model.set_answer("notes.txt".to_string());
         assert!(
             model.accepted().is_none(),
             "a strict request does not accept a name its filter rejects"
         );
-        model.save_name = "notes.png".to_string();
+        model.set_answer("notes.png".to_string());
         assert!(model.accepted().is_some());
     }
 
@@ -1461,5 +1648,16 @@ mod tests {
             model.thumbnail_request(file, too_big, 32).is_none(),
             "a file past the size limit sends no request"
         );
+    }
+
+    /// A typed address is relative to the directory on screen, and `.` and `..` are folds
+    /// rather than characters the filesystem would have to resolve.
+    #[test]
+    fn a_typed_path_folds_dots_and_joins_a_relative_one() {
+        let base = Path::new("base");
+        assert_eq!(typed_path(base, "c"), PathBuf::from("base/c"));
+        assert_eq!(typed_path(base, "../c"), PathBuf::from("c"));
+        assert_eq!(typed_path(base, "./c/../d"), PathBuf::from("base/d"));
+        assert_eq!(typed_path(base, ".."), PathBuf::from(""));
     }
 }

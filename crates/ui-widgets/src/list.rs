@@ -83,22 +83,9 @@ impl<'a> List<'a> {
 
         // The unified scroll container owns the clip, the wheel and the offset; the list
         // only contributes its rows and a background.
-        // The default thumb is translucent black, which vanishes on a dark list; it takes
-        // the pack's own ink instead.
-        let thumb = ui_core::geom::Color {
-            a: 0.4,
-            ..self.pack.colour_or(
-                ui_design::CommonColor::OnSurface,
-                ui_core::geom::Color::WHITE,
-            )
-        };
-        let bar = crate::scroll::ScrollbarConf {
-            thumb,
-            ..crate::scroll::ScrollbarConf::default()
-        };
         let mut list = Scroll::fixed(self.id, self.width, self.height)
             .background(fill, Corners::all(radius))
-            .with_scrollbar(bar);
+            .with_scrollbar(crate::scroll::ScrollbarConf::on(&self.pack));
         let row_width = self.width
             - self.pack.metrics.control.padding.left
             - self.pack.metrics.control.padding.right;

@@ -108,13 +108,9 @@ pub trait Device {
     fn set_uniform_mat3(&mut self, slot: UniformSlot, values: &[f32; 9]);
     fn set_uniform_mat4(&mut self, slot: UniformSlot, values: &[f32; 16]);
 
-    /// Draw the unit quad once per instance, reading `instances` in the program's layout.
-    fn draw_instanced(
-        &mut self,
-        program: ProgramId,
-        instances: &[u8],
-        count: u32,
-    ) -> Result<(), GpuError>;
+    /// Draw the unit quad once per instance in `instances`, read in the program's layout. The
+    /// count comes from the slice: one a caller states separately can outrun what it uploaded.
+    fn draw_instanced(&mut self, program: ProgramId, instances: &[u8]) -> Result<(), GpuError>;
 
     /// Copy `rect` from `src` into `dst`, with no filtering and no blend.
     fn blit(&mut self, src: TargetId, dst: TargetId, rect: [i32; 4]);

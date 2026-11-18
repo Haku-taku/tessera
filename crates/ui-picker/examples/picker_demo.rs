@@ -35,7 +35,9 @@ use ui_platform::places::Place;
 use ui_platform::view::App;
 use ui_platform::window::SurfaceSpec;
 use ui_platform::{Container, Element, from_decl};
-use ui_picker::{Chooser, MIN_SIZE, PackOf, Picker, PickerOptions, PickerOutcome, PickerState};
+use ui_picker::{
+    Chooser, MIN_SIZE, MenuStyleOf, PackOf, Picker, PickerOptions, PickerOutcome, PickerState,
+};
 use ui_style::{Env, MotionName, StyleScope};
 use ui_widgets::{Button, Cx, Pressable, Text};
 
@@ -105,6 +107,8 @@ struct Demo {
     /// The picker shown in this window when the host refused a dialog surface.
     embedded: Embedded,
     packs: [PackOf; 3],
+    /// Each pack's engine-menu material, so a dialog's context menus follow its pack.
+    menu_styles: [MenuStyleOf; 3],
     env: Arc<Env>,
 }
 
@@ -294,6 +298,11 @@ impl Demo {
 }
 
 impl App for Demo {
+    /// The page and its in-window dialog draw with the first pack, so their menus do too.
+    fn menu_style(&self) -> Option<ui_widgets::MenuStyle> {
+        Some((self.menu_styles[0])(self.appearance()))
+    }
+
     fn view(&mut self, cx: &mut ui_core::cx::Cx<'_>) -> Box<dyn Element> {
         let width = cx.width() as f32;
         let height = cx.height() as f32;
@@ -431,7 +440,9 @@ fn run() -> Result<(), String> {
     // The host's handle follows whichever surface it opened last, so one obtained now is
     // still the right owner once the dialog's own window exists.
     let shell_menu = host.shell_menu();
-    let env = language_env();
+    // The platform keeps the preferred-UI-language list; the environment is only how a POSIX
+    // session states it, and a Windows launch from the shell states nothing.
+    let env = language_env(&host.languages());
     use ui_platform::ThemeWatcher as _;
     // The page offers the switch, but the system's own preference is what the first frame
     // opens in; `PICKER_DEMO_DARK=0|1` seeds it for a screenshot without a click.
@@ -444,6 +455,11 @@ fn run() -> Result<(), String> {
         ui_widgets_md3::pack_of,
         ui_widgets_fluent::pack_of,
         ui_widgets_glass::pack_of,
+    ];
+    let menu_styles: [MenuStyleOf; 3] = [
+        ui_widgets_md3::menu_style_of,
+        ui_widgets_fluent::menu_style_of,
+        ui_widgets_glass::menu_style_of,
     ];
     let start = start_directory(&places);
     let shared: SharedHandle = Rc::new(RefCell::new(Shared {
@@ -464,6 +480,7 @@ fn run() -> Result<(), String> {
         shared: Rc::clone(&shared),
         embedded: Rc::clone(&embedded),
         packs,
+        menu_styles,
         env: Arc::clone(&env),
     };
     let parent = host.open(
@@ -494,7 +511,13 @@ fn run() -> Result<(), String> {
             Appearance::Light
         };
         let scoped = Env::with_scope(Some(Arc::clone(&env)), StyleScope::new(appearance), ());
-        let options = PickerOptions::new(listings.clone(), start.clone(), packs[index], scoped)
+        let options = PickerOptions::new(
+            listings.clone(),
+            start.clone(),
+            packs[index],
+            menu_styles[index],
+            scoped,
+        )
             .places(places.clone())
             .devices(devices.clone())
             .volumes(volumes.clone())
@@ -611,9 +634,8 @@ fn surface_options() -> OpenOptions {
     }
 }
 
-fn language_env() -> Arc<Env> {
-    let system = ui_platform::posix_system_languages();
-    match Language::builtin(LanguageChoice::Auto, &system) {
+fn language_env(system: &[String]) -> Arc<Env> {
+    match Language::builtin(LanguageChoice::Auto, system) {
         Ok(language) => Env::with(Some(Env::root()), language),
         Err(error) => {
             eprintln!("picker_demo: no built-in catalog ({error}); the dialog stays English");

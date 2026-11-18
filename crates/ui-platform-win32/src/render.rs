@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use ui_core::Damage;
 use ui_core::draw::DrawList;
 use ui_platform::present::{CanvasFrame, PresentStats};
+use ui_platform::window::ColourPolicy;
 use windows::Win32::Foundation::{HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, SetEvent,
@@ -134,6 +135,7 @@ enum Command {
         hwnd: isize,
         size: (u32, u32),
         alpha: Alpha,
+        colour: ColourPolicy,
         uncapped: bool,
         refresh_hz: Option<f32>,
         pace: Arc<FramePace>,
@@ -238,6 +240,7 @@ impl RenderThread {
         hwnd: HWND,
         size: (u32, u32),
         alpha: Alpha,
+        colour: ColourPolicy,
         uncapped: bool,
         refresh_hz: Option<f32>,
         pace: Arc<FramePace>,
@@ -249,6 +252,7 @@ impl RenderThread {
             hwnd: hwnd.0 as isize,
             size,
             alpha,
+            colour,
             uncapped,
             refresh_hz,
             pace,
@@ -385,6 +389,8 @@ struct Entry {
     hwnd: HWND,
     size: (u32, u32),
     alpha: Alpha,
+    /// What the surface asked its colour to follow; a rebuild decides again under it.
+    colour: ColourPolicy,
     uncapped: bool,
     /// The output's refresh period: one frame may hold the display for this long, and a
     /// chain that never blanks must not be presented faster than it.
@@ -568,6 +574,7 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
             hwnd,
             size,
             alpha,
+            colour,
             uncapped,
             refresh_hz,
             pace,
@@ -576,7 +583,7 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
         } => {
             let hwnd = HWND(hwnd as *mut core::ffi::c_void);
             log::debug!("ui-platform-win32: opening a chain for {hwnd:?}");
-            match Win32Presenter::open_raw(hwnd, size, alpha) {
+            match Win32Presenter::open_raw(hwnd, size, alpha, colour) {
                 Ok(presenter) => {
                     let entry = Entry {
                         presenter: Some(presenter),
@@ -586,6 +593,7 @@ fn apply(command: Command, entries: &mut Vec<Option<Entry>>) {
                         hwnd,
                         size,
                         alpha,
+                        colour,
                         uncapped,
                         period: period(refresh_hz),
                         last: None,
@@ -700,7 +708,13 @@ fn submit(index: usize, entries: &mut [Option<Entry>]) {
                 // A driver update or a lost adapter: the old chain goes first, because a
                 // window holds one flip chain at a time.
                 drop(presenter);
-                match reopen(entry.hwnd, entry.size, entry.alpha, entry.supersample) {
+                match reopen(
+                    entry.hwnd,
+                    entry.size,
+                    entry.alpha,
+                    entry.colour,
+                    entry.supersample,
+                ) {
                     Ok(fresh) => {
                         entry.presenter = Some(fresh);
                         if let Some(presenter) = entry.presenter.as_mut() {
@@ -743,7 +757,7 @@ fn submit(index: usize, entries: &mut [Option<Entry>]) {
 fn rebuild(entry: &mut Entry, reason: &str) -> Result<(), String> {
     // A window holds one flip chain at a time: the old one goes before the new one opens.
     entry.presenter = None;
-    let fresh = reopen(entry.hwnd, entry.size, entry.alpha, entry.supersample)
+    let fresh = reopen(entry.hwnd, entry.size, entry.alpha, entry.colour, entry.supersample)
         .map_err(|error| format!("the chain could not be rebuilt after {reason}: {error}"))?;
     entry.presenter = Some(fresh);
     // A new renderer holds no page, so the next frame carries both.
@@ -760,10 +774,11 @@ fn reopen(
     hwnd: HWND,
     size: (u32, u32),
     alpha: Alpha,
+    colour: ColourPolicy,
     supersample: u32,
 ) -> Result<Win32Presenter, String> {
-    let mut presenter =
-        Win32Presenter::open_raw(hwnd, size, alpha).map_err(|error| error.to_string())?;
+    let mut presenter = Win32Presenter::open_raw(hwnd, size, alpha, colour)
+        .map_err(|error| error.to_string())?;
     presenter.renderer_mut().set_supersample(supersample);
     Ok(presenter)
 }

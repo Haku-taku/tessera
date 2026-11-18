@@ -299,17 +299,19 @@ const ADAPTER: &[(CommonColor, Option<&str>)] = &[
     ),
     (CommonColor::Divider, Some("DividerStrokeColorDefaultBrush")),
     (CommonColor::Stroke, Some("ControlStrokeColorDefaultBrush")),
+    // A row's states are layers over the surface it already stands on; WinUI's own list and
+    // navigation rows use the subtle fills, whose light column darkens the page instead.
     (
         CommonColor::SurfaceHover,
-        Some("ControlFillColorSecondaryBrush"),
+        Some("SubtleFillColorSecondaryBrush"),
     ),
     (
         CommonColor::SurfacePressed,
-        Some("ControlFillColorTertiaryBrush"),
+        Some("SubtleFillColorTertiaryBrush"),
     ),
     (
         CommonColor::SurfaceSelected,
-        Some("ControlFillColorTertiaryBrush"),
+        Some("ListViewItemBackgroundSelected"),
     ),
     (CommonColor::Error, Some("SystemFillColorCriticalBrush")),
     (CommonColor::OnError, None),
@@ -329,6 +331,17 @@ impl StyleSystem for WinUISystem {
     }
 
     fn common_colour(&self, role: CommonColor) -> Resolution<Resolved<Rgba>> {
+        // WinUI's selected fill for a row is a near-surface wash that only reads with its
+        // accent indicator pill, which this plane has no role for; the accent wash carries it.
+        if role == CommonColor::SurfaceSelected
+            && self.ctx.contrast != Contrast::High
+            && let Some(accent) = self.colour("AccentFillColorDefaultBrush")
+        {
+            return Resolution::Value(Resolved::new(
+                accent.with_alpha(0x24),
+                Source::Convention("accent wash in place of WinUI's indicator selection"),
+            ));
+        }
         let Some((_, name)) = ADAPTER.iter().find(|(r, _)| *r == role) else {
             return Resolution::Unmapped;
         };
@@ -385,5 +398,49 @@ mod tests {
         // StaticResource of `ControlFillColorDefault`: the template name must land on the colour.
         assert_eq!(light().colour("ButtonBackground"), Some(Rgba(0xB3FF_FFFF)));
         assert_eq!(dark().colour("ButtonBackground"), Some(Rgba(0x0FFF_FFFF)));
+    }
+
+    fn channels(colour: Rgba) -> (f32, f32, f32) {
+        (
+            ((colour.0 >> 16) & 0xff) as f32,
+            ((colour.0 >> 8) & 0xff) as f32,
+            (colour.0 & 0xff) as f32,
+        )
+    }
+
+    fn over(top: Rgba, base: (f32, f32, f32)) -> (f32, f32, f32) {
+        let alpha = top.alpha() as f32 / 255.0;
+        let ink = channels(top);
+        (
+            ink.0 * alpha + base.0 * (1.0 - alpha),
+            ink.1 * alpha + base.1 * (1.0 - alpha),
+            ink.2 * alpha + base.2 * (1.0 - alpha),
+        )
+    }
+
+    #[test]
+    fn a_selected_row_reads_against_the_row_it_marks() {
+        // The bug this pins: selection answered `ControlFillColorTertiary`, white at 30%,
+        // which composited over the light dialog to a 2/255 step from an unmarked row.
+        for system in [light(), dark()] {
+            let selected = system.common_colour(CommonColor::SurfaceSelected);
+            let selected = selected.value().expect("WinUI answers a selected fill");
+            let raised = system
+                .colour("CardBackgroundFillColorDefaultBrush")
+                .expect("the dialog's own fill");
+            let page = system
+                .colour("ApplicationPageBackgroundThemeBrush")
+                .expect("the page under it");
+            let row = over(raised, channels(page));
+            let marked = over(selected.value, row);
+            let gap = (marked.0 - row.0)
+                .abs()
+                .max((marked.1 - row.1).abs())
+                .max((marked.2 - row.2).abs());
+            assert!(
+                gap >= 8.0,
+                "{system:?}: a marked row steps only {gap} from an unmarked one"
+            );
+        }
     }
 }

@@ -88,6 +88,6 @@ pub use transfer::{Selection, SelectionReader};
 pub use view::{App, AppLoop, FrameInfo, run_app};
 pub use volumes::{Mountable, VolumeMounter, Volumes, VolumesState};
 pub use window::{
-    Anchor, AutoHide, Constraint, ExclusiveZone, KeyboardMode, Layer, LayerSpec, PopupSpec,
-    SurfaceRole, SurfaceSpec, place_popup,
+    Anchor, AutoHide, ColourPolicy, Constraint, ExclusiveZone, KeyboardMode, Layer, LayerSpec,
+    PopupSpec, SurfaceRole, SurfaceSpec, place_popup,
 };

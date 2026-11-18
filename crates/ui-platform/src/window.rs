@@ -12,8 +12,22 @@
 //! `margin` and `size` into a rectangle on the output itself; `exclusive` and `keyboard` have
 //! no counterpart and are ignored, or approximated with "does not activate" window styles.
 
-use ui_core::geom::{Insets, Rect};
+use ui_core::geom::{Insets, Point, Rect};
 use ui_core::layout::{OverlayAlign, Side};
+
+/// What a surface's colour follows when its output can show more than SDR.
+///
+/// Interface content is authored in sRGB, so SDR is the honest default: a surface asks for
+/// more only when it draws light — a pin holding an HDR capture, a capture overlay showing
+/// one. Asking is what keeps an HDR surface from being forced on every window of an app.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColourPolicy {
+    /// Present SDR; a compositor maps it onto an HDR output like any other SDR window.
+    #[default]
+    Sdr,
+    /// Take the output's own description: HDR where the output is HDR, SDR elsewhere.
+    Auto,
+}
 
 /// What a host asks for when it opens a surface.
 #[derive(Clone, Debug)]
@@ -31,6 +45,8 @@ pub struct SurfaceSpec {
     /// its own resize path; a programmatic size still wins, as it must for a surface the app
     /// itself shrinks.
     pub min_size: Option<(u32, u32)>,
+    /// What this surface's colour follows; [`ColourPolicy::Sdr`] unless it asks.
+    pub colour: ColourPolicy,
 }
 
 impl SurfaceSpec {
@@ -41,7 +57,14 @@ impl SurfaceSpec {
             name: title.into(),
             role: SurfaceRole::Window { size },
             min_size: None,
+            colour: ColourPolicy::Sdr,
         }
+    }
+
+    /// Ask the surface to follow its output's description, HDR included.
+    pub fn with_colour(mut self, colour: ColourPolicy) -> Self {
+        self.colour = colour;
+        self
     }
 
     /// Declare the smallest client area a user may size this window to.
@@ -61,6 +84,7 @@ impl SurfaceSpec {
             name: namespace.into(),
             role: SurfaceRole::Layer(layer),
             min_size: None,
+            colour: ColourPolicy::Sdr,
         }
     }
 
@@ -76,6 +100,7 @@ impl SurfaceSpec {
             name: title.into(),
             role: SurfaceRole::Dialog { size, modal: true },
             min_size: None,
+            colour: ColourPolicy::Sdr,
         }
     }
 
@@ -246,13 +271,14 @@ pub enum KeyboardMode {
 /// What a platform popup asks for: a rectangle, an anchor, and what to do at an edge.
 ///
 /// Every coordinate is in the parent presentation's space. The engine lays the panel out in
-/// the parent tree before the surface exists, so `rect` is that subtree's rect plus whatever
-/// paints outside it, and no second layout follows. Its size is never changed by a constraint
-/// adjustment, and its origin is where the panel's own coordinates start: a platform that
-/// routes the popup's input back into the tree shifts each position by it.
+/// the parent tree before the surface exists, so `rect` is that subtree's rect grown out to the
+/// grid the panel is rasterized on, and no second layout follows. Its size is never changed by a
+/// constraint adjustment, and its origin is where the panel's own coordinates start: a platform
+/// that routes the popup's input back into the tree shifts each position by it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PopupSpec {
-    /// The laid-out panel: the surface's size, and the tree position it stands for.
+    /// The laid-out panel cut on the grid it is rasterized on: the surface's size, and the
+    /// tree position it stands for.
     pub rect: Rect,
     /// The rectangle the panel hangs from, in the parent presentation's coordinates.
     pub anchor: Rect,
@@ -303,6 +329,39 @@ impl Default for Constraint {
     fn default() -> Self {
         Self::FLIP_AND_SLIDE
     }
+}
+
+/// A surface's origin on the whole pixels its content is rasterized on.
+///
+/// A window can only stand on whole pixels, and glyphs are rasterized against the tree's own
+/// grid: a panel cut out of the tree with a fractional offset draws every glyph between two
+/// texels. Snapping the origin here keeps the paint, the window's place and the input shift
+/// naming the same pixel.
+pub fn snap_surface_origin(origin: Point, grid: f32) -> Point {
+    if !(grid.is_finite() && grid > 0.0) {
+        return origin;
+    }
+    Point::new(
+        (origin.x * grid).round() / grid,
+        (origin.y * grid).round() / grid,
+    )
+}
+
+/// A surface's rect grown out onto the whole pixels its content is rasterized on.
+///
+/// The origin comes down to the grid and the far edge up to it, so the window holds every
+/// pixel the panel painted. Taking the origin to the nearer grid line instead would shave
+/// the sliver it stepped over off one edge — the panel's border lives there.
+pub fn snap_surface_rect(rect: Rect, grid: f32) -> Rect {
+    if !(grid.is_finite() && grid > 0.0) || !(rect.size.w.is_finite() && rect.size.h.is_finite())
+    {
+        return rect;
+    }
+    let min_x = (rect.min_x() * grid).floor() / grid;
+    let min_y = (rect.min_y() * grid).floor() / grid;
+    let max_x = (rect.max_x() * grid).ceil() / grid;
+    let max_y = (rect.max_y() * grid).ceil() / grid;
+    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
 /// Where a popup lands: the preferred placement, adjusted against `bounds`.

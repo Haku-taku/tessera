@@ -168,7 +168,7 @@ fn windows_main() {
         width: W,
         height: H,
     };
-    // Building the renderer compiles all eighteen programs: a shader error surfaces here.
+    // Programs are built on first use, so a shader error surfaces at the first frame.
     let mut gpu = GpuRenderer::new(&mut device).expect("renderer");
     gpu.clear(&mut device, &offscreen, [0.0, 0.0, 0.0, 0.0]);
     let stats = gpu

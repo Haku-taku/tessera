@@ -169,7 +169,11 @@ impl Presenter {
         let (win, gpu) = {
             let mut win = win;
             let gpu = if want_gpu {
-                match GpuWindow::open(&mut win, GpuWindowConfig::default()) {
+                let config = GpuWindowConfig {
+                    colour: spec.colour,
+                    ..GpuWindowConfig::default()
+                };
+                match GpuWindow::open(&mut win, config) {
                     Ok(gpu) => Some(gpu),
                     Err(e) => {
                         return Err(format!(
@@ -402,6 +406,8 @@ fn popup_surface_spec(parent: &SurfaceSpec, spec: PopupSpec) -> SurfaceSpec {
             ),
         },
         min_size: None,
+        // A panel is the parent surface's chrome, and shows what the parent shows.
+        colour: parent.colour,
     }
 }
 
@@ -421,7 +427,11 @@ fn open_panel(
     let surface = popup_surface_spec(parent_spec, spec);
     let mut win = WaylandWindow::create_popup(parent_window, surface.clone(), spec, grab_serial)
         .map_err(|e| format!("cannot open a popup surface: {e}"))?;
-    let gpu = GpuWindow::open(&mut win, GpuWindowConfig::default())
+    let config = GpuWindowConfig {
+        colour: surface.colour,
+        ..GpuWindowConfig::default()
+    };
+    let gpu = GpuWindow::open(&mut win, config)
         .map_err(|e| format!("GPU presenter unavailable: {e}"))?;
     Ok(PopupPresenter {
         gpu,
@@ -450,13 +460,19 @@ fn open_panel_window(
         spec.rect.size.w.round().max(1.0) as u32,
         spec.rect.size.h.round().max(1.0) as u32,
     );
-    let surface = SurfaceSpec::dialog(parent_spec.app_id.clone(), title, size).with_modal(false);
+    let surface = SurfaceSpec::dialog(parent_spec.app_id.clone(), title, size)
+        .with_modal(false)
+        .with_colour(parent_spec.colour);
     let mut win = WaylandWindow::create_dialog(parent_window, surface.clone())
         .map_err(|e| format!("cannot open the panel's window: {e}"))?;
     // The panel is the window's whole content, so the compositor must not offer another size.
     win.set_content_size(size)
         .map_err(|e| format!("cannot pin the panel's window size: {e}"))?;
-    let gpu = GpuWindow::open(&mut win, GpuWindowConfig::default())
+    let config = GpuWindowConfig {
+        colour: surface.colour,
+        ..GpuWindowConfig::default()
+    };
+    let gpu = GpuWindow::open(&mut win, config)
         .map_err(|e| format!("GPU presenter unavailable: {e}"))?;
     Ok(PopupPresenter {
         gpu,

@@ -2923,6 +2923,100 @@ mod contracts {
         lp.dispatch(ui_core::Event::KeyPressed { key });
     }
 
+    /// A panel's surface is cut out of the tree on the whole pixels its content sits on.
+    ///
+    /// A pointer names a pixel by its centre, so a menu anchored at one sits between whole
+    /// logical units, and its content-authored size is fractional too. The platform can only
+    /// stand a window on whole pixels, and glyph tiles are authored on the tree's grid: a
+    /// fractional cut samples every glyph between two texels, and a fractional extent shaves
+    /// the sliver the window rounds off the panel's far edge.
+    #[test]
+    fn a_menu_anchored_between_pixels_gets_a_surface_on_the_pixel_grid() {
+        struct SurfaceTarget {
+            glyphs: Vec<ui_core::geom::Rect>,
+            rects: Vec<ui_core::geom::Rect>,
+            canvas: ui_core::geom::Rect,
+        }
+        impl crate::present::SceneTarget for SurfaceTarget {
+            fn size(&self) -> (u32, u32) {
+                (400, 300)
+            }
+
+            fn present_scene(
+                &mut self,
+                scene: &ui_core::draw::DrawList,
+                _text: &crate::text_pass::TextPass,
+                _damage: &ui_core::Damage,
+                _canvases: &[crate::present::CanvasFrame],
+            ) -> Result<crate::present::PresentStats, String> {
+                self.glyphs = scene.prims.glyphs.iter().map(|g| g.rect).collect();
+                self.rects = scene.prims.rects.iter().map(|r| r.rect).collect();
+                self.canvas = scene.canvas;
+                Ok(crate::present::PresentStats {
+                    draw_calls: 1,
+                    band: None,
+                })
+            }
+        }
+        let (mut lp, mut target) = menu_sink();
+        if !lp.text_pass().has_face() {
+            eprintln!("skipped: no system fonts");
+            return;
+        }
+        lp.set_panel_surfaces(true);
+        lp.frame(&mut target, None);
+        assert!(lp.open_menu_at(
+            Id::str("row"),
+            ui_core::geom::Point::new(20.5, 20.5),
+            vec![
+                ui_core::menu::MenuItem::new(Id::str("copy"), "Copy"),
+                ui_core::menu::MenuItem::new(Id::str("paste"), "Paste"),
+            ],
+        ));
+        // The host answers the declaration with a surface, as a real one does.
+        lp.frame(&mut target, None);
+        let panel = lp.platform_panels().first().expect("a platform panel").node;
+        lp.set_panel_presentation(panel, true);
+        // The entrance slides the panel in; the settled frame is the one on screen.
+        lp.frame_with_dt(&mut target, None, 0.2);
+        lp.frame_with_dt(&mut target, None, 0.2);
+        let panel = lp.platform_panels().first().expect("a platform panel").node;
+        let mut own = SurfaceTarget {
+            glyphs: Vec::new(),
+            rects: Vec::new(),
+            canvas: ui_core::geom::Rect::ZERO,
+        };
+        lp.present_panel(panel, &mut own).expect("the panel's list");
+        assert!(!own.glyphs.is_empty(), "the menu painted its labels");
+        let grid = lp.text_scale();
+        for glyph in &own.glyphs {
+            let device = glyph.origin.x * grid;
+            assert!(
+                (device - device.round()).abs() < 1e-3,
+                "a glyph at {device} device px is between texels"
+            );
+        }
+        for extent in [own.canvas.size.w, own.canvas.size.h] {
+            let device = extent * grid;
+            assert!(
+                (device - device.round()).abs() < 1e-3,
+                "a surface {device} device px wide is between texels"
+            );
+        }
+        // Every painted pixel stays on the surface: rounding the far edge down cuts into
+        // the panel's border, which is the sliver the window used to shave.
+        for prim in own.rects.iter().chain(&own.glyphs) {
+            assert!(
+                prim.min_x() >= -1e-3
+                    && prim.min_y() >= -1e-3
+                    && prim.max_x() <= own.canvas.size.w + 1e-3
+                    && prim.max_y() <= own.canvas.size.h + 1e-3,
+                "a prim at {prim:?} falls off the {:?} surface",
+                own.canvas.size
+            );
+        }
+    }
+
     /// A row's label and chord are both measured, not left at nothing.
     ///
     /// Menu text once declared no size class, and a nowrap line is capped by that hint: every

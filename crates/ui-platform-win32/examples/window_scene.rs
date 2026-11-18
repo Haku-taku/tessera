@@ -24,13 +24,13 @@ fn windows_main() -> Result<(), String> {
     use std::time::{Duration, Instant};
 
     use ui_core::colour::{
-        Chromaticities, LinearEncoding, SCRGB_WHITE_NITS, TransferFunction, WhiteAdaptation,
+        Chromaticities, OutputEncoding, SCRGB_WHITE_NITS, TransferFunction, WhiteAdaptation,
         encode_for_pq_output, gamut_matrix_adapted,
     };
     use ui_core::geom::{Color, Corners};
     use ui_core::{Id, NodeData, NodeKind, SizeClass};
     use ui_platform::view::{App, AppLoop};
-    use ui_platform::window::SurfaceSpec;
+    use ui_platform::window::{ColourPolicy, SurfaceSpec};
     use ui_platform::{Container, Element};
     use ui_platform_win32::{HdrOutput, Win32Presenter, Win32Window};
 
@@ -145,7 +145,7 @@ fn windows_main() -> Result<(), String> {
         Sdr,
         Hdr {
             output: HdrOutput,
-            encoding: LinearEncoding,
+            encoding: OutputEncoding,
         },
     }
 
@@ -183,8 +183,8 @@ fn windows_main() -> Result<(), String> {
         let gamut = gamut_matrix_adapted(
             Chromaticities::SRGB,
             match encoding {
-                LinearEncoding::Pq => Chromaticities::BT2020,
-                LinearEncoding::ScRgb => Chromaticities::SRGB,
+                OutputEncoding::Pq => Chromaticities::BT2020,
+                OutputEncoding::ScRgb => Chromaticities::SRGB,
             },
             WhiteAdaptation::Bradford,
         );
@@ -192,10 +192,10 @@ fn windows_main() -> Result<(), String> {
         for (channel, row) in codes.iter_mut().zip(gamut) {
             let mapped: f32 = row.iter().zip(linear).map(|(m, l)| m * l).sum();
             let code = match encoding {
-                LinearEncoding::Pq => {
+                OutputEncoding::Pq => {
                     encode_for_pq_output(mapped, output.reference_nits, output.min_nits)
                 }
-                LinearEncoding::ScRgb => {
+                OutputEncoding::ScRgb => {
                     (mapped * output.reference_nits / SCRGB_WHITE_NITS).clamp(0.0, 1.0)
                 }
             };
@@ -266,7 +266,14 @@ fn windows_main() -> Result<(), String> {
         "crabsnap-win32-scene",
         "crabsnap — Win32 / D3D11",
         (960, 640),
-    );
+    )
+    // The probe reports which chain it got, so it must be allowed to reach the HDR one; an
+    // SDR run asks for the other branch explicitly.
+    .with_colour(if std::env::var("WINDOW_SDR").is_ok() {
+        ColourPolicy::Sdr
+    } else {
+        ColourPolicy::Auto
+    });
     let mut window = Win32Window::new(spec).map_err(|error| error.to_string())?;
     let mut presenter = Win32Presenter::new(&window).map_err(|error| error.to_string())?;
     let target = Target::of(&presenter);

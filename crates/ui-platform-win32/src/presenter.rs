@@ -2,7 +2,7 @@
 
 use ui_core::Damage;
 use ui_core::colour::{
-    Chromaticities, Destination, Domain, LinearEncoding, ToneMapping, WhiteAdaptation,
+    Chromaticities, Destination, Domain, OutputEncoding, ToneMapping, WhiteAdaptation,
     gamut_matrix_adapted,
 };
 use ui_core::draw::DrawList;
@@ -10,6 +10,7 @@ use ui_gpu_d3d11::D3d11Device;
 use ui_gpu_scene::{AtlasUpload, CanvasUpload, Device, GpuRenderer, RenderTarget, TargetId};
 use ui_platform::present::{CanvasFrame, PresentStats, SceneTarget};
 use ui_platform::text_pass::TextPass;
+use ui_platform::window::ColourPolicy;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::DirectComposition::{
@@ -54,7 +55,7 @@ pub struct Win32Presenter {
     format: DXGI_FORMAT,
     /// The output the chain declares HDR for, with how that light is encoded; `None` on an
     /// 8-bit SDR surface.
-    hdr: Option<(HdrOutput, LinearEncoding)>,
+    hdr: Option<(HdrOutput, OutputEncoding)>,
     /// Held for the life of the surface: composed frames stop showing when it drops.
     _composition: Composition,
     /// The chain's frame-latency event, when the driver gave it one: the handle turns
@@ -100,7 +101,7 @@ impl Win32Presenter {
                 "the window has no client area to present into",
             )));
         }
-        Self::open_raw(window.visual_hwnd(), size, window.alpha())
+        Self::open_raw(window.visual_hwnd(), size, window.alpha(), window.colour())
     }
 
     /// Build the device and open a swap chain on a raw window handle.
@@ -112,6 +113,7 @@ impl Win32Presenter {
         hwnd: HWND,
         size: (u32, u32),
         alpha: Alpha,
+        colour: ColourPolicy,
     ) -> Result<Self, WindowError> {
         if size.0 == 0 || size.1 == 0 {
             return Err(WindowError::Win32(String::from(
@@ -122,7 +124,7 @@ impl Win32Presenter {
             .map_err(|error| WindowError::Gpu(format!("D3D11 device: {error}")))?;
         let mut renderer = GpuRenderer::new(&mut device)
             .map_err(|error| WindowError::Gpu(format!("renderer: {error}")))?;
-        let opened = open_chain(device.raw_device(), hwnd, size, alpha)?;
+        let opened = open_chain(device.raw_device(), hwnd, size, alpha, colour)?;
         // One frame in flight: a present waits at the next blank, and a second queued frame
         // would only add a display of latency to every frame after it. The same event is what
         // lets one thread present several chains without blocking on any single one.
@@ -204,7 +206,7 @@ impl Win32Presenter {
     }
 
     /// How the chain encodes linear light, which decides what its buffer holds.
-    pub fn hdr_encoding(&self) -> Option<LinearEncoding> {
+    pub fn hdr_encoding(&self) -> Option<OutputEncoding> {
         self.hdr.map(|(_, encoding)| encoding)
     }
 
@@ -492,7 +494,7 @@ pub enum Alpha {
 struct Chain {
     chain: IDXGISwapChain1,
     format: DXGI_FORMAT,
-    hdr: Option<(HdrOutput, LinearEncoding)>,
+    hdr: Option<(HdrOutput, OutputEncoding)>,
     composition: Composition,
     /// Whether the chain was opened with a frame-latency waitable object.
     waitable: bool,
@@ -514,17 +516,21 @@ struct Composition {
 ///
 /// Only one chain exists at a time: the format is decided from the output before a chain is
 /// made, and a chain the driver will declare neither PQ nor scRGB is dropped before the SDR
-/// one replaces it.
+/// one replaces it. Only a surface that asked for [`ColourPolicy::Auto`] takes the HDR chain.
 fn open_chain(
     device: &ID3D11Device,
     hwnd: HWND,
     size: (u32, u32),
     alpha: Alpha,
+    colour: ColourPolicy,
 ) -> Result<Chain, WindowError> {
     let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
         .map_err(|error| WindowError::Gpu(format!("CreateDXGIFactory2: {error}")))?;
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    if let Some(output) = crate::outputs::hdr_output(&factory, monitor) {
+    if let Some(output) = (colour == ColourPolicy::Auto)
+        .then(|| crate::outputs::hdr_output(&factory, monitor))
+        .flatten()
+    {
         let format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         let (chain, composition, waitable) =
             create_chain(&factory, device, hwnd, size, format, alpha)?;
@@ -556,16 +562,16 @@ fn open_chain(
 /// PQ is what a colour-managed compositor asks for, and a float chain on an advanced-colour
 /// display often refuses it while accepting scRGB — which is what the desktop itself
 /// composites in, and what Chromium declares for HDR.
-fn declare_hdr(chain: &IDXGISwapChain1) -> Option<LinearEncoding> {
+fn declare_hdr(chain: &IDXGISwapChain1) -> Option<OutputEncoding> {
     let chain = chain.cast::<IDXGISwapChain3>().ok()?;
     // `DXGI_COLOR_SPACE_SUPPORT_FLAG_PRESENT`, the flag the bindings do not name.
     const SUPPORTED_FOR_PRESENT: u32 = 0x1;
     for (space, encoding) in [
         (
             DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
-            LinearEncoding::Pq,
+            OutputEncoding::Pq,
         ),
-        (DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, LinearEncoding::ScRgb),
+        (DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, OutputEncoding::ScRgb),
     ] {
         let presentable = unsafe { chain.CheckColorSpaceSupport(space) }
             .is_ok_and(|flags| flags & SUPPORTED_FOR_PRESENT != 0);
@@ -578,9 +584,9 @@ fn declare_hdr(chain: &IDXGISwapChain1) -> Option<LinearEncoding> {
 
 /// Point the renderer at the display: light tone mapped into the panel's own range, in the
 /// gamut and encoding the chain declared.
-fn aim_at_hdr(renderer: &mut GpuRenderer, output: HdrOutput, encoding: LinearEncoding) {
+fn aim_at_hdr(renderer: &mut GpuRenderer, output: HdrOutput, encoding: OutputEncoding) {
     renderer.set_destination(Destination {
-        domain: Domain::Linear {
+        domain: Domain::Extended {
             reference_nits: output.reference_nits,
             min_nits: output.min_nits,
             peak_nits: output.peak_nits,
@@ -590,13 +596,13 @@ fn aim_at_hdr(renderer: &mut GpuRenderer, output: HdrOutput, encoding: LinearEnc
     });
     renderer.set_gamut(match encoding {
         // A PQ surface carries BT.2020.
-        LinearEncoding::Pq => gamut_matrix_adapted(
+        OutputEncoding::Pq => gamut_matrix_adapted(
             Chromaticities::SRGB,
             Chromaticities::BT2020,
             WhiteAdaptation::Bradford,
         ),
         // scRGB's primaries are the working space's own, so nothing is converted.
-        LinearEncoding::ScRgb => gamut_matrix_adapted(
+        OutputEncoding::ScRgb => gamut_matrix_adapted(
             Chromaticities::SRGB,
             Chromaticities::SRGB,
             WhiteAdaptation::Bradford,

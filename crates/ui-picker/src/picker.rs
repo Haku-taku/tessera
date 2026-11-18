@@ -42,7 +42,7 @@ use ui_platform::{Element, KeepAlive};
 use ui_style::{Env, Style, StyleScope};
 use ui_widgets::RowHeights;
 
-use crate::model::{Action, Model, RangeShape, Subfolders};
+use crate::model::{typed_path, Action, Model, RangeShape, Subfolders};
 
 pub use crate::model::{FileFilter, ListingSource, Mode, ThumbnailPolicy};
 /// The appearance a pack is resolved for; a picker follows its env's scope.
@@ -50,6 +50,13 @@ pub use ui_design::Appearance;
 
 /// A pack family: one resolved style per appearance, as each kit's `pack_of` is.
 pub type PackOf = fn(Appearance) -> &'static Style;
+
+/// A pack family's engine-menu material for an appearance, as each kit's `menu_style_of` is.
+///
+/// The dialog's context menus are the engine's, and the engine asks the `App` for their look:
+/// a picker drawing with a pack must name that pack's menu material or its menus keep the
+/// engine's fixed default.
+pub type MenuStyleOf = fn(Appearance) -> ui_platform::menu::MenuStyle;
 
 
 /// The smallest dialog the drawn picker asks to be sized to, in logical units.
@@ -88,10 +95,12 @@ pub const NEXT_COLUMN: ShortcutId = ShortcutId("picker.next-column");
 pub const FIRST: ShortcutId = ShortcutId("picker.first");
 /// The shortcut that selects the last row.
 pub const LAST: ShortcutId = ShortcutId("picker.last");
-/// The shortcut that marks or unmarks the cursor's row in a multi mode.
+/// The shortcut that marks or unmarks the cursor's row.
 pub const TOGGLE: ShortcutId = ShortcutId("picker.toggle");
-/// The shortcut that marks every row the mode can answer.
+/// The shortcut that marks every row.
 pub const SELECT_ALL: ShortcutId = ShortcutId("picker.select-all");
+/// The shortcut that drops every mark, leaving the cursor where it is.
+pub const DESELECT: ShortcutId = ShortcutId("picker.deselect");
 /// The shortcut that turns the address field into a typed path.
 pub const PATH_ENTRY: ShortcutId = ShortcutId("picker.path");
 /// The shortcut that focuses the search field.
@@ -409,8 +418,16 @@ pub(crate) struct Running {
     pub(crate) total: u64,
     pub(crate) bytes_done: u64,
     pub(crate) bytes_total: u64,
+    /// The sources the job was started on, sorted for the band's list.
+    pub(crate) items: Vec<PathBuf>,
     /// The item being worked on.
-    pub(crate) current: String,
+    pub(crate) current: Option<PathBuf>,
+}
+
+/// A started job's kind and the batch it runs on, kept until its report arrives.
+struct Job {
+    kind: ui_platform::OperationKind,
+    items: Vec<PathBuf>,
 }
 
 /// A destination collision the worker is waiting on.
@@ -544,6 +561,9 @@ pub struct PickerOptions {
     /// The pack family the dialog draws with; the opening app picks the design system, and
     /// the appearance comes from `env`'s [`StyleScope`].
     pub pack_of: PackOf,
+    /// The same pack family's material for the engine's context menus, which the dialog opens
+    /// over its rows; it follows the same appearance.
+    pub menu_style_of: MenuStyleOf,
     /// The scope the dialog's messages resolve in; it must carry a language, and its
     /// appearance decides which pack the dialog draws with (light when it states none).
     pub env: Arc<Env>,
@@ -602,6 +622,7 @@ impl PickerOptions {
         source: impl ListingSource + 'static,
         start: impl Into<PathBuf>,
         pack_of: PackOf,
+        menu_style_of: MenuStyleOf,
         env: Arc<Env>,
     ) -> Self {
         Self {
@@ -609,6 +630,7 @@ impl PickerOptions {
             start: start.into(),
             mode: Mode::OpenFile,
             pack_of,
+            menu_style_of,
             env,
             places: Vec::new(),
             extra_places: Vec::new(),
@@ -760,6 +782,8 @@ impl PickerOptions {
 pub struct PickerState {
     pub(crate) model: Model,
     pub(crate) pack: &'static Style,
+    /// The pack's engine-menu material, asked for every frame so a theme change reaches it.
+    pub(crate) menu_style_of: MenuStyleOf,
     pub(crate) env: Arc<Env>,
     pub(crate) places: Vec<Place>,
     pub(crate) extra_places: Vec<ChooserPlace>,
@@ -810,8 +834,8 @@ pub struct PickerState {
     clipboard: Option<ClipboardWrite>,
     /// The one job the footer's band carries.
     pub(crate) running: Option<Running>,
-    /// The kind of every job still running, keyed by the id its events carry.
-    kinds: std::collections::HashMap<ui_platform::OperationId, ui_platform::OperationKind>,
+    /// Every job still running, keyed by the id its events carry: its kind and its batch.
+    jobs: std::collections::HashMap<ui_platform::OperationId, Job>,
     /// A new folder was asked for; the build names it, because the name is a message.
     pub(crate) new_folder: bool,
     /// A collision the worker waits on, with the panel's own state.
@@ -923,7 +947,7 @@ impl PickerState {
         model.set_save_names(options.save_names);
         model.set_save_policy(options.overwrite, options.strict_types);
         if let Some(name) = save_name {
-            model.save_name = name;
+            model.set_answer(name);
         }
         if let Some(path) = options.start_at_file {
             model.select_when_listed(path);
@@ -946,6 +970,7 @@ impl PickerState {
         let state = Self {
             model,
             pack,
+            menu_style_of: options.menu_style_of,
             env: options.env,
             places: options.places,
             extra_places: options.extra_places,
@@ -978,7 +1003,7 @@ impl PickerState {
             cut: Vec::new(),
             clipboard: None,
             running: None,
-            kinds: std::collections::HashMap::new(),
+            jobs: std::collections::HashMap::new(),
             new_folder: false,
             conflict: None,
             failures: None,
@@ -1128,7 +1153,7 @@ impl PickerState {
         // elsewhere is not pulled back.
         if self.model.mode() == Mode::SaveFile && !self.name_focus_requested {
             self.name_focus_requested = true;
-            cx.request_focus(view::save_name_id());
+            cx.request_focus(view::answer_id());
         }
         if let Some(entry) = &mut self.path_entry
             && entry.focus_requested
@@ -1183,7 +1208,7 @@ impl PickerState {
                 self.pending = self.accept();
                 self.leave_search_if_navigated();
             }
-        } else if owner == view::save_name_id() && shortcut == OPEN {
+        } else if owner == view::answer_id() && shortcut == OPEN {
             self.pending = self.accept();
         } else if owner == view::rename_id() {
             self.dirty = true;
@@ -1500,9 +1525,9 @@ impl PickerState {
         // the model keeps it until accept joins it to the folder on screen. The search and
         // path fields report the same way.
         if let Change::Text(text) = change {
-            if id == view::save_name_id() {
+            if id == view::answer_id() {
                 self.dirty = true;
-                self.model.save_name = text;
+                self.model.set_answer(text);
             } else if id == view::search_id() {
                 self.set_search_query(text);
             } else if id == view::path_entry_id() {
@@ -2105,12 +2130,15 @@ impl PickerState {
         self.start(request.with_policy(ConflictPolicy::Ask));
     }
 
-    /// Start one batch and remember its kind, which its progress events do not carry.
+    /// Start one batch and remember its kind and its sources, which its progress events do
+    /// not carry.
     fn start(&mut self, request: OperationRequest) -> Option<ui_platform::OperationId> {
         let operations = self.file_operations.clone()?;
         let kind = request.kind;
+        let mut items = request.sources.clone();
+        sort_paths(&mut items);
         let id = operations.start(request);
-        self.kinds.insert(id, kind);
+        self.jobs.insert(id, Job { kind, items });
         self.dirty = true;
         Some(id)
     }
@@ -2139,19 +2167,18 @@ impl PickerState {
         for event in operations.take() {
             match event {
                 ui_platform::OperationEvent::Progress(progress) => {
-                    let kind = self
-                        .kinds
-                        .get(&progress.id)
-                        .copied()
-                        .unwrap_or(ui_platform::OperationKind::Copy);
+                    // A job the dialog did not start has no batch to list; the footer still
+                    // reports it, as it did before the band existed.
+                    let job = self.jobs.get(&progress.id);
                     self.running = Some(Running {
                         id: progress.id,
-                        kind,
+                        kind: job.map_or(ui_platform::OperationKind::Copy, |job| job.kind),
                         done: progress.done_items,
                         total: progress.total_items,
                         bytes_done: progress.bytes_done,
                         bytes_total: progress.bytes_total,
-                        current: progress.current_name,
+                        items: job.map(|job| job.items.clone()).unwrap_or_default(),
+                        current: progress.current,
                     });
                 }
                 // The panel is the dialog's answer; the worker waits until a row is pressed.
@@ -2172,7 +2199,7 @@ impl PickerState {
             return;
         }
         for report in finished {
-            self.kinds.remove(&report.id);
+            self.jobs.remove(&report.id);
             if self
                 .running
                 .as_ref()
@@ -3523,10 +3550,15 @@ impl PickerState {
                     .or_else(|| self.spring_pending.take())
                 {
                     self.open_spring(path);
-                } else if self.model.mode().is_multi() {
+                } else {
                     self.dirty = true;
                     self.model.toggle_cursor();
                 }
+                None
+            }
+            DESELECT => {
+                self.dirty = true;
+                self.model.clear_selection();
                 None
             }
             _ => {
@@ -3590,6 +3622,7 @@ impl PickerState {
             (KeyChord::new(Key::End, Modifiers::NONE), LAST),
             (KeyChord::new(Key::Space, Modifiers::NONE), TOGGLE),
             (KeyChord::new(Key::Char('a'), ctrl), SELECT_ALL),
+            (KeyChord::new(Key::Char('d'), ctrl), DESELECT),
             (KeyChord::new(Key::Char('l'), ctrl), PATH_ENTRY),
             (KeyChord::new(Key::Char('f'), ctrl), SEARCH),
             // The file verbs: the caret keeps these chords while it is open, because the
@@ -3758,6 +3791,13 @@ impl App for Picker {
         }
         dirty
     }
+
+    /// The rows' context menus are the engine's, so the pack that draws the dialog names
+    /// their material; the appearance is the one the caller scoped `env` with.
+    fn menu_style(&self) -> Option<ui_platform::menu::MenuStyle> {
+        let appearance = StyleScope::of(&self.state.env).appearance;
+        Some((self.state.menu_style_of)(appearance))
+    }
 }
 
 impl PickerState {
@@ -3779,27 +3819,10 @@ fn base_name_len(name: &str) -> usize {
     }
 }
 
-/// The path a typed address names, resolved against the directory on screen when relative.
-fn typed_path(base: &Path, input: &str) -> PathBuf {
-    use std::path::Component;
-
-    let raw = Path::new(input);
-    let mut path = PathBuf::new();
-    if !raw.is_absolute() {
-        path.push(base);
-    }
-    for component in raw.components() {
-        match component {
-            Component::Prefix(prefix) => path.push(prefix.as_os_str()),
-            Component::RootDir => path.push(Component::RootDir.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                path.pop();
-            }
-            Component::Normal(name) => path.push(name),
-        }
-    }
-    path
+/// Sort paths the way the dialog lists them: case-insensitively by the whole path, so one
+/// batch reads in one order wherever it is shown.
+pub(crate) fn sort_paths(paths: &mut [PathBuf]) {
+    paths.sort_by_cached_key(|path| path.to_string_lossy().to_lowercase());
 }
 
 #[cfg(test)]
@@ -3862,8 +3885,14 @@ mod tests {
             ),
         ])));
         PickerState::new(
-            PickerOptions::new(answers, root, ui_widgets_md3::pack_of, ui_style::Env::root())
-                .searches(Matches(std::sync::Mutex::new(SearchState::Idle))),
+            PickerOptions::new(
+                answers,
+                root,
+                ui_widgets_md3::pack_of,
+                ui_widgets_md3::menu_style_of,
+                ui_style::Env::root(),
+            )
+            .searches(Matches(std::sync::Mutex::new(SearchState::Idle))),
         )
     }
 
@@ -3905,6 +3934,7 @@ mod tests {
             answers,
             "/root",
             ui_widgets_md3::pack_of,
+            ui_widgets_md3::menu_style_of,
             ui_style::Env::root(),
         ))
     }
@@ -4328,16 +4358,5 @@ mod tests {
         state.model.poll();
         assert!(!state.model.searching());
         assert_eq!(state.model.rows()[0].name, "one");
-    }
-
-    /// A typed address is relative to the directory on screen, and `.` and `..` are folds
-    /// rather than characters the filesystem would have to resolve.
-    #[test]
-    fn a_typed_path_folds_dots_and_joins_a_relative_one() {
-        let base = Path::new("base");
-        assert_eq!(typed_path(base, "c"), PathBuf::from("base/c"));
-        assert_eq!(typed_path(base, "../c"), PathBuf::from("c"));
-        assert_eq!(typed_path(base, "./c/../d"), PathBuf::from("base/d"));
-        assert_eq!(typed_path(base, ".."), PathBuf::from(""));
     }
 }

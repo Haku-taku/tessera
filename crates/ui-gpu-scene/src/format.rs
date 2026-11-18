@@ -27,7 +27,8 @@ pub enum TextureFormat {
     R8,
     /// Eight-bit colour, as a picture or a colour atlas stores it in the sRGB domain.
     Rgba8,
-    /// Half-float colour, holding premultiplied linear values.
+    /// Half-float colour: the same sRGB codes in more precision, so values above white
+    /// survive. An extended surface's frame and its pictures use it.
     Rgba16F,
 }
 

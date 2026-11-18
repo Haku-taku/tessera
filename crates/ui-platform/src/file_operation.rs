@@ -154,8 +154,8 @@ pub struct OperationProgress {
     pub total_items: u64,
     pub bytes_done: u64,
     pub bytes_total: u64,
-    /// The source item being worked on, for the footer.
-    pub current_name: String,
+    /// The source item being worked on, so the view can point at it in the job's own list.
+    pub current: Option<PathBuf>,
 }
 
 /// How one top-level source ended; a destination is absent for a delete or a rename.
@@ -764,7 +764,7 @@ fn execute(
         total_items,
         bytes_done: 0,
         bytes_total: 0,
-        current_name: String::new(),
+        current: None,
         last_emit: Instant::now() - PROGRESS_STEP,
     };
     executor.progress(true);
@@ -796,7 +796,7 @@ struct Executor<'a> {
     total_items: u64,
     bytes_done: u64,
     bytes_total: u64,
-    current_name: String,
+    current: Option<PathBuf>,
     last_emit: Instant,
 }
 
@@ -812,7 +812,7 @@ impl Executor<'_> {
             total_items: self.total_items,
             bytes_done: self.bytes_done,
             bytes_total: self.bytes_total,
-            current_name: self.current_name.clone(),
+            current: self.current.clone(),
         });
         (self.emit)(event);
     }
@@ -843,7 +843,7 @@ impl Executor<'_> {
                 self.cancel_rest(&sources[index..]);
                 break;
             }
-            self.current_name = name_of(source);
+            self.current = Some(source.clone());
             let result = match kind {
                 OperationKind::Copy => self.copy_item(source, destination),
                 OperationKind::Move => self.move_item(source, destination),
@@ -1206,7 +1206,7 @@ impl Executor<'_> {
                 .failed
                 .push((extra.clone(), OpError::Unsupported));
         }
-        self.current_name = name_of(source);
+        self.current = Some(source.clone());
         let result = match new_name {
             Some(new_name) => self.rename_one(source, new_name),
             None => Err(Stop::Failed(OpError::Unsupported)),
@@ -1274,7 +1274,7 @@ impl Executor<'_> {
                 self.cancel_rest(&sources[index..]);
                 break;
             }
-            self.current_name = name_of(source);
+            self.current = Some(source.clone());
             let result = match mode {
                 DeleteMode::Trash => self.operator.platform.trash(source),
                 DeleteMode::Permanent => self.remove_any(source),
@@ -1383,12 +1383,6 @@ impl Executor<'_> {
 
 fn join_name(destination: &Path, source: &Path) -> Option<PathBuf> {
     source.file_name().map(|name| destination.join(name))
-}
-
-fn name_of(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

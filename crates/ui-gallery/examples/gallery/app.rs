@@ -361,10 +361,10 @@ impl Gallery {
                 .iter()
                 .any(|page| STYLES.iter().any(|(tag, _)| switch_id(*page, tag) == id))
     }
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(system: Vec<String>) -> Self {
         use ui_platform::ThemeWatcher as _;
         // Publish the catalog scope before the first frame builds any page.
-        init_locale();
+        init_locale(&system);
         let theme_watch = ThemeWatch::new();
         // `GALLERY_DARK=0|1` seeds the appearance, so a light-theme screenshot needs no click.
         let dark = match std::env::var("GALLERY_DARK").ok().as_deref() {

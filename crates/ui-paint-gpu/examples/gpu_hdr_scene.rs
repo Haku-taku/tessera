@@ -72,11 +72,11 @@ fn main() {
     let mut device = GlDevice::new(ctx.gl_handle(), ctx.is_gles());
     let mut gpu = GpuRenderer::new(&mut device).expect("renderer");
     gpu.set_destination(ui_core::colour::Destination {
-        domain: ui_core::colour::Domain::Linear {
+        domain: ui_core::colour::Domain::Extended {
             reference_nits: REFERENCE_NITS,
             min_nits: MIN_NITS,
             peak_nits: PEAK_NITS,
-            encoding: ui_core::colour::LinearEncoding::Pq,
+            encoding: ui_core::colour::OutputEncoding::Pq,
         },
         tone: ui_core::colour::ToneMapping::Bt2390,
     });

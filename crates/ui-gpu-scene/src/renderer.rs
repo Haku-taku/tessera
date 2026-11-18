@@ -37,6 +37,8 @@ impl Shade {
     pub(crate) fn of(material: Option<BackdropMaterial>) -> Self {
         match material {
             None | Some(BackdropMaterial::Plain) => Shade::Plain,
+            // A scrim is the plain program with its dim uniform on: same blit, darker output.
+            Some(BackdropMaterial::Scrim(_)) => Shade::Plain,
             Some(BackdropMaterial::Acrylic(_)) => Shade::Acrylic,
             Some(BackdropMaterial::LiquidGlass(_)) => Shade::Liquid,
         }
@@ -275,13 +277,14 @@ pub struct GpuRenderer {
     /// (scale, offset) for the output transform; `None` keeps the buffer as sRGB.
     hdr: Option<[f32; 2]>,
     /// Which encoding the transform writes when it runs.
-    linear_encoding: ui_core::colour::LinearEncoding,
-    /// What this renderer draws onto: the domain, its white and peak, and the tone curve.
-    /// Content is converted for it, so a change here invalidates every image texture.
+    output_encoding: ui_core::colour::OutputEncoding,
+    /// The destination's peak as the frame stores it, in codes: a scrim hides light up to
+    /// here, because past it the display shows the peak whatever the frame holds.
+    peak_code: f32,
+    /// What this renderer draws onto: the codes' range, its white and peak, and the tone
+    /// curve. Content is converted for it, so a change invalidates every image texture.
     destination: ui_core::colour::Destination,
-    /// Working domain: encoded sRGB for SDR, linear light for HDR.
-    encode: Encode,
-    /// Internal storage precision for the frame and every layer target.
+    /// Precision of the frame and every layer target: follows the destination's range.
     target_format: crate::format::TargetFormat,
     /// sRGB -> output gamut, row-major; identity until a description is read.
     gamut: [[f32; 3]; 3],
@@ -344,9 +347,9 @@ impl GpuRenderer {
             layer_bounds: Vec::new(),
             layer_radius: Vec::new(),
             hdr: None,
-            linear_encoding: ui_core::colour::LinearEncoding::Pq,
+            output_encoding: ui_core::colour::OutputEncoding::Pq,
+            peak_code: 1.0,
             destination: ui_core::colour::Destination::SDR,
-            encode: Encode::Srgb,
             target_format: TargetFormat::Rgba8,
             gamut: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             output_scratch: None,
@@ -392,40 +395,47 @@ impl GpuRenderer {
 
     /// Draw for `destination` from the next frame on.
     ///
-    /// The domain and the frame precision are one choice: linear light in eight bits bands
-    /// in the shadows far worse than sRGB does, so HDR always stores f16.
+    /// Both domains hold sRGB codes and blend in them; the range is what differs, and eight
+    /// bits cannot hold light past white, so an extended destination always stores f16.
     pub fn set_destination(&mut self, destination: ui_core::colour::Destination) {
         self.destination = destination;
-        use ui_core::colour::{Domain, LinearEncoding};
+        use ui_core::colour::{Domain, OutputEncoding};
         let (hdr, encoding) = match destination.domain {
-            Domain::Encoded => (None, LinearEncoding::Pq),
-            Domain::Linear {
+            Domain::Encoded => (None, OutputEncoding::Pq),
+            Domain::Extended {
                 reference_nits,
                 min_nits,
                 encoding,
                 ..
             } => (
                 Some(match encoding {
-                    LinearEncoding::Pq => [
+                    OutputEncoding::Pq => [
                         ui_core::colour::reference_scale(reference_nits),
                         ui_core::colour::min_offset(min_nits),
                     ],
                     // scRGB's unit is 80 nits whatever the display's white is, so the
                     // scene's white is what has to be carried into it.
-                    LinearEncoding::ScRgb => [
-                        reference_nits / ui_core::colour::SCRGB_WHITE_NITS,
-                        0.0,
-                    ],
+                    OutputEncoding::ScRgb => {
+                        [reference_nits / ui_core::colour::SCRGB_WHITE_NITS, 0.0]
+                    }
                 }),
                 encoding,
             ),
         };
         self.hdr = hdr;
-        self.linear_encoding = encoding;
-        self.encode = Encode::of(destination);
-        self.target_format = match self.encode {
-            Encode::Srgb => crate::format::TargetFormat::Rgba8,
-            Encode::Linear => crate::format::TargetFormat::Rgba16F,
+        self.output_encoding = encoding;
+        self.peak_code = match destination.domain {
+            Domain::Encoded => 1.0,
+            Domain::Extended {
+                reference_nits,
+                peak_nits,
+                ..
+            } => ui_core::colour::TransferFunction::Srgb
+                .encode_extended(peak_nits / reference_nits.max(1.0)),
+        };
+        self.target_format = match destination.domain {
+            Domain::Encoded => crate::format::TargetFormat::Rgba8,
+            Domain::Extended { .. } => crate::format::TargetFormat::Rgba16F,
         };
     }
 
@@ -434,7 +444,7 @@ impl GpuRenderer {
         self.destination
     }
 
-    /// The frame's storage precision, which follows the working domain.
+    /// The frame's storage precision, which follows the destination's range.
     pub fn frame_format(&self) -> crate::format::TargetFormat {
         self.target_format
     }
@@ -494,27 +504,20 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Upload (or replace) the colour atlas: premultiplied RGBA8, converted to the domain.
+    /// Upload (or replace) the colour atlas: premultiplied RGBA8 sRGB, as the frame's own
+    /// domain is sRGB whatever the destination's range.
     pub fn set_color_atlas(
         &mut self,
         device: &mut dyn Device,
         atlas: AtlasUpload,
     ) -> Result<(), GpuError> {
-        let linear = match self.encode {
-            Encode::Srgb => None,
-            Encode::Linear => Some(premultiplied_to_linear(&atlas.data)),
-        };
-        let (format, data) = match &linear {
-            None => (TextureFormat::Rgba8, atlas.data.as_slice()),
-            Some(bytes) => (TextureFormat::Rgba16F, bytes.as_slice()),
-        };
         upload_atlas(
             device,
             &mut self.color_atlas_tex,
             atlas.width,
             atlas.height,
-            format,
-            data,
+            TextureFormat::Rgba8,
+            &atlas.data,
         )?;
         self.color_atlas_size = (atlas.width, atlas.height);
         Ok(())
@@ -865,7 +868,7 @@ impl GpuRenderer {
         frame_tex: TextureId,
         band: Option<[i32; 4]>,
     ) -> Result<(), GpuError> {
-        // Resolve before the output transform: the transform must encode averaged pixels,
+        // Resolve before the output transform: the transform must convert averaged pixels,
         // not one sample per destination pixel taken from the supersampled frame.
         let mut from = frame_fbo;
         let mut source = frame_tex;
@@ -877,7 +880,7 @@ impl GpuRenderer {
                 size.1,
                 self.target_format,
             )?;
-            self.resolve_frame(device, scratch.fbo, source, size, false)?;
+            self.resolve_frame(device, scratch.fbo, source, size)?;
             from = scratch.fbo;
             source = scratch.tex;
         }
@@ -889,12 +892,9 @@ impl GpuRenderer {
                 size.1,
                 self.target_format,
             )?;
-            let key = match self.linear_encoding {
-                ui_core::colour::LinearEncoding::ScRgb => ProgramKey::OutputScRgb,
-                ui_core::colour::LinearEncoding::Pq => match self.encode {
-                    Encode::Srgb => ProgramKey::OutputSrgb,
-                    Encode::Linear => ProgramKey::OutputLinear,
-                },
+            let key = match self.output_encoding {
+                ui_core::colour::OutputEncoding::ScRgb => ProgramKey::OutputScRgb,
+                ui_core::colour::OutputEncoding::Pq => ProgramKey::OutputSrgb,
             };
             let p = self.program(device, key)?;
 
@@ -925,7 +925,7 @@ impl GpuRenderer {
                 device.set_uniform_mat3(u, &cols);
             }
             let quad: [f32; 4] = [0.0, 0.0, size.0 as f32, size.1 as f32];
-            device.draw_instanced(p.id, as_bytes(&quad), 1)?;
+            device.draw_instanced(p.id, as_bytes(&quad))?;
             device.set_blend(true);
 
             from = scratch.fbo;
@@ -945,7 +945,6 @@ impl GpuRenderer {
         dest: TargetId,
         src: TextureId,
         size: (u32, u32),
-        encode: bool,
     ) -> Result<(), GpuError> {
         let p = self.program(device, ProgramKey::Resolve)?;
 
@@ -964,11 +963,8 @@ impl GpuRenderer {
         if let Some(u) = p.uniforms.supersample {
             device.set_uniform_i32(u, self.supersample as i32);
         }
-        if let Some(u) = p.uniforms.encode {
-            device.set_uniform_i32(u, i32::from(encode));
-        }
         let quad: [f32; 4] = [0.0, 0.0, size.0 as f32, size.1 as f32];
-        device.draw_instanced(p.id, as_bytes(&quad), 1)?;
+        device.draw_instanced(p.id, as_bytes(&quad))?;
         device.set_blend(true);
 
         Ok(())
@@ -1144,12 +1140,15 @@ impl GpuRenderer {
         if let Some(u) = p.uniforms.layer_skip_empty {
             device.set_uniform_f32(u, 0.0);
         }
+        if let Some(u) = p.uniforms.scrim {
+            device.set_uniform_vec4(u, [0.0, 1.0, 1.0, 0.0]);
+        }
         if let Some(u) = p.uniforms.layer_tex {
             device.bind_texture(0, Some(tex));
             device.set_uniform_i32(u, 0);
         }
         let data = [0.0f32, 0.0, viewport.0, viewport.1];
-        device.draw_instanced(p.id, as_bytes(&data), 1)?;
+        device.draw_instanced(p.id, as_bytes(&data))?;
 
         Ok(())
     }
@@ -1313,22 +1312,41 @@ impl GpuRenderer {
             .unwrap_or(ui_core::geom::Rect::ZERO);
         let effects_program = self.program(device, ProgramKey::Effects)?;
         let box_program = self.program(device, ProgramKey::Box)?;
-        let filtered = timed!(
-            "gpu_blur",
-            crate::effect::run(
-                &mut self.backdrop_scratch,
-                device,
-                &effects_program,
-                &box_program,
-                src_tex,
-                size.0,
-                size.1,
-                bounds,
-                self.target_format,
-                &[effect],
-                false,
-            )
-        )?;
+        // A scrim filters nothing and the bound frame cannot be sampled, so its backdrop is a
+        // straight copy; `run` would see a no-op chain and hand back the frame itself.
+        let filtered = if entry.sigma <= 0.0 && matches!(material, Some(BackdropMaterial::Scrim(_)))
+        {
+            timed!(
+                "gpu_scrim_copy",
+                crate::effect::copy(
+                    &mut self.backdrop_scratch,
+                    device,
+                    &effects_program,
+                    src_tex,
+                    size.0,
+                    size.1,
+                    bounds,
+                    self.target_format,
+                )
+            )?
+        } else {
+            timed!(
+                "gpu_blur",
+                crate::effect::run(
+                    &mut self.backdrop_scratch,
+                    device,
+                    &effects_program,
+                    &box_program,
+                    src_tex,
+                    size.0,
+                    size.1,
+                    bounds,
+                    self.target_format,
+                    &[effect],
+                    false,
+                )
+            )?
+        };
         if !composites(material, filtered != src_tex) {
             return Ok(());
         }
@@ -1424,7 +1442,7 @@ impl GpuRenderer {
             );
         }
         let quad: [f32; 4] = [0.0, 0.0, w as f32, h as f32];
-        device.draw_instanced(p.id, as_bytes(&quad), 1)?;
+        device.draw_instanced(p.id, as_bytes(&quad))?;
         // The rim compresses many capture texels into one pixel, so the capture carries a
         // chain: the face still reads level 0, where the tap is already exact.
         // The chain is built with the capture's framebuffer released: GL leaves the result
@@ -1471,12 +1489,10 @@ impl GpuRenderer {
             )?),
             _ => None,
         };
-        let key = match (shade, self.encode) {
-            (Shade::Plain, _) => ProgramKey::Layers,
-            (Shade::Acrylic, Encode::Srgb) => ProgramKey::Acrylic,
-            (Shade::Acrylic, Encode::Linear) => ProgramKey::AcrylicLinear,
-            (Shade::Liquid, Encode::Srgb) => ProgramKey::GlassKit,
-            (Shade::Liquid, Encode::Linear) => ProgramKey::GlassKitLinear,
+        let key = match shade {
+            Shade::Plain => ProgramKey::Layers,
+            Shade::Acrylic => ProgramKey::Acrylic,
+            Shade::Liquid => ProgramKey::GlassKit,
         };
         let p = self.program(device, key)?;
 
@@ -1513,6 +1529,41 @@ impl GpuRenderer {
         if let Some(u) = p.uniforms.layer_skip_empty {
             device.set_uniform_f32(u, 0.0);
         }
+        if let Some(u) = p.uniforms.scrim {
+            let run = match material {
+                Some(BackdropMaterial::Scrim(s)) => [
+                    1.0,
+                    1.0 - s.opacity,
+                    self.peak_code,
+                    if s.hole.is_empty() { 0.0 } else { 1.0 },
+                ],
+                _ => [0.0, 1.0, 1.0, 0.0],
+            };
+            device.set_uniform_vec4(u, run);
+        }
+        if let Some(u) = p.uniforms.scrim_hole {
+            // The material's hole is measured from where the node is drawn, as its entry is.
+            let hole = match material {
+                Some(BackdropMaterial::Scrim(s)) if !s.hole.is_empty() => {
+                    self.on_device(ui_core::geom::Rect::new(
+                        entry.rect.origin.x + s.hole.origin.x,
+                        entry.rect.origin.y + s.hole.origin.y,
+                        s.hole.size.w,
+                        s.hole.size.h,
+                    ))
+                }
+                _ => ui_core::geom::Rect::ZERO,
+            };
+            device.set_uniform_vec4(
+                u,
+                [
+                    hole.origin.x,
+                    hole.origin.y,
+                    hole.origin.x + hole.size.w,
+                    hole.origin.y + hole.size.h,
+                ],
+            );
+        }
         if let Some(u) = p.uniforms.layer_tex {
             device.bind_texture(0, Some(filtered));
             device.set_uniform_i32(u, 0);
@@ -1522,7 +1573,8 @@ impl GpuRenderer {
             device.set_uniform_i32(u, 0);
         }
         match material {
-            None | Some(BackdropMaterial::Plain) => {}
+            // A scrim reads the layer program, whose scrim uniform was set above.
+            None | Some(BackdropMaterial::Plain) | Some(BackdropMaterial::Scrim(_)) => {}
             Some(BackdropMaterial::Acrylic(a)) => {
                 if let Some(u) = p.uniforms.tint {
                     device.set_uniform_vec4(u, [a.tint.r, a.tint.g, a.tint.b, a.tint.a]);
@@ -1608,11 +1660,7 @@ impl GpuRenderer {
         // `a_rect.y` is the top in device space, and the quad runs down from there, so
         // the instance must cover the whole frame; coverage() then cuts the node's shape.
         let data = [0.0f32, 0.0, size.0 as f32, size.1 as f32];
-        device.draw_instanced(
-            p.id,
-            as_bytes(&data),
-            (crate::layout::UNIT_QUAD.len() / 2) as u32,
-        )?;
+        device.draw_instanced(p.id, as_bytes(&data))?;
 
         self.stats.draw_calls += 1;
         if material.is_some() {
@@ -1778,11 +1826,7 @@ impl GpuRenderer {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
         set_clip_uniforms(device, &p, clip, self.scale);
-        device.draw_instanced(
-            p.id,
-            as_bytes(data),
-            (data.len() / layout::RECT_STRIDE as usize) as u32,
-        )?;
+        device.draw_instanced(p.id, as_bytes(data))?;
 
         self.stats.rects += (data.len() / layout::RECT_STRIDE as usize) as u32;
         self.stats.draw_calls += 1;
@@ -1803,11 +1847,7 @@ impl GpuRenderer {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
         set_clip_uniforms(device, &p, clip, self.scale);
-        device.draw_instanced(
-            p.id,
-            as_bytes(data),
-            (data.len() / layout::SECTOR_STRIDE as usize) as u32,
-        )?;
+        device.draw_instanced(p.id, as_bytes(data))?;
 
         self.stats.draw_calls += 1;
         Ok(())
@@ -1827,11 +1867,7 @@ impl GpuRenderer {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
         set_clip_uniforms(device, &p, clip, self.scale);
-        device.draw_instanced(
-            p.id,
-            as_bytes(data),
-            (data.len() / layout::ELLIPSE_STRIDE as usize) as u32,
-        )?;
+        device.draw_instanced(p.id, as_bytes(data))?;
 
         self.stats.draw_calls += 1;
         Ok(())
@@ -1851,11 +1887,7 @@ impl GpuRenderer {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
         set_clip_uniforms(device, &p, clip, self.scale);
-        device.draw_instanced(
-            p.id,
-            as_bytes(data),
-            (data.len() / layout::LINE_STRIDE as usize) as u32,
-        )?;
+        device.draw_instanced(p.id, as_bytes(data))?;
 
         self.stats.draw_calls += 1;
         Ok(())
@@ -1898,11 +1930,7 @@ impl GpuRenderer {
             device.set_uniform_i32(u, 1);
         }
         set_clip_uniforms(device, &p, clip, self.scale);
-        device.draw_instanced(
-            p.id,
-            as_bytes(data),
-            (data.len() / layout::GLYPH_STRIDE as usize) as u32,
-        )?;
+        device.draw_instanced(p.id, as_bytes(data))?;
 
         self.stats.glyphs += (data.len() / layout::GLYPH_STRIDE as usize) as u32;
         self.stats.draw_calls += 1;
@@ -1928,7 +1956,7 @@ impl GpuRenderer {
                 let mut data: Vec<f32> = Vec::new();
                 for i in batch.range.start..batch.range.end {
                     if let Some(p) = list.prims.shadows.get(i as usize) {
-                        push_shadow(&mut data, p, self.scale, self.encode);
+                        push_shadow(&mut data, p, self.scale);
                     }
                 }
                 if !data.is_empty() {
@@ -1998,7 +2026,7 @@ impl GpuRenderer {
             PrimKind::Rect => {
                 for i in batch.range.start..batch.range.end {
                     if let Some(p) = list.prims.rects.get(i as usize) {
-                        push_rect(rect_data, p, self.scale, self.encode);
+                        push_rect(rect_data, p, self.scale);
                     }
                 }
                 if !rect_data.is_empty() {
@@ -2017,7 +2045,7 @@ impl GpuRenderer {
                 let mut data: Vec<f32> = Vec::new();
                 for i in batch.range.start..batch.range.end {
                     if let Some(p) = list.prims.sectors.get(i as usize) {
-                        push_sector(&mut data, p, self.scale, self.encode);
+                        push_sector(&mut data, p, self.scale);
                     }
                 }
                 if !data.is_empty() {
@@ -2035,7 +2063,7 @@ impl GpuRenderer {
                 let mut data: Vec<f32> = Vec::new();
                 for i in batch.range.start..batch.range.end {
                     if let Some(p) = list.prims.ellipses.get(i as usize) {
-                        push_ellipse(&mut data, p, self.scale, self.encode);
+                        push_ellipse(&mut data, p, self.scale);
                     }
                 }
                 if !data.is_empty() {
@@ -2053,7 +2081,7 @@ impl GpuRenderer {
                 let mut data: Vec<f32> = Vec::new();
                 for i in batch.range.start..batch.range.end {
                     if let Some(p) = list.prims.lines.get(i as usize) {
-                        push_line(&mut data, p, self.scale, self.encode);
+                        push_line(&mut data, p, self.scale);
                     }
                 }
                 if !data.is_empty() {
@@ -2076,7 +2104,7 @@ impl GpuRenderer {
                         if scissor.is_some_and(|s| !glyph_hits_scissor(p, self.scale, s)) {
                             continue;
                         }
-                        push_glyph(glyph_data, p, self.scale, self.encode);
+                        push_glyph(glyph_data, p, self.scale);
                     }
                 }
                 if !glyph_data.is_empty() {
@@ -2265,10 +2293,7 @@ impl GpuRenderer {
                     let tex = match other {
                         Some(tex) => tex,
                         None => {
-                            let format = match Encode::of(self.destination) {
-                                Encode::Srgb => TextureFormat::Rgba8,
-                                Encode::Linear => TextureFormat::Rgba16F,
-                            };
+                            let format = texture_format(self.destination);
                             device.create_texture(entry.width, entry.height, format)?
                         }
                     };
@@ -2339,11 +2364,7 @@ impl GpuRenderer {
             device.set_uniform_i32(u, 0);
         }
         set_clip_uniforms(device, &p, clip, self.scale);
-        device.draw_instanced(
-            p.id,
-            as_bytes(data),
-            (data.len() / layout::IMAGE_STRIDE as usize) as u32,
-        )?;
+        device.draw_instanced(p.id, as_bytes(data))?;
 
         self.stats.images_drawn += (data.len() / layout::IMAGE_STRIDE as usize) as u32;
         self.stats.draw_calls += 1;
@@ -2364,11 +2385,7 @@ impl GpuRenderer {
             device.set_uniform_vec2(u, [viewport.0, viewport.1]);
         }
         set_clip_uniforms(device, &p, clip, self.scale);
-        device.draw_instanced(
-            p.id,
-            as_bytes(data),
-            (data.len() / layout::SHADOW_STRIDE as usize) as u32,
-        )?;
+        device.draw_instanced(p.id, as_bytes(data))?;
 
         self.stats.shadows_drawn += (data.len() / layout::SHADOW_STRIDE as usize) as u32;
         self.stats.draw_calls += 1;
@@ -2505,14 +2522,7 @@ impl GpuRenderer {
             )
             .ok()?;
             let scratch_fbo = scratch.fbo;
-            self.resolve_frame(
-                device,
-                scratch_fbo,
-                tex,
-                (w, h),
-                self.encode == Encode::Linear,
-            )
-            .ok()?;
+            self.resolve_frame(device, scratch_fbo, tex, (w, h)).ok()?;
             scratch_fbo
         } else {
             fbo
@@ -2524,9 +2534,9 @@ impl GpuRenderer {
 }
 
 /// Pack one shadow: rect, radius, colour, blur + dy, shape, surface edge.
-fn push_shadow(out: &mut Vec<f32>, p: &ShadowPrim, scale: f32, encode: Encode) {
+fn push_shadow(out: &mut Vec<f32>, p: &ShadowPrim, scale: f32) {
     let r = p.rect;
-    let (rgb, a) = encode.split(p.colour);
+    let (rgb, a) = split(p.colour);
     let rad = [
         p.corners.tl * scale,
         p.corners.tr * scale,
@@ -2568,16 +2578,16 @@ fn push_shadow(out: &mut Vec<f32>, p: &ShadowPrim, scale: f32, encode: Encode) {
     ]);
 }
 
-fn push_rect(out: &mut Vec<f32>, p: &RectPrim, scale: f32, encode: Encode) {
+fn push_rect(out: &mut Vec<f32>, p: &RectPrim, scale: f32) {
     let r = p.rect;
     // Same clamp as the CPU path: a radius over half the short side folds the SDF.
     let radius = p.radius.clamp_to(r.size);
-    let (fill, alpha) = encode.split(p.fill);
+    let (fill, alpha) = split(p.fill);
     // Gradient: the far stop plus (axis, enabled). Backends without the shader support
     // fall back to `fill`, which is why `fill` is always the near stop.
     let (far, axis, enabled) = match p.gradient {
         Some(g) => {
-            let (c, a) = encode.split(g.to);
+            let (c, a) = split(g.to);
             let axis = match g.axis {
                 ui_core::draw::GradientAxis::Vertical => 0.0,
                 ui_core::draw::GradientAxis::Horizontal => 1.0,
@@ -2588,7 +2598,7 @@ fn push_rect(out: &mut Vec<f32>, p: &RectPrim, scale: f32, encode: Encode) {
     };
     let (border, width) = match p.border {
         Some((c, w)) => {
-            let (br, ba) = encode.split(c);
+            let (br, ba) = split(c);
             ([br[0], br[1], br[2], ba], w * scale)
         }
         None => ([0.0; 4], 0.0),
@@ -2596,7 +2606,7 @@ fn push_rect(out: &mut Vec<f32>, p: &RectPrim, scale: f32, encode: Encode) {
     // A stroke gradient reuses the fill's axis: every WinUI elevation border is vertical.
     let (border_far, border_grad) = match p.border_gradient {
         Some(g) => {
-            let (c, a) = encode.split(g.to);
+            let (c, a) = split(g.to);
             ([c[0], c[1], c[2], a], 1.0)
         }
         None => ([0.0; 4], 0.0),
@@ -2666,9 +2676,9 @@ fn push_rect(out: &mut Vec<f32>, p: &RectPrim, scale: f32, encode: Encode) {
     ]);
 }
 
-fn push_sector(out: &mut Vec<f32>, p: &ui_core::draw::SectorPrim, scale: f32, encode: Encode) {
+fn push_sector(out: &mut Vec<f32>, p: &ui_core::draw::SectorPrim, scale: f32) {
     let s = &p.sector;
-    let (rgb, alpha) = encode.split(p.colour);
+    let (rgb, alpha) = split(p.colour);
     // The sweep is normalised here so the shader needs no negative-angle handling.
     let sweep = s.sweep();
     out.extend_from_slice(&[
@@ -2686,9 +2696,9 @@ fn push_sector(out: &mut Vec<f32>, p: &ui_core::draw::SectorPrim, scale: f32, en
     ]);
 }
 
-fn push_ellipse(out: &mut Vec<f32>, p: &ui_core::draw::EllipsePrim, scale: f32, encode: Encode) {
-    let (fill, fill_alpha) = encode.split(p.fill);
-    let (rgb, alpha) = encode.split(p.colour);
+fn push_ellipse(out: &mut Vec<f32>, p: &ui_core::draw::EllipsePrim, scale: f32) {
+    let (fill, fill_alpha) = split(p.fill);
+    let (rgb, alpha) = split(p.colour);
     out.extend_from_slice(&[
         p.centre.x * scale,
         p.centre.y * scale,
@@ -2706,8 +2716,8 @@ fn push_ellipse(out: &mut Vec<f32>, p: &ui_core::draw::EllipsePrim, scale: f32, 
     ]);
 }
 
-fn push_line(out: &mut Vec<f32>, p: &ui_core::draw::LinePrim, scale: f32, encode: Encode) {
-    let (rgb, alpha) = encode.split(p.colour);
+fn push_line(out: &mut Vec<f32>, p: &ui_core::draw::LinePrim, scale: f32) {
+    let (rgb, alpha) = split(p.colour);
     out.extend_from_slice(&[
         p.from.x * scale,
         p.from.y * scale,
@@ -2746,8 +2756,8 @@ fn upload_atlas(
     Ok(())
 }
 
-fn push_glyph(out: &mut Vec<f32>, p: &GlyphPrim, scale: f32, encode: Encode) {
-    let (rgb, alpha) = encode.split(p.color);
+fn push_glyph(out: &mut Vec<f32>, p: &GlyphPrim, scale: f32) {
+    let (rgb, alpha) = split(p.color);
     out.extend_from_slice(&[
         p.rect.origin.x * scale,
         p.rect.origin.y * scale,
@@ -2841,27 +2851,10 @@ fn needs_upload(
     }
 }
 
-/// Premultiplied sRGB bytes to premultiplied linear half floats.
-///
-/// Premultiplication is undone before the decode: `decode(a*c)` is not `a*decode(c)`.
-fn premultiplied_to_linear(rgba: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len() * 2);
-    for texel in rgba.as_chunks::<4>().0 {
-        let alpha = texel[3] as f32 / 255.0;
-        for &c in &texel[..3] {
-            let straight = ui_core::colour::TransferFunction::Srgb
-                .decode((c as f32 / 255.0) / alpha.max(1e-6));
-            out.extend_from_slice(&half_bits((straight * alpha).clamp(0.0, 1.0)).to_le_bytes());
-        }
-        out.extend_from_slice(&half_bits(alpha).to_le_bytes());
-    }
-    out
-}
-
 /// IEEE-754 binary32 to binary16, rounding at the 10-bit mantissa.
 ///
-/// Only linear light in the range a texture carries reaches this, so subnormals are the
-/// only edge; infinities and NaNs are passed through rather than clamped.
+/// Only the ranges a texture carries reach this, so subnormals are the only edge;
+/// infinities and NaNs are passed through rather than clamped.
 fn half_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -2917,7 +2910,8 @@ fn upload_image(
             data.len()
         )));
     }
-    let encode = Encode::of(destination);
+    let format = texture_format(destination);
+    let extended = format == TextureFormat::Rgba16F;
     let placement = entry.colour.placement(destination);
     // The sampler filters the stored channels, so straight alpha would let a transparent
     // texel's colour reach across an edge. Premultiplied here is what filtering must see,
@@ -2938,25 +2932,19 @@ fn upload_image(
         // One buffer for the whole picture: a per-texel allocation costs more than the
         // conversion of a megapixel frame.
         let texels = needed / texel_bytes;
-        let mut out: Vec<u8> = Vec::with_capacity(texels * match encode {
-            Encode::Srgb => 4,
-            Encode::Linear => 8,
-        });
+        let mut out: Vec<u8> = Vec::with_capacity(texels * if extended { 8 } else { 4 });
+        // Eight bits clamp at white; an extended texture keeps light above it.
         let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
         let mut convert = |texel: &[u8]| {
             let [r, g, b, alpha] = placement.texel(texel);
-            match encode {
-                Encode::Srgb => out.extend_from_slice(&[
-                    byte(r * alpha),
-                    byte(g * alpha),
-                    byte(b * alpha),
-                    byte(alpha),
-                ]),
-                Encode::Linear => {
-                    for value in [r * alpha, g * alpha, b * alpha, alpha] {
-                        out.extend_from_slice(&half_bits(value).to_le_bytes());
-                    }
+            if extended {
+                for value in [r * alpha, g * alpha, b * alpha, alpha] {
+                    out.extend_from_slice(&half_bits(value).to_le_bytes());
                 }
+            } else {
+                let premultiplied =
+                    [byte(r * alpha), byte(g * alpha), byte(b * alpha), byte(alpha)];
+                out.extend_from_slice(&premultiplied);
             }
         };
         // The packing decides the chunk size, and a storage has one of two.
@@ -2974,49 +2962,22 @@ fn upload_image(
         }
         out
     };
-    let format = match encode {
-        Encode::Srgb => TextureFormat::Rgba8,
-        Encode::Linear => TextureFormat::Rgba16F,
-    };
     device.upload_texture(tex, entry.width, entry.height, format, &premultiplied);
     device.set_sampling(tex, entry.sampling, false);
     Ok(())
 }
 
-/// How colour is written into instance data and textures.
-///
-/// SDR keeps sRGB-encoded values, which is the look every control was authored with and
-/// matches the CPU rasteriser. HDR converts to linear light first: blending, blurs and
-/// coverage then average physical light, and values above SDR white stay meaningful.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Encode {
-    Srgb,
-    Linear,
+/// The frame's codes are sRGB on every surface; only an extended destination's need f16.
+fn texture_format(destination: ui_core::colour::Destination) -> TextureFormat {
+    match destination.domain {
+        ui_core::colour::Domain::Encoded => TextureFormat::Rgba8,
+        ui_core::colour::Domain::Extended { .. } => TextureFormat::Rgba16F,
+    }
 }
 
-impl Encode {
-    /// The domain a destination blends in.
-    fn of(destination: ui_core::colour::Destination) -> Self {
-        match destination.domain {
-            ui_core::colour::Domain::Encoded => Self::Srgb,
-            ui_core::colour::Domain::Linear { .. } => Self::Linear,
-        }
-    }
-
-    /// Straight-alpha colour as this domain stores it, before premultiplication.
-    fn split(self, c: Color) -> ([f32; 3], f32) {
-        match self {
-            Self::Srgb => ([c.r, c.g, c.b], c.a),
-            Self::Linear => (
-                [
-                    ui_core::colour::TransferFunction::Srgb.decode(c.r),
-                    ui_core::colour::TransferFunction::Srgb.decode(c.g),
-                    ui_core::colour::TransferFunction::Srgb.decode(c.b),
-                ],
-                c.a,
-            ),
-        }
-    }
+/// Straight-alpha colour as the frame stores it: sRGB codes, raw.
+fn split(c: Color) -> ([f32; 3], f32) {
+    ([c.r, c.g, c.b], c.a)
 }
 
 /// Apply a clip: scissor bounds the rect cheaply, the shader handles the rounded shape.
@@ -3287,12 +3248,7 @@ mod tests {
     #[test]
     fn rect_instance_fields_land_at_the_shader_offsets() {
         let mut out = Vec::new();
-        push_rect(
-            &mut out,
-            &rect_prim(Color::from_rgba8(51, 102, 153, 204)),
-            1.0,
-            Encode::Srgb,
-        );
+        push_rect(&mut out, &rect_prim(Color::from_rgba8(51, 102, 153, 204)), 1.0);
         // Layout: rect(0..4), radius(4..8), fill(8..12), border(12..16).
         assert_eq!(&out[0..4], &[10.0, 20.0, 30.0, 40.0]);
         assert_eq!(&out[4..8], &[4.0, 4.0, 4.0, 4.0]);
@@ -3358,11 +3314,11 @@ mod tests {
             "a new description must reach the GPU"
         );
         let hdr = ui_core::colour::Destination {
-            domain: ui_core::colour::Domain::Linear {
+            domain: ui_core::colour::Domain::Extended {
                 reference_nits: 203.0,
                 min_nits: 0.0,
                 peak_nits: 417.0,
-                encoding: ui_core::colour::LinearEncoding::Pq,
+                encoding: ui_core::colour::OutputEncoding::Pq,
             },
             tone: ui_core::colour::ToneMapping::Bt2390,
         };

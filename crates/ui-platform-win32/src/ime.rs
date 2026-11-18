@@ -14,10 +14,42 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::UI::Input::Ime::{
     CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT, COMPOSITIONFORM, CPS_CANCEL, GCS_COMPSTR, GCS_CURSORPOS,
     GCS_RESULTSTR, HIMC, IME_COMPOSITION_STRING, ISC_SHOWUICANDIDATEWINDOW,
-    ISC_SHOWUICOMPOSITIONWINDOW, ImmGetCompositionStringW, ImmGetContext, ImmNotifyIME,
-    ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow, ImmSetOpenStatus,
-    NI_COMPOSITIONSTR,
+    ISC_SHOWUICOMPOSITIONWINDOW, ImmAssociateContext, ImmGetCompositionStringW, ImmGetContext,
+    ImmNotifyIME, ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow,
+    ImmSetOpenStatus, NI_COMPOSITIONSTR,
 };
+
+/// Give the window an input context, or take the one it has away.
+///
+/// A context left associated lets the input method open itself on a window with no field
+/// to type into, and the composition it then builds reaches a tree that collects nothing.
+/// The context taken away is handed back through `saved`: it is the input method's own
+/// state, and restoring it is what makes the next field type the way the method was set up.
+pub(crate) fn set_associated(hwnd: HWND, wanted: bool, saved: &mut Option<HIMC>) -> bool {
+    match (wanted, saved.take()) {
+        (true, Some(context)) => {
+            unsafe {
+                ImmAssociateContext(hwnd, context);
+            }
+            true
+        }
+        // The window's own association, if it has one, is the one it should keep.
+        (true, None) => true,
+        (false, None) => {
+            let previous = unsafe { ImmAssociateContext(hwnd, HIMC::default()) };
+            if previous.is_invalid() {
+                // There was nothing to take; the window was already without a context.
+                return false;
+            }
+            *saved = Some(previous);
+            true
+        }
+        (false, Some(context)) => {
+            *saved = Some(context);
+            true
+        }
+    }
+}
 
 /// Open or close the window's input context when `open` differs from `already`.
 ///

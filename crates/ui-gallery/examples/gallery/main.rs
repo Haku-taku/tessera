@@ -499,7 +499,12 @@ fn main() {
     }
     // Layout must measure with the same faces the painter rasterises: the monospace
     // estimate calls an icon 1 em wide at 0.6 em and its box no longer holds the glyph.
-    let mut lp = AppLoop::with_stack(Gallery::new(), TEXT_STACK);
+    // A bare session has no backend to ask, so the environment is the only answer here; on a
+    // POSIX session it is the whole answer.
+    let mut lp = AppLoop::with_stack(
+        Gallery::new(ui_platform::posix_system_languages()),
+        TEXT_STACK,
+    );
     // The engine ships no fonts: the host supplies the SF Symbols file the iOS controls use.
     lp.register_font(
         ui_widgets::SF_SYMBOLS_FAMILY,
@@ -585,7 +590,8 @@ fn run_host(uncapped: bool) {
         "crabsnap-ui   gallery",
         (WIN_W, WIN_H),
     );
-    if let Err(e) = host.open(spec, Gallery::new(), options) {
+    let system = host.languages();
+    if let Err(e) = host.open(spec, Gallery::new(system), options) {
         eprintln!("{e}");
         std::process::exit(1);
     }

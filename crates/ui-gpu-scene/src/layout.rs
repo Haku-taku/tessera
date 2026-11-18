@@ -13,15 +13,6 @@ pub const IMAGE_STRIDE: i32 = 13;
 /// Floats per shadow instance: rect, radius, colour, blur + dy, shape, surface edge.
 pub const SHADOW_STRIDE: i32 = 21;
 
-/// Floats per arc instance: centre, geometry, fill, caps.
-pub const SECTOR_STRIDE: i32 = 11;
-
-/// Floats per ellipse instance: centre, radii, stroke width, fill, stroke.
-pub const ELLIPSE_STRIDE: i32 = 13;
-
-/// Floats per segment instance: from, to, width, fill.
-pub const LINE_STRIDE: i32 = 9;
-
 /// Largest tap count the effect shader accepts; keep in sync with `u_weights[33]`.
 pub const MAX_TAPS: u32 = 33;
 

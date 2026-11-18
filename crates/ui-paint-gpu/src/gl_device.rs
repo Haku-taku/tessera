@@ -52,7 +52,6 @@ const UNIFORMS: &[&str] = &[
     "u_taps",
     "u_radius",
     "u_ss",
-    "u_encode",
     "u_capture",
     "u_region",
     "u_weights",
@@ -63,6 +62,8 @@ const UNIFORMS: &[&str] = &[
     "u_rect",
     "u_exp",
     "u_skip_empty",
+    "u_scrim",
+    "u_scrim_hole",
     "u_tint",
     "u_luminosity",
     "u_noise",
@@ -81,6 +82,8 @@ struct GlProgram {
     vao: glow::VertexArray,
     unit_vbo: glow::Buffer,
     instance_vbo: glow::Buffer,
+    /// Bytes per instance, so the draw count never outruns what `draw_instanced` uploaded.
+    stride: usize,
     slots: HashMap<&'static str, UniformSlot>,
     locations: Vec<glow::UniformLocation>,
 }
@@ -246,16 +249,9 @@ fn sources(key: ProgramKey) -> (String, String) {
         ProgramKey::Effects => (layer(), shader::EFFECT_FRAGMENT.to_string()),
         ProgramKey::Box => (layer(), shader::BOX_FRAGMENT.to_string()),
         ProgramKey::OutputSrgb => (layer(), shader::OUTPUT_FRAGMENT.to_string()),
-        ProgramKey::OutputLinear => (
-            layer(),
-            format!("#define LINEAR_DOMAIN\n{}", shader::OUTPUT_FRAGMENT),
-        ),
         ProgramKey::OutputScRgb => (
             layer(),
-            format!(
-                "#define LINEAR_DOMAIN\n#define SCRGB_OUTPUT\n{}",
-                shader::OUTPUT_FRAGMENT
-            ),
+            format!("#define SCRGB_OUTPUT\n{}", shader::OUTPUT_FRAGMENT),
         ),
         ProgramKey::Resolve => (layer(), shader::RESOLVE_FRAGMENT.to_string()),
         ProgramKey::Capture => (layer(), shader::CAPTURE_FRAGMENT.to_string()),
@@ -270,15 +266,7 @@ fn sources(key: ProgramKey) -> (String, String) {
         ProgramKey::Shadows => (shader::SHADOW_VERTEX.to_string(), shader::shadow_fragment()),
         ProgramKey::Images => (shader::IMAGE_VERTEX.to_string(), shader::image_fragment()),
         ProgramKey::Acrylic => (layer(), shader::acrylic_fragment()),
-        ProgramKey::AcrylicLinear => (
-            layer(),
-            format!("#define LINEAR_DOMAIN\n{}", shader::acrylic_fragment()),
-        ),
         ProgramKey::GlassKit => (layer(), shader::liquid_glass_fragment()),
-        ProgramKey::GlassKitLinear => (
-            layer(),
-            format!("#define LINEAR_DOMAIN\n{}", shader::liquid_glass_fragment()),
-        ),
     }
 }
 
@@ -312,7 +300,7 @@ impl Device for GlDevice {
                 .create_buffer()
                 .map_err(|error| GpuError::Device(format!("create buffer: {error}")))?;
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(instance_vbo));
-            let spare = vec![0.0f32; spec.stride as usize * 64];
+            let spare = vec![0.0f32; spec.stride() as usize * 64];
             gl.buffer_data_u8_slice(
                 glow::ARRAY_BUFFER,
                 crate::as_bytes(&spare),
@@ -327,7 +315,7 @@ impl Device for GlDevice {
                         *size,
                         glow::FLOAT,
                         false,
-                        spec.stride * 4,
+                        spec.stride() * 4,
                         offset * 4,
                     );
                     gl.vertex_attrib_divisor(location, 1);
@@ -361,6 +349,7 @@ impl Device for GlDevice {
                 vao,
                 unit_vbo,
                 instance_vbo,
+                stride: spec.stride() as usize * 4,
                 slots,
                 locations,
             });
@@ -699,15 +688,14 @@ impl Device for GlDevice {
         }
     }
 
-    fn draw_instanced(
-        &mut self,
-        program: ProgramId,
-        instances: &[u8],
-        count: u32,
-    ) -> Result<(), GpuError> {
+    fn draw_instanced(&mut self, program: ProgramId, instances: &[u8]) -> Result<(), GpuError> {
         let Some(entry) = self.programs.get(program.0 as usize) else {
             return Err(GpuError::Device(format!("no program {}", program.0)));
         };
+        let count = instances.len() / entry.stride;
+        if count == 0 {
+            return Ok(());
+        }
         unsafe {
             self.gl.bind_vertex_array(Some(entry.vao));
             self.gl
